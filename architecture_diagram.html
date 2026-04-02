@@ -1,0 +1,528 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>🤖 Trading Agent Architecture</title>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+  <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.2/babel.min.js"></script>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { background: #0a0f1a; }
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(-6px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+<body>
+  <div id="root"></div>
+  <script type="text/babel">
+    const { useState } = React;
+
+    const COLORS = {
+      data:        { bg: "#1e3a5f", border: "#3b82f6", text: "#93c5fd", label: "#60a5fa" },
+      perceive:    { bg: "#1a3a2a", border: "#22c55e", text: "#86efac", label: "#4ade80" },
+      classify:    { bg: "#2d2a1a", border: "#eab308", text: "#fde68a", label: "#facc15" },
+      plan:        { bg: "#2d1a3a", border: "#a855f7", text: "#d8b4fe", label: "#c084fc" },
+      risk:        { bg: "#3a1a1a", border: "#ef4444", text: "#fca5a5", label: "#f87171" },
+      llm:         { bg: "#1a2d3a", border: "#06b6d4", text: "#a5f3fc", label: "#22d3ee" },
+      execute:     { bg: "#1a2a1a", border: "#10b981", text: "#6ee7b7", label: "#34d399" },
+      monitor:     { bg: "#3a2a1a", border: "#f97316", text: "#fed7aa", label: "#fb923c" },
+      intelligence:{ bg: "#1a1a3a", border: "#8b5cf6", text: "#c4b5fd", label: "#a78bfa" },
+      storage:     { bg: "#1f1a2e", border: "#6d28d9", text: "#ddd6fe", label: "#a78bfa" },
+      alpaca:      { bg: "#0f2a1f", border: "#059669", text: "#6ee7b7", label: "#34d399" },
+    };
+
+    const Box = ({ color, title, items = [], icon, onClick, active }) => (
+      <div
+        onClick={onClick}
+        style={{
+          background: color.bg,
+          border: `2px solid ${active ? "#fff" : color.border}`,
+          borderRadius: 10,
+          padding: "10px 14px",
+          flex: 1,
+          cursor: onClick ? "pointer" : "default",
+          boxShadow: active ? `0 0 16px ${color.border}` : `0 0 6px ${color.border}44`,
+          transition: "all 0.2s",
+          minWidth: 0,
+        }}
+      >
+        <div style={{ display: "flex", alignItems: "center", gap: 6, marginBottom: items.length ? 6 : 0 }}>
+          {icon && <span style={{ fontSize: 16 }}>{icon}</span>}
+          <span style={{ color: color.label, fontWeight: 700, fontSize: 13, letterSpacing: 0.3 }}>{title}</span>
+        </div>
+        {items.map((item, i) => (
+          <div key={i} style={{ color: color.text, fontSize: 11.5, marginTop: 3, paddingLeft: 4,
+            borderLeft: `2px solid ${color.border}55` }}>
+            {item}
+          </div>
+        ))}
+      </div>
+    );
+
+    const Arrow = ({ color = "#475569", style = {} }) => (
+      <div style={{ display: "flex", alignItems: "center", justifyContent: "center",
+        flexShrink: 0, width: 24, ...style }}>
+        <div style={{
+          background: `linear-gradient(to right, ${color}44, ${color})`,
+          height: 2, width: "100%", position: "relative",
+        }}>
+          <div style={{
+            position: "absolute", right: -1, top: "50%",
+            transform: "translateY(-50%)", width: 0, height: 0,
+            borderTop: "4px solid transparent",
+            borderBottom: "4px solid transparent",
+            borderLeft: `6px solid ${color}`,
+          }} />
+        </div>
+      </div>
+    );
+
+    const DETAILS = {
+      perceive: {
+        title: "Phase I — Perceive",
+        color: COLORS.perceive,
+        desc: "Fetches 200 days of historical price data via yfinance and real-time quotes via Alpaca snapshot API.",
+        bullets: [
+          "yfinance → 200-day OHLCV for SMA/RSI/Bollinger computation",
+          "Alpaca snapshot API → real-time price for regime decisions",
+          "Hybrid architecture: historical accuracy + real-time precision",
+        ],
+        file: "market_data.py",
+      },
+      classify: {
+        title: "Phase II — Classify",
+        color: COLORS.classify,
+        desc: "Determines market regime by comparing price to SMAs and measuring trend momentum.",
+        bullets: [
+          "Bullish: Price > SMA-200, SMA-50 slope upward → Bull Put Spread",
+          "Bearish: Price < SMA-200, SMA-50 slope downward → Bear Call Spread",
+          "Sideways: Oscillating between SMAs, BB narrowing → Iron Condor",
+          "RSI-14 used as confirmation signal",
+        ],
+        file: "regime.py",
+      },
+      plan: {
+        title: "Phase III — Plan",
+        color: COLORS.plan,
+        desc: "Selects optimal strikes from the options chain based on regime and target delta.",
+        bullets: [
+          "Sold strike: |delta| ≤ 0.20 (high probability of expiring worthless)",
+          "Spread width: $5 between sold and bought strikes",
+          "Target DTE: 45 days (theta decay sweet spot)",
+          "Iron Condor: combines bull put + bear call spreads",
+        ],
+        file: "strategy.py",
+      },
+      risk: {
+        title: "Phase IV — Risk",
+        color: COLORS.risk,
+        desc: "Non-negotiable guardrails. All 6 checks must pass or trade is rejected.",
+        bullets: [
+          "✓ Credit/Width ≥ 1/3 (adequate compensation for risk)",
+          "✓ Sold delta ≤ 0.20 (OTM, high probability)",
+          "✓ Max loss ≤ 2% of account balance",
+          "✓ Account type = paper only",
+          "✓ Market must be open",
+          "✓ Plan structurally valid",
+        ],
+        file: "risk_manager.py",
+      },
+      llm: {
+        title: "Phase V — LLM Analysis",
+        color: COLORS.llm,
+        desc: "Intelligence layer that reviews trades, consults trade history via RAG, and decides approve/modify/skip.",
+        bullets: [
+          "Queries RAG for similar past trades and outcomes",
+          "Retrieves relevant lessons from the knowledge base",
+          "Reviews performance stats (win rate, avg P&L)",
+          "Outputs: action, confidence, reasoning, warnings",
+          "SAFETY: Cannot override risk manager rejections",
+        ],
+        file: "llm_analyst.py",
+      },
+      monitor: {
+        title: "Stage 1 — Monitor",
+        color: COLORS.monitor,
+        desc: "Runs before new trade entries every cycle. Manages open positions against exit thresholds.",
+        bullets: [
+          "Stop-Loss: close if unrealized loss ≥ 50% of max loss",
+          "Profit-Target: close if unrealized profit ≥ 75% of credit",
+          "Regime-Shift: close immediately if regime contradicts strategy",
+          "Triggers post-trade LLM analysis on close",
+        ],
+        file: "position_monitor.py",
+      },
+      intelligence: {
+        title: "Intelligence Layer",
+        color: COLORS.intelligence,
+        desc: "The learning system. Builds institutional memory over time and improves decisions.",
+        bullets: [
+          "LLM Client: OpenAI-compatible (Ollama/Mistral by default, swappable)",
+          "Trade Journal: full lifecycle logging for every trade",
+          "Knowledge Base: file-based RAG with cosine similarity search",
+          "Embeddings: nomic-embed-text (768-dimensional vectors)",
+        ],
+        file: "llm_client.py + trade_journal.py + knowledge_base.py",
+      },
+      finetune: {
+        title: "Fine-Tuning Pipeline",
+        color: COLORS.storage,
+        desc: "Exports accumulated trade data for training your local model on your own trading history.",
+        bullets: [
+          "Chat JSONL format: for Ollama/LM Studio fine-tuning",
+          "Alpaca format: for LoRA/QLoRA instruction tuning",
+          "DPO preference pairs: win trades (chosen) vs loss trades (rejected)",
+          "Requires 20+ closed trades to export",
+        ],
+        file: "fine_tuning.py",
+      },
+    };
+
+    function App() {
+      const [active, setActive] = useState(null);
+      const toggle = (key) => setActive(active === key ? null : key);
+      const detail = active ? DETAILS[active] : null;
+
+      return (
+        <div style={{
+          background: "#0a0f1a",
+          minHeight: "100vh",
+          padding: "24px 20px",
+          fontFamily: "'Inter', 'Segoe UI', sans-serif",
+          color: "#e2e8f0",
+        }}>
+          {/* Title */}
+          <div style={{ textAlign: "center", marginBottom: 28 }}>
+            <h1 style={{ fontSize: 22, fontWeight: 800, color: "#f1f5f9", margin: 0, letterSpacing: -0.5 }}>
+              🤖 Autonomous Options Trading Agent
+            </h1>
+            <p style={{ color: "#64748b", fontSize: 13, margin: "6px 0 0" }}>
+              Architecture — click any component for details
+            </p>
+          </div>
+
+          {/* Detail Panel */}
+          {detail && (
+            <div style={{
+              background: detail.color.bg,
+              border: `2px solid ${detail.color.border}`,
+              borderRadius: 12,
+              padding: "14px 18px",
+              marginBottom: 20,
+              boxShadow: `0 0 20px ${detail.color.border}55`,
+              animation: "fadeIn 0.2s ease",
+            }}>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start" }}>
+                <div style={{ flex: 1 }}>
+                  <div style={{ color: detail.color.label, fontWeight: 700, fontSize: 14, marginBottom: 4 }}>
+                    {detail.title}
+                  </div>
+                  <div style={{ color: detail.color.text, fontSize: 12.5, marginBottom: 8 }}>{detail.desc}</div>
+                  <div style={{ display: "flex", flexWrap: "wrap", gap: 6 }}>
+                    {detail.bullets.map((b, i) => (
+                      <div key={i} style={{
+                        background: `${detail.color.border}22`,
+                        border: `1px solid ${detail.color.border}55`,
+                        borderRadius: 6,
+                        padding: "3px 8px",
+                        color: detail.color.text,
+                        fontSize: 11,
+                      }}>{b}</div>
+                    ))}
+                  </div>
+                </div>
+                <div style={{ display: "flex", flexDirection: "column", alignItems: "flex-end", gap: 6, marginLeft: 12 }}>
+                  <div style={{
+                    background: "#0f172a",
+                    border: `1px solid ${detail.color.border}44`,
+                    borderRadius: 6,
+                    padding: "3px 8px",
+                    color: "#64748b",
+                    fontSize: 11,
+                    fontFamily: "monospace",
+                  }}>{detail.file}</div>
+                  <button onClick={() => setActive(null)} style={{
+                    background: "transparent",
+                    border: "1px solid #475569",
+                    color: "#94a3b8",
+                    borderRadius: 6,
+                    padding: "3px 10px",
+                    cursor: "pointer",
+                    fontSize: 11,
+                  }}>✕ close</button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* Main Layout */}
+          <div style={{ display: "flex", gap: 16, alignItems: "stretch" }}>
+
+            {/* LEFT: Data Sources */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, width: 170, flexShrink: 0 }}>
+              <div style={{ color: "#475569", fontSize: 10, fontWeight: 700, textTransform: "uppercase",
+                letterSpacing: 1, textAlign: "center" }}>Data Sources</div>
+              <Box color={COLORS.data} icon="📈" title="Yahoo Finance"
+                items={["Historical OHLCV", "200-day lookback", "SMA / RSI / BB"]} />
+              <Box color={COLORS.data} icon="⚡" title="Alpaca Market Data"
+                items={["Real-time snapshots", "Option chains + Greeks", "Delta / Theta / Vega"]} />
+              <Box color={COLORS.alpaca} icon="🏦" title="Alpaca Paper API"
+                items={["Account equity", "Market clock", "/v2/positions", "/v2/orders"]} />
+            </div>
+
+            {/* Arrow */}
+            <Arrow color="#3b82f6" style={{ width: 28 }} />
+
+            {/* CENTER: Agent Core */}
+            <div style={{ flex: 1, display: "flex", flexDirection: "column", gap: 0, minWidth: 0 }}>
+
+              <div style={{
+                background: "#0f172a",
+                border: "2px solid #1e293b",
+                borderRadius: "12px 12px 0 0",
+                padding: "8px 14px",
+                display: "flex",
+                alignItems: "center",
+                gap: 8,
+              }}>
+                <span style={{ fontSize: 18 }}>🔄</span>
+                <div>
+                  <div style={{ color: "#f1f5f9", fontWeight: 700, fontSize: 13 }}>Agent Cycle (agent.py)</div>
+                  <div style={{ color: "#475569", fontSize: 11 }}>Two-stage loop — runs periodically</div>
+                </div>
+              </div>
+
+              {/* Stage 1 */}
+              <div style={{
+                background: "#0d1a0d",
+                border: "2px solid #1e293b",
+                borderLeft: `3px solid ${COLORS.monitor.border}`,
+                borderRight: `3px solid ${COLORS.monitor.border}`,
+                padding: "10px 14px",
+              }}>
+                <div style={{ color: COLORS.monitor.label, fontWeight: 700, fontSize: 12,
+                  marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+                  <span>🔍</span> STAGE 1 — Monitor Existing Positions
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                  <Box color={COLORS.monitor} title="Position Monitor" icon="📊"
+                    items={["Fetch open positions", "Group into spreads"]}
+                    onClick={() => toggle("monitor")} active={active === "monitor"} />
+                  <Arrow color={COLORS.monitor.border} />
+                  <Box color={COLORS.monitor} title="Exit Signals" icon="🚦"
+                    items={["Stop-Loss: 50% max loss", "Profit: 75% credit", "Regime Shift"]} />
+                  <Arrow color={COLORS.monitor.border} />
+                  <Box color={COLORS.execute} title="Order Tracker" icon="📋"
+                    items={["Track fills", "Cancel stale", "Order history"]} />
+                </div>
+              </div>
+
+              <div style={{ background: "#1e293b", height: 1 }} />
+
+              {/* Stage 2 */}
+              <div style={{
+                background: "#0a0f1a",
+                border: "2px solid #1e293b",
+                borderLeft: `3px solid ${COLORS.plan.border}`,
+                borderRight: `3px solid ${COLORS.plan.border}`,
+                padding: "10px 14px",
+              }}>
+                <div style={{ color: COLORS.plan.label, fontWeight: 700, fontSize: 12,
+                  marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
+                  <span>🎯</span> STAGE 2 — Open New Positions (Per Ticker: SPY, QQQ, AAPL, MSFT, AMZN, IWM)
+                </div>
+
+                <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
+                  <Box color={COLORS.perceive} title="I · Perceive" icon="👁"
+                    items={["yfinance 200d", "Alpaca snapshot", "Cache prices"]}
+                    onClick={() => toggle("perceive")} active={active === "perceive"} />
+                  <Arrow color={COLORS.perceive.border} />
+
+                  <Box color={COLORS.classify} title="II · Classify" icon="🧭"
+                    items={["SMA-50/200", "Bollinger Bands", "RSI-14"]}
+                    onClick={() => toggle("classify")} active={active === "classify"} />
+                  <Arrow color={COLORS.classify.border} />
+
+                  <Box color={COLORS.plan} title="III · Plan" icon="📐"
+                    items={["Select strategy", "Pick strikes", "45 DTE target"]}
+                    onClick={() => toggle("plan")} active={active === "plan"} />
+                  <Arrow color={COLORS.plan.border} />
+
+                  <Box color={COLORS.risk} title="IV · Risk" icon="🛡"
+                    items={["6 guardrails", "Max loss 2%", "Paper only"]}
+                    onClick={() => toggle("risk")} active={active === "risk"} />
+                  <Arrow color={COLORS.risk.border} />
+
+                  <Box color={COLORS.llm} title="V · LLM" icon="🧠"
+                    items={["RAG context", "Approve/Skip", "Confidence"]}
+                    onClick={() => toggle("llm")} active={active === "llm"} />
+                  <Arrow color={COLORS.execute.border} />
+
+                  <Box color={COLORS.execute} title="VI · Execute" icon="⚡"
+                    items={["mleg order", "Alpaca API", "Journal entry"]} />
+                </div>
+
+                {/* Regime → Strategy */}
+                <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
+                  {[
+                    { regime: "BULLISH", strategy: "Bull Put Spread", color: COLORS.perceive },
+                    { regime: "BEARISH", strategy: "Bear Call Spread", color: COLORS.risk },
+                    { regime: "SIDEWAYS", strategy: "Iron Condor", color: COLORS.classify },
+                  ].map((r) => (
+                    <div key={r.regime} style={{
+                      flex: 1, background: r.color.bg,
+                      border: `1px solid ${r.color.border}55`,
+                      borderRadius: 7, padding: "5px 8px",
+                      display: "flex", alignItems: "center", gap: 6,
+                    }}>
+                      <span style={{ color: r.color.label, fontSize: 11, fontWeight: 700 }}>{r.regime}</span>
+                      <span style={{ color: "#475569", fontSize: 11 }}>→</span>
+                      <span style={{ color: r.color.text, fontSize: 11 }}>{r.strategy}</span>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              {/* Footer */}
+              <div style={{
+                background: "#0f172a",
+                border: "2px solid #1e293b",
+                borderTop: "none",
+                borderRadius: "0 0 12px 12px",
+                padding: "6px 14px",
+                display: "flex",
+                gap: 16,
+                flexWrap: "wrap",
+              }}>
+                {[
+                  { label: "Max Loss", value: "(Width − Credit) × 100", color: COLORS.risk },
+                  { label: "Min Credit Ratio", value: "≥ 33% of spread width", color: COLORS.plan },
+                  { label: "Sold Delta", value: "≤ 0.20 (OTM)", color: COLORS.classify },
+                ].map((g) => (
+                  <div key={g.label} style={{ display: "flex", gap: 5, alignItems: "center" }}>
+                    <span style={{ color: "#475569", fontSize: 11 }}>{g.label}:</span>
+                    <span style={{ color: g.color.text, fontSize: 11, fontWeight: 600 }}>{g.value}</span>
+                  </div>
+                ))}
+              </div>
+            </div>
+
+            {/* Arrow */}
+            <Arrow color="#8b5cf6" style={{ width: 28 }} />
+
+            {/* RIGHT: Intelligence Layer */}
+            <div style={{ display: "flex", flexDirection: "column", gap: 8, width: 190, flexShrink: 0 }}>
+              <div style={{ color: "#475569", fontSize: 10, fontWeight: 700, textTransform: "uppercase",
+                letterSpacing: 1, textAlign: "center" }}>Intelligence Layer</div>
+
+              <Box color={COLORS.intelligence} icon="🧠" title="LLM Client"
+                items={["Ollama / Mistral 7B", "OpenAI-compatible API", "Swappable provider"]}
+                onClick={() => toggle("intelligence")} active={active === "intelligence"} />
+
+              <Box color={COLORS.intelligence} icon="📚" title="Knowledge Base (RAG)"
+                items={["nomic-embed-text", "Cosine similarity", "Trades + Lessons"]}
+                onClick={() => toggle("intelligence")} active={active === "intelligence"} />
+
+              <Box color={COLORS.intelligence} icon="📓" title="Trade Journal"
+                items={["Full lifecycle log", "Win/loss stats", "Post-trade analysis"]}
+                onClick={() => toggle("intelligence")} active={active === "intelligence"} />
+
+              <Box color={COLORS.storage} icon="🎓" title="Fine-Tuning Pipeline"
+                items={["Chat JSONL", "Alpaca format", "DPO pairs"]}
+                onClick={() => toggle("finetune")} active={active === "finetune"} />
+            </div>
+          </div>
+
+          {/* Learning Loop */}
+          <div style={{ marginTop: 16 }}>
+            <div style={{ color: "#475569", fontSize: 10, fontWeight: 700, textTransform: "uppercase",
+              letterSpacing: 1, textAlign: "center", marginBottom: 8 }}>Learning Loop</div>
+            <div style={{
+              background: "#0a0f1a",
+              border: "2px dashed #1e3a5f",
+              borderRadius: 10,
+              padding: "10px 16px",
+              display: "flex",
+              alignItems: "center",
+              gap: 0,
+            }}>
+              {[
+                { icon: "⚡", label: "Trade Executes", color: COLORS.execute },
+                { arrow: true, label: "fills", color: "#10b981" },
+                { icon: "📓", label: "Journal Entry\nOpened", color: COLORS.intelligence },
+                { arrow: true, label: "closes", color: "#8b5cf6" },
+                { icon: "🔍", label: "LLM Post-Trade\nAnalysis", color: COLORS.llm },
+                { arrow: true, label: "extracts", color: "#06b6d4" },
+                { icon: "💡", label: "Lessons →\nKnowledge Base", color: COLORS.storage },
+                { arrow: true, label: "informs", color: "#a855f7" },
+                { icon: "🧠", label: "Better Decisions\nNext Cycle", color: COLORS.classify },
+                { arrow: true, label: "after 20+ trades", color: "#eab308" },
+                { icon: "🎓", label: "Fine-Tune\nLocal Model", color: COLORS.storage },
+              ].map((item, i) =>
+                item.arrow ? (
+                  <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column",
+                    alignItems: "center", gap: 2 }}>
+                    {item.label && <span style={{ color: "#475569", fontSize: 9,
+                      whiteSpace: "nowrap" }}>{item.label}</span>}
+                    <div style={{ width: "100%", height: 2,
+                      background: `linear-gradient(to right, ${item.color}55, ${item.color})`,
+                      position: "relative" }}>
+                      <div style={{ position: "absolute", right: -1, top: "50%",
+                        transform: "translateY(-50%)", width: 0, height: 0,
+                        borderTop: "4px solid transparent",
+                        borderBottom: "4px solid transparent",
+                        borderLeft: `5px solid ${item.color}` }} />
+                    </div>
+                  </div>
+                ) : (
+                  <div key={i} style={{
+                    background: item.color.bg,
+                    border: `1px solid ${item.color.border}`,
+                    borderRadius: 8,
+                    padding: "6px 10px",
+                    textAlign: "center",
+                    flexShrink: 0,
+                  }}>
+                    <div style={{ fontSize: 16 }}>{item.icon}</div>
+                    <div style={{ color: item.color.text, fontSize: 10, fontWeight: 600,
+                      whiteSpace: "pre-line", lineHeight: 1.3 }}>{item.label}</div>
+                  </div>
+                )
+              )}
+            </div>
+          </div>
+
+          {/* Legend */}
+          <div style={{ display: "flex", gap: 12, justifyContent: "center",
+            marginTop: 14, flexWrap: "wrap" }}>
+            {[
+              { color: COLORS.data, label: "Market Data" },
+              { color: COLORS.monitor, label: "Position Monitor" },
+              { color: COLORS.perceive, label: "Phases I-II" },
+              { color: COLORS.plan, label: "Phases III-IV" },
+              { color: COLORS.llm, label: "LLM Phase V" },
+              { color: COLORS.execute, label: "Execution" },
+              { color: COLORS.intelligence, label: "Intelligence" },
+              { color: COLORS.storage, label: "Fine-Tuning" },
+            ].map((l) => (
+              <div key={l.label} style={{ display: "flex", alignItems: "center", gap: 5 }}>
+                <div style={{ width: 10, height: 10, borderRadius: 3,
+                  background: l.color.bg, border: `2px solid ${l.color.border}` }} />
+                <span style={{ color: "#64748b", fontSize: 11 }}>{l.label}</span>
+              </div>
+            ))}
+          </div>
+
+          <div style={{ textAlign: "center", color: "#334155", fontSize: 11, marginTop: 12 }}>
+            80 tests passing · SPY QQQ AAPL MSFT AMZN IWM · Alpaca Paper Trading
+          </div>
+        </div>
+      );
+    }
+
+    const root = ReactDOM.createRoot(document.getElementById("root"));
+    root.render(<App />);
+  </script>
+</body>
+</html>

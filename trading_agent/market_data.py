@@ -174,6 +174,7 @@ class MarketDataProvider:
         """
         url = f"https://data.alpaca.markets/v1beta1/options/snapshots/{underlying}"
         params = {
+
             "type": option_type,
             "expiration_date": expiration_date,
             "limit": 100,

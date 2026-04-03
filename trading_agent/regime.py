@@ -8,6 +8,7 @@ import logging
 from dataclasses import dataclass
 from enum import Enum
 
+import numpy as np
 import pandas as pd
 
 from trading_agent.market_data import MarketDataProvider
@@ -39,6 +40,10 @@ class RegimeAnalysis:
     # Relative strength vs benchmarks (5-min return differential)
     relative_strength_vs_spy: float = 0.0
     relative_strength_vs_qqq: float = 0.0
+    # Capital retainment guards
+    macro_guard_active: bool = False   # True when price < SMA-200 (blocks bull spreads)
+    iv_rank: float = 0.0               # realized-vol percentile rank 0-100
+    high_iv_warning: bool = False      # True when iv_rank > 95 (extreme instability)
 
 
 class RegimeClassifier:
@@ -106,6 +111,14 @@ class RegimeClassifier:
             if ticker_ret is not None and qqq_ret is not None:
                 rs_vs_qqq = ticker_ret - qqq_ret
 
+        # Macro guard: price below SMA-200 blocks bullish strategies
+        macro_guard_active = current_price < current_sma_200
+
+        # IV rank from realized-volatility percentile over last 200 days.
+        # We use rolling 20-day annualised realized vol as an IV proxy and
+        # compute what percentile today's reading sits at.
+        iv_rank, high_iv_warning = self._compute_iv_rank(close)
+
         regime, reasoning = self._determine_regime(
             current_price, current_sma_50, current_sma_200,
             sma_50_slope, bb_width, mean_reversion_signal,
@@ -125,15 +138,55 @@ class RegimeClassifier:
             mean_reversion_direction=mean_reversion_direction,
             relative_strength_vs_spy=rs_vs_spy,
             relative_strength_vs_qqq=rs_vs_qqq,
+            macro_guard_active=macro_guard_active,
+            iv_rank=iv_rank,
+            high_iv_warning=high_iv_warning,
         )
         logger.info(
             "[%s] Regime → %s | Price=%.2f SMA50=%.2f SMA200=%.2f "
-            "Slope=%.4f BB=%.4f RSI=%.1f MR=%s RS_SPY=%.4f",
+            "Slope=%.4f BB=%.4f RSI=%.1f MR=%s RS_SPY=%.4f "
+            "MacroGuard=%s IVRank=%.1f HighVol=%s",
             ticker, regime.value, current_price, current_sma_50,
             current_sma_200, sma_50_slope, bb_width, current_rsi,
             mean_reversion_direction or "none", rs_vs_spy,
+            macro_guard_active, iv_rank, high_iv_warning,
         )
         return analysis
+
+    @staticmethod
+    def _compute_iv_rank(close: pd.Series,
+                         window: int = 20,
+                         high_iv_pct: float = 95.0):
+        """
+        Compute a realized-volatility percentile rank as an IV proxy.
+
+        Method
+        ------
+        1. Compute rolling *window*-day annualised realised vol over the full
+           price series, stepping every 5 days for speed.
+        2. Rank today's reading against that distribution → iv_rank [0–100].
+        3. Set high_iv_warning = True when iv_rank > *high_iv_pct* (default 95).
+
+        Returns (iv_rank: float, high_iv_warning: bool).
+        """
+        returns = close.pct_change().dropna()
+        if len(returns) < window + 5:
+            return 0.0, False
+
+        current_vol = float(returns.tail(window).std() * np.sqrt(252)) * 100
+
+        # Sample historical vols every 5 bars to build the distribution
+        hist_vols = []
+        for i in range(0, len(returns) - window, 5):
+            v = float(returns.iloc[i:i + window].std() * np.sqrt(252)) * 100
+            hist_vols.append(v)
+
+        if not hist_vols:
+            return 0.0, False
+
+        iv_rank = float(np.sum(np.array(hist_vols) < current_vol) / len(hist_vols) * 100)
+        high_iv_warning = iv_rank > high_iv_pct
+        return round(iv_rank, 1), high_iv_warning
 
     def _determine_regime(self, price: float, sma50: float, sma200: float,
                           slope_50: float, bb_width: float,

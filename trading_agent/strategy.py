@@ -96,12 +96,15 @@ class StrategyPlanner:
     # Minimum relative strength differential (vs SPY or QQQ) to trigger bias
     RS_THRESHOLD = 0.001   # 0.1% outperformance in 5-min window
 
-    SPREAD_WIDTH = 5.0          # dollars between sold / bought strikes
-    TARGET_DTE = 44             # days-to-expiration target (adjusted for available options)
-    DTE_RANGE = (21, 45)        # acceptable DTE window
+    SPREAD_WIDTH = 5.0          # standardised width — controls buying-power usage
+    TARGET_DTE = 45             # bias toward upper DTE range to reduce gamma risk
+    DTE_RANGE = (35, 50)        # tightened window; upper bound slows gamma impact
+    # Delta targeting window for the short leg: maximises POP while capping risk
+    MIN_DELTA = 0.20            # floor — below this is too far OTM (low credit)
+    # max_delta passed via __init__ (default 0.25)
 
     def __init__(self, data_provider: MarketDataProvider,
-                 max_delta: float = 0.20,
+                 max_delta: float = 0.25,   # ceiling for short-leg delta
                  min_credit_ratio: float = 0.33):
         self.data = data_provider
         self.max_delta = max_delta
@@ -308,33 +311,42 @@ class StrategyPlanner:
 
     def _pick_expiration(self) -> str:
         """
-        Choose the Friday nearest to TARGET_DTE, clamped inside DTE_RANGE.
+        Choose the Friday nearest to TARGET_DTE (45), biasing toward the
+        UPPER end of DTE_RANGE to reduce gamma risk near expiration.
 
-        Uses local date (not UTC) so the expiration matches the trading
-        day the user expects.  The old roll-forward-only logic could land
-        on a Friday that is outside the upper DTE bound when the target
-        date falls on a Saturday or Sunday.
+        When both adjacent Fridays are within the allowed range the further
+        one (higher DTE) is preferred — this keeps theta decay slower and
+        gives more time for the trade to work.
+
+        Uses local date (not UTC) to match the cron-run trading day.
         """
-        today = datetime.now().date()           # local date, not UTC
+        today = datetime.now().date()
         target = today + timedelta(days=self.TARGET_DTE)
 
-        # Find both adjacent Fridays and pick the closer one
         days_to_next = (4 - target.weekday()) % 7
         next_friday = target + timedelta(days=days_to_next)
         prev_friday = next_friday - timedelta(days=7)
 
-        # Prefer the closer Friday; ties go to the earlier one
-        candidate = next_friday if days_to_next <= 3 else prev_friday
-
-        # Clamp within DTE_RANGE so we never request an expiration Alpaca
-        # won't have liquid data for
         min_expiry = today + timedelta(days=self.DTE_RANGE[0])
         max_expiry = today + timedelta(days=self.DTE_RANGE[1])
 
-        if candidate > max_expiry:
-            candidate -= timedelta(days=7)   # step back one week
-        elif candidate < min_expiry:
-            candidate += timedelta(days=7)   # step forward one week
+        next_ok = min_expiry <= next_friday <= max_expiry
+        prev_ok = min_expiry <= prev_friday <= max_expiry
+
+        if next_ok and prev_ok:
+            # Both valid — pick the further Friday (higher DTE = less gamma risk)
+            candidate = next_friday
+        elif next_ok:
+            candidate = next_friday
+        elif prev_ok:
+            candidate = prev_friday
+        else:
+            # Neither adjacent Friday fits; clamp to the closest valid Friday
+            candidate = next_friday if days_to_next <= 3 else prev_friday
+            if candidate > max_expiry:
+                candidate -= timedelta(days=7)
+            elif candidate < min_expiry:
+                candidate += timedelta(days=7)
 
         dte = (candidate - today).days
         logger.debug("Expiration selected: %s (%d DTE)", candidate, dte)
@@ -342,18 +354,34 @@ class StrategyPlanner:
 
     def _find_sold_strike(self, contracts: List[Dict]) -> Optional[Dict]:
         """
-        From the chain, pick the contract whose |delta| is closest to
-        (but ≤) self.max_delta.
+        Pick the short-leg contract targeting the 0.20–0.25 delta window
+        (MIN_DELTA to max_delta).
+
+        Priority:
+          1. Contracts in the sweet-spot [MIN_DELTA, max_delta] — pick the
+             one closest to max_delta (highest premium, still within POP target)
+          2. Fallback: any contract with |delta| ≤ max_delta (chain may be sparse)
         """
-        candidates = [
+        # Primary: within the target delta window
+        sweet_spot = [
+            c for c in contracts
+            if self.MIN_DELTA <= abs(c["delta"]) <= self.max_delta and c["mid"] > 0
+        ]
+        if sweet_spot:
+            sweet_spot.sort(key=lambda c: abs(c["delta"]), reverse=True)
+            return sweet_spot[0]
+
+        # Fallback: any valid OTM delta (sparse chains)
+        fallback = [
             c for c in contracts
             if 0 < abs(c["delta"]) <= self.max_delta and c["mid"] > 0
         ]
-        if not candidates:
+        if not fallback:
             return None
-        # Closest delta to the ceiling (highest premium while staying OTM)
-        candidates.sort(key=lambda c: abs(c["delta"]), reverse=True)
-        return candidates[0]
+        fallback.sort(key=lambda c: abs(c["delta"]), reverse=True)
+        logger.debug("Delta sweet-spot empty — using fallback delta %.3f",
+                     abs(fallback[0]["delta"]))
+        return fallback[0]
 
     def _find_bought_strike(self, contracts: List[Dict],
                             sold_strike: float,

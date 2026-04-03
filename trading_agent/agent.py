@@ -50,7 +50,7 @@ from trading_agent.strategy import StrategyPlanner, SpreadPlan
 from trading_agent.risk_manager import RiskManager, RiskVerdict
 from trading_agent.executor import OrderExecutor
 from trading_agent.position_monitor import (
-    PositionMonitor, ExitSignal, SpreadPosition,
+    PositionMonitor, ExitSignal, SpreadPosition, IMMEDIATE_EXIT_SIGNALS,
 )
 from trading_agent.order_tracker import OrderTracker
 from trading_agent.llm_client import LLMClient, LLMConfig
@@ -397,7 +397,8 @@ class TradingAgent:
             return {"total_spreads": 0, "positions": [], "closed": []}
 
         underlyings = {s.underlying for s in spreads}
-        current_regimes = {}
+        current_regimes: Dict = {}
+        underlying_prices: Dict[str, float] = {}
         for ticker in underlyings:
             try:
                 analysis = self.regime_classifier.classify(ticker)
@@ -406,12 +407,16 @@ class TradingAgent:
                             ticker, analysis.regime.value)
             except Exception as exc:
                 logger.warning("[%s] Could not classify regime: %s", ticker, exc)
+            price = self._cached_price(ticker)
+            if price > 0:
+                underlying_prices[ticker] = price
 
-        spreads = self.position_monitor.evaluate(spreads, current_regimes)
+        spreads = self.position_monitor.evaluate(
+            spreads, current_regimes, underlying_prices)
 
         closed = []
         for spread in spreads:
-            if spread.exit_signal != ExitSignal.HOLD:
+            if spread.exit_signal != ExitSignal.HOLD and self._should_exit_spread(spread):
                 if self.config.trading.dry_run:
                     logger.info(
                         "[%s] DRY RUN — would close %s (%s: %s)",
@@ -483,6 +488,52 @@ class TradingAgent:
 
         logger.info("[%s] Phase II — CLASSIFY", ticker)
         analysis: RegimeAnalysis = self.regime_classifier.classify(ticker)
+
+        # --- Macro Guard: price < SMA-200 blocks Bull Put Spreads ---
+        if getattr(analysis, "macro_guard_active", False):
+            expected = self._regime_to_strategy(analysis.regime)
+            if expected == "Bull Put Spread":
+                reason = (
+                    f"MacroGuard: price ({analysis.current_price:.2f}) < "
+                    f"SMA-200 ({analysis.sma_200:.2f}) — blocking bull spread")
+                logger.warning("[%s] %s | strategy_mode=defense_first", ticker, reason)
+                self.journal_kb.log_defense_first(
+                    ticker, reason, analysis.current_price,
+                    {"regime": analysis.regime.value,
+                     "macro_guard_active": True,
+                     "iv_rank": getattr(analysis, "iv_rank", 0.0)})
+                return {
+                    "ticker": ticker,
+                    "regime": analysis.regime.value,
+                    "strategy": "Bull Put Spread",
+                    "plan_valid": False,
+                    "risk_approved": False,
+                    "status": "skipped",
+                    "reason": reason,
+                    "strategy_mode": "defense_first",
+                }
+
+        # --- High-IV block: IV rank > 95th pct blocks all new entries ---
+        if getattr(analysis, "high_iv_warning", False):
+            reason = (
+                f"HighIV: IV rank {getattr(analysis, 'iv_rank', 0):.1f} > 95th pct "
+                f"— extreme volatility, blocking all new entries")
+            logger.warning("[%s] %s | strategy_mode=defense_first", ticker, reason)
+            self.journal_kb.log_defense_first(
+                ticker, reason, analysis.current_price,
+                {"regime": analysis.regime.value,
+                 "iv_rank": getattr(analysis, "iv_rank", 0.0),
+                 "high_iv_warning": True})
+            return {
+                "ticker": ticker,
+                "regime": analysis.regime.value,
+                "strategy": "skipped",
+                "plan_valid": False,
+                "risk_approved": False,
+                "status": "skipped",
+                "reason": reason,
+                "strategy_mode": "defense_first",
+            }
 
         logger.info("[%s] Phase III — PLAN (%s → %s)", ticker,
                      analysis.regime.value,
@@ -631,6 +682,34 @@ class TradingAgent:
     # Risk guardrail helpers
     # ==================================================================
 
+    # ------------------------------------------------------------------
+    # Daily state helpers  (shared by drawdown check + debounce)
+    # ------------------------------------------------------------------
+
+    def _load_daily_state(self) -> Dict:
+        """Load daily_state.json; return {} on missing or corrupt file."""
+        state_path = os.path.join(
+            self.config.logging.trade_plan_dir, DAILY_STATE_FILENAME)
+        try:
+            with open(state_path) as fh:
+                return json.load(fh)
+        except (FileNotFoundError, json.JSONDecodeError):
+            return {}
+        except Exception as exc:
+            logger.warning("Could not read daily state: %s", exc)
+            return {}
+
+    def _save_daily_state(self, state: Dict) -> None:
+        """Persist state dict to daily_state.json."""
+        state_path = os.path.join(
+            self.config.logging.trade_plan_dir, DAILY_STATE_FILENAME)
+        try:
+            os.makedirs(os.path.dirname(state_path), exist_ok=True)
+            with open(state_path, "w") as fh:
+                json.dump(state, fh)
+        except Exception as exc:
+            logger.warning("Could not write daily state: %s", exc)
+
     def _check_daily_drawdown(self, current_equity: float) -> bool:
         """
         Check if today's equity has fallen beyond the daily drawdown limit.
@@ -639,28 +718,18 @@ class TradingAgent:
 
         Returns True if the circuit breaker should fire.
         """
-        state_path = os.path.join(
-            self.config.logging.trade_plan_dir, DAILY_STATE_FILENAME)
         today = datetime.now().date().isoformat()
-
-        state: Dict = {}
-        if os.path.exists(state_path):
-            try:
-                with open(state_path) as fh:
-                    state = json.load(fh)
-            except Exception as exc:
-                logger.warning("Could not read daily state file: %s", exc)
+        state = self._load_daily_state()
 
         if state.get("date") != today:
-            # New day — reset baseline
-            state = {"date": today, "start_equity": current_equity}
-            os.makedirs(os.path.dirname(state_path), exist_ok=True)
-            try:
-                with open(state_path, "w") as fh:
-                    json.dump(state, fh)
-                logger.info("Daily state reset: start_equity=$%.2f", current_equity)
-            except Exception as exc:
-                logger.warning("Could not write daily state file: %s", exc)
+            # New day — reset baseline (preserve exit_vote_counts if present)
+            state = {
+                "date": today,
+                "start_equity": current_equity,
+                "exit_vote_counts": {},
+            }
+            self._save_daily_state(state)
+            logger.info("Daily state reset: start_equity=$%.2f", current_equity)
             return False
 
         start_equity = float(state.get("start_equity", current_equity))
@@ -690,6 +759,54 @@ class TradingAgent:
 
         logger.info("Daily drawdown check OK: %.2f%% (limit=%.0f%%)",
                     drawdown * 100, limit * 100)
+        return False
+
+    def _should_exit_spread(self, spread: SpreadPosition) -> bool:
+        """
+        3-cycle debounce guard for non-immediate exit signals.
+
+        Immediate signals (HARD_STOP, STRIKE_PROXIMITY, DTE_SAFETY) bypass
+        debounce and return True immediately.
+
+        All other signals require the SAME signal on 3 consecutive cycles
+        before this returns True.  Vote counts are persisted in daily_state.json
+        and reset each calendar day.
+        """
+        if spread.exit_signal == ExitSignal.HOLD:
+            return False
+
+        # Immediate signals bypass debounce
+        if spread.exit_signal in IMMEDIATE_EXIT_SIGNALS:
+            logger.warning(
+                "[%s] IMMEDIATE exit signal %s — bypassing debounce",
+                spread.underlying, spread.exit_signal.value)
+            return True
+
+        state = self._load_daily_state()
+        vote_counts: Dict = state.get("exit_vote_counts", {})
+
+        ticker = spread.underlying
+        signal_val = spread.exit_signal.value
+
+        existing = vote_counts.get(ticker, {})
+        if existing.get("signal") == signal_val:
+            count = existing.get("count", 0) + 1
+        else:
+            count = 1   # new or changed signal — reset
+
+        vote_counts[ticker] = {"signal": signal_val, "count": count}
+        state["exit_vote_counts"] = vote_counts
+        self._save_daily_state(state)
+
+        if count >= 3:
+            logger.warning(
+                "[%s] Exit signal %s confirmed after %d cycles — acting",
+                spread.underlying, signal_val, count)
+            return True
+
+        logger.info(
+            "[%s] Exit signal %s vote %d/3 — debouncing (next check in ~5 min)",
+            spread.underlying, signal_val, count)
         return False
 
     def _check_liquidation_mode(self, equity: float,

@@ -96,24 +96,44 @@ class TestPickExpiration:
         lo, hi = planner.DTE_RANGE
         assert lo <= dte <= hi, f"DTE={dte} is outside range {lo}-{hi}"
 
-    def test_saturday_target_picks_previous_friday(self):
-        """When target date is Saturday, nearest Friday is the day before."""
-        from datetime import datetime, date, timedelta
+    def test_both_valid_fridays_picks_further_one(self):
+        """When both adjacent Fridays are within DTE_RANGE, pick the further one
+        (higher DTE = less gamma risk) — capital retainment DTE bias update."""
+        from datetime import datetime, date
         from unittest.mock import patch
 
         planner = self._planner()
-        # Force today to a date where today + 44 lands on a Saturday
-        # April 2 + 44 = May 16 (Saturday)
+        # fake_today = April 2, 2026 → TARGET_DTE=45 → target = May 17 (Sunday)
+        # next_friday = May 22 (DTE=50, at max boundary) — VALID
+        # prev_friday = May 15 (DTE=43)                 — VALID
+        # Both in DTE_RANGE (35, 50) → prefer further = May 22
         fake_today = date(2026, 4, 2)
         with patch("trading_agent.strategy.datetime") as mock_dt:
             mock_dt.now.return_value.date.return_value = fake_today
             exp = planner._pick_expiration()
 
         exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-        # Previous Friday = May 15
-        assert exp_date == date(2026, 5, 15)
-        assert exp_date.weekday() == 4
-        # DTE = 43 — inside (21, 45)
+        assert exp_date.weekday() == 4, "Expiry must be a Friday"
+        assert exp_date == date(2026, 5, 22), "Should prefer the higher-DTE Friday"
+        assert (exp_date - fake_today).days == 50  # exactly at DTE_RANGE upper bound
+
+    def test_only_prev_friday_valid_picks_prev(self):
+        """When next_friday exceeds max DTE, fall back to prev_friday."""
+        from datetime import datetime, date
+        from unittest.mock import patch
+
+        planner = self._planner()
+        # fake_today = April 1, 2026 → target = May 16 (Saturday)
+        # next_friday = May 22 (DTE=51 > 50) — INVALID (exceeds max)
+        # prev_friday = May 15 (DTE=44)       — VALID
+        fake_today = date(2026, 4, 1)
+        with patch("trading_agent.strategy.datetime") as mock_dt:
+            mock_dt.now.return_value.date.return_value = fake_today
+            exp = planner._pick_expiration()
+
+        exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
+        assert exp_date.weekday() == 4, "Expiry must be a Friday"
+        assert exp_date == date(2026, 5, 15), "Should pick prev_friday when next is out of range"
         dte = (exp_date - fake_today).days
         assert planner.DTE_RANGE[0] <= dte <= planner.DTE_RANGE[1]
 

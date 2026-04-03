@@ -121,6 +121,28 @@ class JournalKB:
         self._write_jsonl(record)
         self._write_md_row(ts, ticker, action, price, raw_signal, status, notes)
 
+    def log_defense_first(
+        self,
+        ticker: str,
+        reason: str,
+        price: float,
+        extra: Optional[Dict] = None,
+    ) -> None:
+        """
+        Log a capital-retainment skip event (macro guard, high-IV block, etc.).
+        Includes strategy_mode: defense_first in the raw_signal for LLM training.
+        """
+        raw: Dict[str, Any] = {"strategy_mode": "defense_first", "reason": reason}
+        if extra:
+            raw.update(extra)
+        self.log_signal(
+            ticker=ticker,
+            action="skipped_defense_first",
+            price=price,
+            raw_signal=raw,
+            notes=f"defense_first: {reason[:80]}",
+        )
+
     def log_error(
         self,
         ticker: str,

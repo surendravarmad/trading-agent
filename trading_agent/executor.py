@@ -115,14 +115,28 @@ class OrderExecutor:
             }
 
         # Live paper execution
-        return self._submit_order(plan, plan_path, run_id)
+        return self._submit_order(plan, plan_path, run_id, verdict.account_balance)
 
     # ------------------------------------------------------------------
     # Alpaca order submission
     # ------------------------------------------------------------------
 
+    def _calculate_qty(self, plan: SpreadPlan, account_balance: float) -> int:
+        """
+        1% Risk Rule: size contracts so max potential loss ≤ 1% of equity.
+
+        max_loss_per_contract = (spread_width - net_credit) × 100
+        qty = floor(1% × equity / max_loss_per_contract), minimum 1
+        """
+        max_loss_per_contract = (plan.spread_width - plan.net_credit) * 100
+        if max_loss_per_contract <= 0:
+            return 1
+        max_risk_dollars = account_balance * 0.01
+        qty = int(max_risk_dollars / max_loss_per_contract)
+        return max(1, qty)
+
     def _submit_order(self, plan: SpreadPlan, plan_path: str,
-                      run_id: str) -> Dict:
+                      run_id: str, account_balance: float = 0.0) -> Dict:
         """
         Submit a multi-leg option order to Alpaca.
         Uses POST /v2/orders with order_class='mleg'.
@@ -177,11 +191,15 @@ class OrderExecutor:
         # Alpaca sign convention: credit → negative limit_price
         limit_price_value = -abs(live_credit)
 
+        qty = self._calculate_qty(plan, account_balance)
+        logger.info("[%s] Position size: %d contract(s) (1%% rule, equity=$%.2f)",
+                    plan.ticker, qty, account_balance)
+
         order_payload = {
             "type": "limit",
             "time_in_force": "day",
             "order_class": "mleg",
-            "qty": "1",
+            "qty": str(qty),
             "limit_price": str(limit_price_value),
             "legs": legs_payload,
         }

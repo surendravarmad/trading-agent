@@ -205,6 +205,42 @@ The file resets automatically at the start of each calendar day.
 
 If available buying power exceeds `MAX_BUYING_POWER_PCT` (default 80%) of account equity, the agent enters **Liquidation Mode**: Stage 2 (new trade opening) is skipped entirely for all tickers. Stage 1 (position monitoring and closing) continues normally. Every skipped ticker is logged with action `skipped_liquidation_mode`.
 
+### Capital Retainment Guards (defense_first)
+
+Two additional entry filters block new trades and log `strategy_mode: defense_first` to `signals.jsonl`:
+
+| Guard | Trigger | Effect |
+|-------|---------|--------|
+| **Macro Guard** | `price < SMA-200` when regime would generate a Bull Put Spread | Skips the entry; Bull spreads against the macro trend are blocked |
+| **High-IV Block** | Realized-volatility IV rank > 95th percentile | Skips ALL new entries; extreme vol spikes make credit spreads dangerously wide |
+
+Both log `action: skipped_defense_first` to JournalKB so the LLM training pipeline can learn from defensive decisions.
+
+### Position Exit Debouncing
+
+Non-immediate exit signals require **3 consecutive cycles** (≈ 15 minutes at the default 5-min interval) of the same signal before a spread is closed. This prevents whipsaw closes on transient market moves.
+
+Signals that **bypass** debounce and close immediately:
+
+| Signal | Trigger |
+|--------|---------|
+| `HARD_STOP` | Spread has lost ≥ 3× the initial credit collected |
+| `STRIKE_PROXIMITY` | Underlying within 1% of any short strike |
+| `DTE_SAFETY` | Thursday after 15:30 ET and expiry is the next day (Friday) |
+
+Debounce vote counts are persisted in `trade_plans/daily_state.json` and reset each calendar day.
+
+### Position Sizing — 1% Risk Rule
+
+When submitting live orders, the executor calculates contract quantity dynamically:
+
+```
+max_loss_per_contract = (spread_width − net_credit) × 100
+qty = floor(1% × account_equity / max_loss_per_contract),  minimum 1
+```
+
+This ensures no single trade risks more than 1% of total equity regardless of spread width or premium level.
+
 ---
 
 ## Project Structure

@@ -4,13 +4,19 @@ Position Monitor
 Fetches open positions from Alpaca, computes unrealized P&L against
 the original trade plan, and generates exit signals based on:
 
-  1. STOP-LOSS:    Close when unrealized loss ≥ 50% of max defined loss
-  2. PROFIT-TARGET: Close when unrealized profit ≥ 75% of max credit received
-  3. REGIME-SHIFT:  Close when current regime contradicts the position's strategy
+  1. HARD_STOP:        Spread value ≥ 3× initial credit (immediate, no debounce)
+  2. PROFIT_TARGET:    50% of max credit captured
+  3. STRIKE_PROXIMITY: Underlying within 1% of any short strike (immediate)
+  4. DTE_SAFETY:       Thursday before expiry after 15:30 ET (immediate)
+  5. REGIME_SHIFT:     Current regime contradicts the position's strategy
+
+Signals marked "immediate" bypass the 3-cycle debounce in agent.py and
+trigger a market-order close without waiting for confirmation.
 """
 
 import logging
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from enum import Enum
 from typing import Dict, List, Optional
 
@@ -23,17 +29,28 @@ logger = logging.getLogger(__name__)
 
 class ExitSignal(Enum):
     HOLD = "hold"
-    STOP_LOSS = "stop_loss"
-    PROFIT_TARGET = "profit_target"
-    REGIME_SHIFT = "regime_shift"
+    STOP_LOSS = "stop_loss"          # legacy alias kept for compatibility
+    HARD_STOP = "hard_stop"          # spread value ≥ 3× credit (immediate)
+    PROFIT_TARGET = "profit_target"  # 50% of credit captured
+    REGIME_SHIFT = "regime_shift"    # regime no longer matches strategy
+    STRIKE_PROXIMITY = "strike_proximity"  # underlying within 1% of short strike
+    DTE_SAFETY = "dte_safety"        # Thursday before expiry ≥ 15:30 ET
     EXPIRED = "expired"
 
 
+# Signals that bypass the 3-cycle debounce — close immediately
+IMMEDIATE_EXIT_SIGNALS = {
+    ExitSignal.HARD_STOP,
+    ExitSignal.STRIKE_PROXIMITY,
+    ExitSignal.DTE_SAFETY,
+}
+
 # Which regime each strategy is compatible with
 STRATEGY_REGIME_MAP = {
-    "Bull Put Spread": Regime.BULLISH,
-    "Bear Call Spread": Regime.BEARISH,
-    "Iron Condor": Regime.SIDEWAYS,
+    "Bull Put Spread":      Regime.BULLISH,
+    "Bear Call Spread":     Regime.BEARISH,
+    "Iron Condor":          Regime.SIDEWAYS,
+    "Mean Reversion Spread": None,   # direction-neutral; never regime-shift closed
 }
 
 
@@ -55,35 +72,52 @@ class PositionSnapshot:
 @dataclass
 class SpreadPosition:
     """
-    Aggregated view of a credit spread (2 or 4 legs grouped by underlying).
-    This links Alpaca positions back to the original trade plan.
+    Aggregated view of a credit spread (2 or 4 legs) linked back to
+    the original trade plan.
     """
     underlying: str
     strategy_name: str
     legs: List[PositionSnapshot]
-    original_credit: float       # net credit received at entry
-    max_loss: float              # defined max loss from the trade plan
+    original_credit: float        # net credit received at entry (per share)
+    max_loss: float               # defined max loss from the trade plan ($)
     spread_width: float
-    net_unrealized_pl: float     # sum of all legs' unrealized P&L
+    net_unrealized_pl: float      # sum of all legs' unrealized P&L
+    expiration: str = ""          # option expiration date YYYY-MM-DD
+    short_strikes: List[float] = field(default_factory=list)  # short-leg strikes
     exit_signal: ExitSignal = ExitSignal.HOLD
     exit_reason: str = ""
 
 
 class PositionMonitor:
     """
-    Monitors open option positions against risk thresholds and
-    regime changes, producing exit signals when action is needed.
+    Monitors open option positions and generates exit signals.
+
+    Parameters
+    ----------
+    profit_target_pct : float
+        Close when unrealized profit ≥ this fraction of the initial credit
+        collected.  Default 0.50 (50% profit target — capital retainment).
+    hard_stop_multiplier : float
+        Close immediately when the spread has lost this multiple of the
+        original credit.  Default 3.0 (hard stop at 3× credit).
+    strike_proximity_pct : float
+        Close immediately when underlying price is within this fraction of
+        any short strike.  Default 0.01 (1%).
     """
 
     def __init__(self, api_key: str, secret_key: str,
                  base_url: str = "https://paper-api.alpaca.markets/v2",
-                 stop_loss_pct: float = 0.50,
-                 profit_target_pct: float = 0.75):
+                 stop_loss_pct: float = 0.50,    # kept for legacy compat
+                 profit_target_pct: float = 0.50,  # 50% profit taker
+                 hard_stop_multiplier: float = 3.0,
+                 strike_proximity_pct: float = 0.01):
         self.api_key = api_key
         self.secret_key = secret_key
         self.base_url = base_url
-        self.stop_loss_pct = stop_loss_pct          # 50% of max loss
-        self.profit_target_pct = profit_target_pct    # 75% of credit
+        self.stop_loss_pct = stop_loss_pct
+        self.profit_target_pct = profit_target_pct
+        self.hard_stop_multiplier = hard_stop_multiplier
+        self.strike_proximity_pct = strike_proximity_pct
 
     def _headers(self) -> Dict[str, str]:
         return {
@@ -97,10 +131,7 @@ class PositionMonitor:
     # ------------------------------------------------------------------
 
     def fetch_open_positions(self) -> List[PositionSnapshot]:
-        """
-        GET /v2/positions — returns all open positions.
-        Filters to options positions only (asset_class == 'us_option').
-        """
+        """GET /v2/positions — filters to us_option only."""
         url = f"{self.base_url}/positions"
         try:
             resp = requests.get(url, headers=self._headers(), timeout=10)
@@ -141,21 +172,25 @@ class PositionMonitor:
         """
         Match open option positions to their original trade plans using
         the option symbols in each plan's legs.
-
-        *trade_plans* is a list of dicts loaded from the trade_plan JSON files.
         """
         spreads = []
 
         for plan in trade_plans:
             tp = plan.get("trade_plan", {})
-            plan_symbols = {leg["symbol"] for leg in tp.get("legs", [])}
+            plan_legs = tp.get("legs", [])
+            plan_symbols = {leg["symbol"] for leg in plan_legs}
             if not plan_symbols:
                 continue
 
-            # Find matching positions
             matched_legs = [p for p in positions if p.symbol in plan_symbols]
             if not matched_legs:
                 continue
+
+            # Extract short-strike prices from the plan for proximity checks
+            short_strikes = [
+                leg["strike"] for leg in plan_legs
+                if leg.get("action") == "sell" and "strike" in leg
+            ]
 
             net_pl = sum(leg.unrealized_pl for leg in matched_legs)
 
@@ -167,6 +202,8 @@ class PositionMonitor:
                 max_loss=tp.get("max_loss", 0),
                 spread_width=tp.get("spread_width", 0),
                 net_unrealized_pl=net_pl,
+                expiration=tp.get("expiration", ""),
+                short_strikes=short_strikes,
             )
             spreads.append(spread)
 
@@ -178,23 +215,32 @@ class PositionMonitor:
     # ------------------------------------------------------------------
 
     def evaluate(self, spreads: List[SpreadPosition],
-                 current_regimes: Dict[str, Regime]) -> List[SpreadPosition]:
+                 current_regimes: Dict[str, Regime],
+                 underlying_prices: Optional[Dict[str, float]] = None
+                 ) -> List[SpreadPosition]:
         """
-        Check each spread position against exit rules:
-          1. Stop-loss:     unrealized loss ≥ 50% of max_loss
-          2. Profit-target: unrealized profit ≥ 75% of original credit × 100
-          3. Regime-shift:  current regime contradicts the strategy
+        Check each spread against all exit rules and assign exit_signal.
+
+        Parameters
+        ----------
+        underlying_prices : dict mapping ticker → current price, used for
+            the strike-proximity guard.
         """
+        prices = underlying_prices or {}
+
         for spread in spreads:
-            signal, reason = self._check_exit(spread, current_regimes)
+            signal, reason = self._check_exit(
+                spread, current_regimes, prices.get(spread.underlying, 0.0))
             spread.exit_signal = signal
             spread.exit_reason = reason
 
             if signal != ExitSignal.HOLD:
+                immediate = signal in IMMEDIATE_EXIT_SIGNALS
                 logger.warning(
-                    "[%s] EXIT SIGNAL: %s — %s | P&L=$%.2f",
-                    spread.underlying, signal.value, reason,
-                    spread.net_unrealized_pl)
+                    "[%s] EXIT SIGNAL: %s%s — %s | P&L=$%.2f",
+                    spread.underlying, signal.value,
+                    " (IMMEDIATE)" if immediate else " (debounce)",
+                    reason, spread.net_unrealized_pl)
             else:
                 logger.info(
                     "[%s] HOLD — P&L=$%.2f (credit=$%.2f, max_loss=$%.2f)",
@@ -204,34 +250,59 @@ class PositionMonitor:
         return spreads
 
     def _check_exit(self, spread: SpreadPosition,
-                    current_regimes: Dict[str, Regime]):
+                    current_regimes: Dict[str, Regime],
+                    underlying_price: float = 0.0):
         """Return (ExitSignal, reason) for a single spread."""
 
-        # --- 1. Stop-loss: unrealized loss ≥ 50% of max_loss ---
-        # unrealized_pl is negative when losing
+        credit_value = spread.original_credit * 100   # per-contract dollar value
+
+        # --- 1. Hard stop: spread has lost 3× the initial credit (IMMEDIATE) ---
+        hard_stop_threshold = credit_value * self.hard_stop_multiplier
+        loss = -spread.net_unrealized_pl   # positive when losing
+        if loss >= hard_stop_threshold > 0:
+            return (
+                ExitSignal.HARD_STOP,
+                f"Loss ${loss:.2f} ≥ {self.hard_stop_multiplier:.0f}× credit "
+                f"${credit_value:.2f} (threshold=${hard_stop_threshold:.2f})"
+            )
+
+        # --- 2. Legacy stop-loss: loss ≥ 50% of defined max-loss ---
         loss_threshold = spread.max_loss * self.stop_loss_pct
-        if spread.net_unrealized_pl < 0 and abs(spread.net_unrealized_pl) >= loss_threshold:
+        if loss >= loss_threshold > 0:
             return (
                 ExitSignal.STOP_LOSS,
-                f"Unrealized loss ${abs(spread.net_unrealized_pl):.2f} "
-                f"≥ {self.stop_loss_pct*100:.0f}% of max loss ${spread.max_loss:.2f} "
-                f"(threshold=${loss_threshold:.2f})"
+                f"Loss ${loss:.2f} ≥ {self.stop_loss_pct*100:.0f}% of "
+                f"max loss ${spread.max_loss:.2f}"
             )
 
-        # --- 2. Profit-target: captured ≥ 75% of credit ---
-        # When a credit spread is winning, unrealized P&L is positive
-        # (the options we sold are decaying, net position value shrinks)
-        credit_value = spread.original_credit * 100  # per-contract
+        # --- 3. Profit target: 50% of credit captured ---
         profit_threshold = credit_value * self.profit_target_pct
-        if spread.net_unrealized_pl > 0 and spread.net_unrealized_pl >= profit_threshold:
+        if spread.net_unrealized_pl >= profit_threshold > 0:
             return (
                 ExitSignal.PROFIT_TARGET,
-                f"Unrealized profit ${spread.net_unrealized_pl:.2f} "
-                f"≥ {self.profit_target_pct*100:.0f}% of credit "
-                f"${credit_value:.2f} (threshold=${profit_threshold:.2f})"
+                f"Profit ${spread.net_unrealized_pl:.2f} ≥ "
+                f"{self.profit_target_pct*100:.0f}% of credit "
+                f"${credit_value:.2f}"
             )
 
-        # --- 3. Regime-shift: strategy no longer matches regime ---
+        # --- 4. Strike proximity guard (IMMEDIATE) ---
+        if underlying_price > 0 and spread.short_strikes:
+            for strike in spread.short_strikes:
+                proximity = abs(underlying_price - strike) / strike
+                if proximity <= self.strike_proximity_pct:
+                    return (
+                        ExitSignal.STRIKE_PROXIMITY,
+                        f"Underlying ${underlying_price:.2f} is within "
+                        f"{proximity*100:.2f}% of short strike ${strike:.0f} "
+                        f"— closing to prevent ITM assignment"
+                    )
+
+        # --- 5. DTE safety: liquidate by 15:30 ET on Thursday before expiry ---
+        dte_signal = self._check_dte_safety(spread.expiration)
+        if dte_signal:
+            return (ExitSignal.DTE_SAFETY, dte_signal)
+
+        # --- 6. Regime shift ---
         ticker = spread.underlying
         if ticker in current_regimes:
             current_regime = current_regimes[ticker]
@@ -245,14 +316,50 @@ class PositionMonitor:
 
         return (ExitSignal.HOLD, "")
 
+    @staticmethod
+    def _check_dte_safety(expiration: str) -> str:
+        """
+        Return a non-empty reason string if the DTE safety rule triggers.
+
+        Rule: if today is Thursday AND current time is ≥ 15:30 ET AND the
+        spread expires the following day (Friday), return a warning.
+
+        We avoid carrying an option into its final Friday of life to prevent
+        last-day gamma explosion and assignment risk.
+        """
+        if not expiration:
+            return ""
+        try:
+            exp_date = datetime.strptime(expiration, "%Y-%m-%d").date()
+            # Convert to ET for the time check
+            now_utc = datetime.now(timezone.utc)
+            # ET = UTC-4 (EDT) or UTC-5 (EST); use UTC-4 (market hours)
+            now_et_hour = (now_utc.hour - 4) % 24
+            now_et_minute = now_utc.minute
+            today = now_utc.date()
+
+            # Thursday = weekday 3
+            is_thursday = today.weekday() == 3
+            after_cutoff = (now_et_hour > 15 or
+                            (now_et_hour == 15 and now_et_minute >= 30))
+            expires_tomorrow = (exp_date - today).days == 1  # Friday
+
+            if is_thursday and after_cutoff and expires_tomorrow:
+                return (
+                    f"DTE safety: expiration {expiration} is tomorrow. "
+                    f"Liquidating by 15:30 ET to avoid last-day gamma risk."
+                )
+        except Exception:
+            pass
+        return ""
+
     # ------------------------------------------------------------------
     # Summary
     # ------------------------------------------------------------------
 
     def summary(self, spreads: List[SpreadPosition]) -> Dict:
-        """Generate a summary dict for logging."""
         total_pl = sum(s.net_unrealized_pl for s in spreads)
-        signals = {}
+        signals: Dict[str, int] = {}
         for s in spreads:
             sig = s.exit_signal.value
             signals[sig] = signals.get(sig, 0) + 1
@@ -268,6 +375,8 @@ class PositionMonitor:
                     "pl": round(s.net_unrealized_pl, 2),
                     "signal": s.exit_signal.value,
                     "reason": s.exit_reason,
+                    "expiration": s.expiration,
+                    "short_strikes": s.short_strikes,
                 }
                 for s in spreads
             ],

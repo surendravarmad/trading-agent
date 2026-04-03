@@ -129,3 +129,7 @@
 | 2026-04-03T02:17:53 | QQQ | rejected | $584.71 | Bear Call Spread | bearish | False | rejected | — | rejected: Bear Call Spread, No call with \|delta\| ≤ 0.2 |
 | 2026-04-03T02:17:53 | IWM | skipped_existing | $251.11 | — | — | — | skipped_existing | — | skipped_existing |
 | 2026-04-03T02:17:53 | GOOG | skipped_existing | $294.45 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T03:09:08 | SPY | skipped_existing | $655.93 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T03:09:08 | QQQ | skipped_defense_first | $584.71 | — | bearish | — | skipped_defense_first | — | defense_first: HighIV: IV rank 100.0 > 95th pct — extreme volatility, blocking a |
+| 2026-04-03T03:09:08 | IWM | skipped_existing | $251.11 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T03:09:08 | GOOG | skipped_existing | $294.45 | — | — | — | skipped_existing | — | skipped_existing |

@@ -133,3 +133,19 @@
 | 2026-04-03T03:09:08 | QQQ | skipped_defense_first | $584.71 | — | bearish | — | skipped_defense_first | — | defense_first: HighIV: IV rank 100.0 > 95th pct — extreme volatility, blocking a |
 | 2026-04-03T03:09:08 | IWM | skipped_existing | $251.11 | — | — | — | skipped_existing | — | skipped_existing |
 | 2026-04-03T03:09:08 | GOOG | skipped_existing | $294.45 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T14:29:47 | SPY | skipped_existing | $655.93 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T14:29:47 | QQQ | skipped_defense_first | $584.71 | — | bearish | — | skipped_defense_first | — | defense_first: HighIV: IV rank 100.0 > 95th pct — extreme volatility, blocking a |
+| 2026-04-03T14:29:47 | IWM | skipped_existing | $251.11 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T14:29:47 | GOOG | skipped_existing | $294.45 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T15:21:15 | SPY | skipped_existing | $655.93 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T15:21:15 | QQQ | skipped_defense_first | $584.71 | — | bearish | — | skipped_defense_first | — | defense_first: HighIV: IV rank 100.0 > 95th pct — extreme volatility, blocking a |
+| 2026-04-03T15:21:15 | IWM | skipped_existing | $251.11 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T15:21:15 | GOOG | skipped_existing | $294.45 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T15:24:55 | SPY | skipped_existing | $655.93 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T15:24:55 | QQQ | skipped_defense_first | $584.71 | — | bearish | — | skipped_defense_first | — | defense_first: HighIV: IV rank 100.0 > 95th pct — extreme volatility, blocking a |
+| 2026-04-03T15:24:55 | IWM | skipped_existing | $251.11 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T15:24:55 | GOOG | skipped_existing | $294.45 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T15:35:13 | SPY | skipped_existing | $655.93 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T15:35:14 | QQQ | skipped_defense_first | $584.71 | — | bearish | — | skipped_defense_first | — | defense_first: HighIV: IV rank 100.0 > 95th pct — extreme volatility, blocking a |
+| 2026-04-03T15:35:14 | IWM | skipped_existing | $251.11 | — | — | — | skipped_existing | — | skipped_existing |
+| 2026-04-03T15:35:14 | GOOG | skipped_existing | $294.45 | — | — | — | skipped_existing | — | skipped_existing |

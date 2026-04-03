@@ -40,6 +40,7 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
+from zoneinfo import ZoneInfo
 
 from trading_agent.config import AppConfig, load_config
 from trading_agent.journal_kb import JournalKB
@@ -66,6 +67,39 @@ CYCLE_TIMEOUT_SECONDS = 270  # 4 min 30 sec
 
 # File that persists daily equity baseline for the drawdown circuit breaker.
 DAILY_STATE_FILENAME = "daily_state.json"
+
+# ---------------------------------------------------------------------------
+# Market-hours guard
+# ---------------------------------------------------------------------------
+_EASTERN = ZoneInfo("America/New_York")
+
+# NYSE core session: 9:30 AM – 4:00 PM ET.
+# 5-minute buffers let a cron job scheduled exactly on the boundary finish
+# its current cycle before the next invocation would be blocked.
+_MARKET_OPEN_HOUR, _MARKET_OPEN_MINUTE   = 9, 25   # 5 min before 9:30
+_MARKET_CLOSE_HOUR, _MARKET_CLOSE_MINUTE = 16, 5   # 5 min after  16:00
+
+
+def _is_within_market_hours() -> bool:
+    """
+    Return True if the current moment is within NYSE trading hours
+    (9:25 AM – 4:05 PM ET, Monday through Friday).
+
+    The 5-minute buffers ensure a cron job firing exactly at the open or
+    close boundary completes its cycle rather than being immediately killed.
+    """
+    now = datetime.now(_EASTERN)
+    if now.weekday() >= 5:          # Saturday=5, Sunday=6
+        return False
+    open_boundary = now.replace(
+        hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE,
+        second=0, microsecond=0,
+    )
+    close_boundary = now.replace(
+        hour=_MARKET_CLOSE_HOUR, minute=_MARKET_CLOSE_MINUTE,
+        second=0, microsecond=0,
+    )
+    return open_boundary <= now <= close_boundary
 
 
 class TradingAgent:
@@ -230,6 +264,32 @@ class TradingAgent:
 
     def _run_cycle_impl(self) -> Dict:
         """Core cycle logic — called inside run_cycle()'s timeout guard."""
+        # --- After-hours shutdown guard -----------------------------------
+        # Exit cleanly (code 0) when invoked outside NYSE market hours so
+        # that a cron scheduler does not waste cycles on a closed market.
+        # Set FORCE_MARKET_OPEN=true (or force_market_open=True in config)
+        # to bypass this check in tests or paper-trading outside hours.
+        if not self.config.trading.force_market_open and not _is_within_market_hours():
+            now_et = datetime.now(_EASTERN)
+            msg = (
+                f"Outside NYSE market hours "
+                f"({now_et.strftime('%A %H:%M ET')}) — shutting down cleanly"
+            )
+            logger.info(msg)
+            self.journal_kb.log_cycle_error(
+                "after_hours_shutdown",
+                {
+                    "local_time_et": now_et.isoformat(),
+                    "market_window": (
+                        f"{_MARKET_OPEN_HOUR:02d}:{_MARKET_OPEN_MINUTE:02d}–"
+                        f"{_MARKET_CLOSE_HOUR:02d}:{_MARKET_CLOSE_MINUTE:02d} ET "
+                        f"Mon–Fri"
+                    ),
+                },
+            )
+            os._exit(0)   # noqa: SLF001  intentional clean shutdown
+        # ------------------------------------------------------------------
+
         logger.info("=" * 70)
         logger.info("TRADING CYCLE START — %s",
                     datetime.now(timezone.utc).isoformat())

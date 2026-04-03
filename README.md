@@ -486,11 +486,105 @@ python -m trading_agent.agent --env /path/to/.env
 
 The agent has a built-in 270-second timeout guard — if a cycle hangs, the process self-terminates so the next cron run starts cleanly.
 
+#### After-hours automatic shutdown
+
+The agent exits cleanly (`os._exit(0)`) at the very start of any cycle that
+falls outside NYSE market hours:
+
+| Condition | Action |
+|-----------|--------|
+| Before 9:25 AM ET (Mon–Fri) | Exit 0 — too early |
+| After 4:05 PM ET (Mon–Fri) | Exit 0 — market closed |
+| Saturday / Sunday | Exit 0 — weekend |
+| Within 9:25 AM – 4:05 PM ET (Mon–Fri) | Cycle runs normally |
+
+The 5-minute buffers (9:25 / 16:05 instead of 9:30 / 16:00) ensure a cron job
+scheduled exactly on the boundary completes its cycle rather than being
+immediately killed.
+
+A `journal_kb.log_cycle_error("after_hours_shutdown", …)` entry is written
+each time so any unexpected out-of-hours invocations are visible in the
+signal journal.
+
+To bypass the guard (paper-trading after hours, CI tests):
+
+```bash
+FORCE_MARKET_OPEN=true python -m trading_agent.agent
+```
+
 ### 5. Run tests
 
 ```bash
 python run_tests.py        # Full suite
 pytest tests/ -v           # Core modules only
+```
+
+---
+
+## Agent Performance Dashboard
+
+`visualize_logs.py` parses the signal journal and per-ticker trade-plan files to
+generate a self-contained interactive HTML report.
+
+### Quick start
+
+```bash
+# Today's report (default paths)
+python visualize_logs.py
+
+# Specific date and tickers
+python visualize_logs.py --date 2026-04-03 --tickers SPY QQQ
+
+# All dates, custom output
+python visualize_logs.py --all-dates --output reports/full_history.html
+```
+
+### Data sources
+
+| Source | File | Key fields extracted |
+|--------|------|----------------------|
+| Signal journal | `trade_journal/signals.jsonl` | `timestamp`, `action`, `price`, `notes`, `raw_signal.*` |
+| Trade plans | `trade_plans/trade_plan_{TICKER}.json` | `state_history[].trade_plan.legs[sell].strike`, `risk_verdict.approved` |
+
+### Visual components
+
+| # | Chart | Description |
+|---|-------|-------------|
+| 1 | **Heartbeat Timeline** | Horizontal scatter — one dot per 5-min cycle, colour-coded by outcome. Hover shows skip reason. |
+| 2 | **Safety Buffer Chart** | Underlying price over the session with a red-dashed short-strike "danger line" for every active position. |
+| 3 | **Logic Distribution** | Pie chart breaking down cycles by state: Active Trade, SMA Filter, RSI Filter, High-IV Block, Risk Rejected, Defense First, Error. |
+
+### Colour legend
+
+| Colour | Status |
+|--------|--------|
+| Green | Trade Executed (`dry_run` / `submitted`) |
+| Blue | Monitoring / No Action (`skip` / `skipped_existing`) |
+| Orange | Risk Rejected |
+| Purple | Defense First (Macro Guard / High-IV Block) |
+| Red | Error / Timeout / Circuit Breaker |
+
+### CLI options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--journal PATH` | `trade_journal/signals.jsonl` | Path to signals.jsonl |
+| `--plans-dir DIR` | `trade_plans` | Directory of `trade_plan_*.json` files |
+| `--tickers SPY QQQ …` | all found | Restrict to specific tickers |
+| `--date YYYY-MM-DD` | today | Filter signals to one day |
+| `--all-dates` | off | Include all dates (overrides `--date`) |
+| `--output PATH` | `daily_report.html` | Output file path |
+
+### Output
+
+A single `daily_report.html` — open in any browser.  The file includes an
+inline stats bar (total cycles, trades executed, defense-first skips, errors)
+and all three Plotly charts loaded from CDN.
+
+### Running the tests
+
+```bash
+pytest tests/test_visualize_logs.py -v
 ```
 
 ---

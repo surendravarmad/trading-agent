@@ -271,7 +271,7 @@ class TestLiquidationMode:
         """With plenty of buying power, trades proceed normally."""
         agent = TradingAgent(_make_config(tmp_path))
         _mock_agent(agent, bullish_prices, sample_put_contracts)
-        # 50% BP remaining (50% used < 80% limit)
+        # 50% BP remaining (75% of initial 2x used < 80% limit)
         agent.data_provider.get_account_info = MagicMock(
             return_value={"equity": "100000", "buying_power": "50000"})
 
@@ -279,3 +279,15 @@ class TestLiquidationMode:
         trades = results["new_trades"]
         assert len(trades) == 1
         assert trades[0].get("status") != "skipped"
+
+    def test_zero_equity_triggers_liquidation(self, tmp_path):
+        """Equity at or below zero triggers emergency liquidation mode."""
+        agent = TradingAgent(_make_config(tmp_path))
+        assert agent._check_liquidation_mode(equity=0.0, buying_power=0.0) is True
+        assert agent._check_liquidation_mode(equity=-1000.0, buying_power=0.0) is True
+
+    def test_fresh_margin_account_no_liquidation(self, tmp_path):
+        """A fresh margin account (buying_power = 2x equity, nothing deployed) should NOT trigger."""
+        agent = TradingAgent(_make_config(tmp_path))
+        # buying_power == 2x equity means 0% deployed
+        assert agent._check_liquidation_mode(equity=100_000.0, buying_power=200_000.0) is False

@@ -131,6 +131,7 @@ class TradingAgent:
             max_delta=config.trading.max_delta,
             liquidity_max_spread=config.trading.liquidity_max_spread,
             max_buying_power_pct=config.trading.max_buying_power_pct,
+            margin_multiplier=config.trading.margin_multiplier,
         )
         self.executor = OrderExecutor(
             api_key=config.alpaca.api_key,
@@ -876,8 +877,10 @@ class TradingAgent:
         signalling the agent should close positions rather than open new ones.
         """
         if equity <= 0:
-            return False
-        pct_used = 1.0 - (buying_power / equity)
+            logger.warning("Equity <= 0 (%.2f) — Emergency Liquidation Mode", equity)
+            return True
+        initial_bp = equity * self.config.trading.margin_multiplier
+        pct_used = 1.0 - (buying_power / initial_bp)
         limit = self.config.trading.max_buying_power_pct
         if pct_used > limit:
             logger.warning(

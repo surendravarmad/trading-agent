@@ -28,6 +28,7 @@ class TradingConfig:
     force_market_open: bool = False    # force market open for testing after hours
     daily_drawdown_limit: float = 0.05  # kill process if account drops >X% in one day
     max_buying_power_pct: float = 0.80  # enter liquidation mode if BP >X% used
+    margin_multiplier: float = 2.0      # broker's buying power multiplier (2.0 = standard margin, 1.0 = cash)
     liquidity_max_spread: float = 0.05  # reject underlying if bid/ask spread >= X
     schedule_interval: str = "5m"       # cycle interval (for startup log / docs)
 
@@ -87,6 +88,7 @@ def load_config(env_path: str = None) -> AppConfig:
         force_market_open=os.getenv("FORCE_MARKET_OPEN", "false").lower() in ("true", "1", "yes"),
         daily_drawdown_limit=float(os.getenv("DAILY_DRAWDOWN_LIMIT", "0.05")),
         max_buying_power_pct=float(os.getenv("MAX_BUYING_POWER_PCT", "0.80")),
+        margin_multiplier=float(os.getenv("MARGIN_MULTIPLIER", "2.0")),
         liquidity_max_spread=float(os.getenv("LIQUIDITY_MAX_SPREAD", "0.05")),
         schedule_interval=os.getenv("SCHEDULE_INTERVAL", "5m"),
     )

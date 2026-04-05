@@ -138,3 +138,26 @@ class TestBuyingPowerCheck:
                                    account_buying_power=None)
         assert verdict.approved is True
         assert not any("buying power" in p.lower() for p in verdict.checks_passed)
+
+    def test_check8_fresh_margin_passes(self):
+        """Fresh margin account (bp = 2x equity, 0% deployed) must pass."""
+        plan = _make_plan(ratio=0.34, max_loss=300)
+        verdict = self.rm.evaluate(plan, 100_000, "paper", True, False,
+                                   account_buying_power=200_000)
+        assert any("buying power" in p.lower() for p in verdict.checks_passed)
+
+    def test_check8_margin_70pct_used_passes(self):
+        """70% of initial buying power deployed (< 80% limit) must pass."""
+        plan = _make_plan(ratio=0.34, max_loss=300)
+        # 70% used: remaining = 200k * 0.30 = $60k
+        verdict = self.rm.evaluate(plan, 100_000, "paper", True, False,
+                                   account_buying_power=60_000)
+        assert any("buying power" in p.lower() for p in verdict.checks_passed)
+
+    def test_check8_margin_85pct_used_fails(self):
+        """85% of initial buying power deployed (> 80% limit) must fail."""
+        plan = _make_plan(ratio=0.34, max_loss=300)
+        # 85% used: remaining = 200k * 0.15 = $30k
+        verdict = self.rm.evaluate(plan, 100_000, "paper", True, False,
+                                   account_buying_power=30_000)
+        assert any("liquidation" in f.lower() for f in verdict.checks_failed)

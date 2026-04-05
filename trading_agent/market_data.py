@@ -429,7 +429,7 @@ class MarketDataProvider:
             resp = requests.get(url, headers=self._alpaca_headers(),
                                 params=params, timeout=10)
             resp.raise_for_status()
-            bars = resp.json().get("bars", [])
+            bars = resp.json().get("bars") or []
             if len(bars) < 2:
                 logger.debug("[%s] Not enough 5-min bars for RS calculation", ticker)
                 return None

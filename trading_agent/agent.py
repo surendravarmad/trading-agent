@@ -550,30 +550,6 @@ class TradingAgent:
         logger.info("[%s] Phase II — CLASSIFY", ticker)
         analysis: RegimeAnalysis = self.regime_classifier.classify(ticker)
 
-        # --- Macro Guard: price < SMA-200 blocks Bull Put Spreads ---
-        if getattr(analysis, "macro_guard_active", False):
-            expected = self._regime_to_strategy(analysis.regime)
-            if expected == "Bull Put Spread":
-                reason = (
-                    f"MacroGuard: price ({analysis.current_price:.2f}) < "
-                    f"SMA-200 ({analysis.sma_200:.2f}) — blocking bull spread")
-                logger.warning("[%s] %s | strategy_mode=defense_first", ticker, reason)
-                self.journal_kb.log_defense_first(
-                    ticker, reason, analysis.current_price,
-                    {"regime": analysis.regime.value,
-                     "macro_guard_active": True,
-                     "iv_rank": getattr(analysis, "iv_rank", 0.0)})
-                return {
-                    "ticker": ticker,
-                    "regime": analysis.regime.value,
-                    "strategy": "Bull Put Spread",
-                    "plan_valid": False,
-                    "risk_approved": False,
-                    "status": "skipped",
-                    "reason": reason,
-                    "strategy_mode": "defense_first",
-                }
-
         # --- High-IV block: IV rank > 95th pct blocks all new entries ---
         if getattr(analysis, "high_iv_warning", False):
             reason = (

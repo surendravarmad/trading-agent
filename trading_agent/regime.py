@@ -41,7 +41,6 @@ class RegimeAnalysis:
     relative_strength_vs_spy: float = 0.0
     relative_strength_vs_qqq: float = 0.0
     # Capital retainment guards
-    macro_guard_active: bool = False   # True when price < SMA-200 (blocks bull spreads)
     iv_rank: float = 0.0               # realized-vol percentile rank 0-100
     high_iv_warning: bool = False      # True when iv_rank > 95 (extreme instability)
 
@@ -111,9 +110,6 @@ class RegimeClassifier:
             if ticker_ret is not None and qqq_ret is not None:
                 rs_vs_qqq = ticker_ret - qqq_ret
 
-        # Macro guard: price below SMA-200 blocks bullish strategies
-        macro_guard_active = current_price < current_sma_200
-
         # IV rank from realized-volatility percentile over last 200 days.
         # We use rolling 20-day annualised realized vol as an IV proxy and
         # compute what percentile today's reading sits at.
@@ -138,18 +134,17 @@ class RegimeClassifier:
             mean_reversion_direction=mean_reversion_direction,
             relative_strength_vs_spy=rs_vs_spy,
             relative_strength_vs_qqq=rs_vs_qqq,
-            macro_guard_active=macro_guard_active,
             iv_rank=iv_rank,
             high_iv_warning=high_iv_warning,
         )
         logger.info(
             "[%s] Regime → %s | Price=%.2f SMA50=%.2f SMA200=%.2f "
             "Slope=%.4f BB=%.4f RSI=%.1f MR=%s RS_SPY=%.4f "
-            "MacroGuard=%s IVRank=%.1f HighVol=%s",
+            "IVRank=%.1f HighVol=%s",
             ticker, regime.value, current_price, current_sma_50,
             current_sma_200, sma_50_slope, bb_width, current_rsi,
             mean_reversion_direction or "none", rs_vs_spy,
-            macro_guard_active, iv_rank, high_iv_warning,
+            iv_rank, high_iv_warning,
         )
         return analysis
 

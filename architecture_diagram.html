@@ -30,6 +30,8 @@
       intelligence:{ bg: "#1a1a3a", border: "#8b5cf6", text: "#c4b5fd", label: "#a78bfa" },
       storage:     { bg: "#1f1a2e", border: "#6d28d9", text: "#ddd6fe", label: "#a78bfa" },
       alpaca:      { bg: "#0f2a1f", border: "#059669", text: "#6ee7b7", label: "#34d399" },
+      guard:       { bg: "#2a1f0a", border: "#f59e0b", text: "#fcd34d", label: "#fbbf24" },
+      report:      { bg: "#1a2a2a", border: "#0d9488", text: "#99f6e4", label: "#2dd4bf" },
     };
 
     const Box = ({ color, title, items = [], icon, onClick, active }) => (
@@ -93,12 +95,16 @@
       classify: {
         title: "Phase II — Classify",
         color: COLORS.classify,
-        desc: "Determines market regime by comparing price to SMAs and measuring trend momentum.",
+        desc: "Determines market regime by comparing price to SMAs, measuring trend momentum, and detecting mean-reversion setups.",
         bullets: [
           "Bullish: Price > SMA-200, SMA-50 slope upward → Bull Put Spread",
           "Bearish: Price < SMA-200, SMA-50 slope downward → Bear Call Spread",
           "Sideways: Oscillating between SMAs, BB narrowing → Iron Condor",
+          "Mean Reversion: Price touches 3-std Bollinger Band → counter-trend entry",
           "RSI-14 used as confirmation signal",
+          "RS vs SPY/QQQ: relative strength bias informs strike selection",
+          "IV Rank computed for high-IV warning (> 95th pct blocks new entries)",
+          "Macro Guard: price < SMA-200 blocks Bull Put Spreads",
         ],
         file: "regime.py",
       },
@@ -107,24 +113,28 @@
         color: COLORS.plan,
         desc: "Selects optimal strikes from the options chain based on regime and target delta.",
         bullets: [
-          "Sold strike: |delta| ≤ 0.20 (high probability of expiring worthless)",
+          "Sold strike: |delta| ≤ 0.25 (high probability of expiring worthless)",
           "Spread width: $5 between sold and bought strikes",
           "Target DTE: 45 days (theta decay sweet spot)",
           "Iron Condor: combines bull put + bear call spreads",
+          "Mean Reversion trades: uses 3-std BB touch as entry trigger",
+          "RS bias: adjusts strike selection based on relative strength vs SPY/QQQ",
         ],
         file: "strategy.py",
       },
       risk: {
         title: "Phase IV — Risk",
         color: COLORS.risk,
-        desc: "Non-negotiable guardrails. All 6 checks must pass or trade is rejected.",
+        desc: "Non-negotiable guardrails. All 8 checks must pass or trade is rejected.",
         bullets: [
-          "✓ Credit/Width ≥ 1/3 (adequate compensation for risk)",
-          "✓ Sold delta ≤ 0.20 (OTM, high probability)",
+          "✓ Plan structurally valid",
+          "✓ Credit/Width ≥ 25% (adequate compensation for risk)",
+          "✓ Sold |delta| ≤ 0.25 (OTM, high probability)",
           "✓ Max loss ≤ 2% of account balance",
           "✓ Account type = paper only",
           "✓ Market must be open",
-          "✓ Plan structurally valid",
+          "✓ Underlying bid/ask spread < $0.05 (liquidity check)",
+          "✓ Buying power used ≤ 80% of equity",
         ],
         file: "risk_manager.py",
       },
@@ -160,10 +170,11 @@
         bullets: [
           "LLM Client: OpenAI-compatible (Ollama/Mistral by default, swappable)",
           "Trade Journal: full lifecycle logging for every trade",
+          "Journal KB: structured signal/error/defense logging (signals.jsonl)",
           "Knowledge Base: file-based RAG with cosine similarity search",
           "Embeddings: nomic-embed-text (768-dimensional vectors)",
         ],
-        file: "llm_client.py + trade_journal.py + knowledge_base.py",
+        file: "llm_client.py + trade_journal.py + journal_kb.py + knowledge_base.py",
       },
       finetune: {
         title: "Fine-Tuning Pipeline",
@@ -176,6 +187,29 @@
           "Requires 20+ closed trades to export",
         ],
         file: "fine_tuning.py",
+      },
+      guards: {
+        title: "Cycle Guards",
+        color: COLORS.guard,
+        desc: "Three agent-level safety checks that run at the start of every cycle before any market activity.",
+        bullets: [
+          "After-Hours Shutdown: exits cleanly outside 9:25 AM–4:05 PM ET Mon–Fri (bypass: FORCE_MARKET_OPEN=true)",
+          "Daily Drawdown Circuit Breaker: halts all trading if equity drops beyond daily_drawdown_limit from day-start equity",
+          "Liquidation Mode: skips all new entries if buying power > 80% used — only monitors existing positions",
+        ],
+        file: "agent.py (_is_within_market_hours, _check_daily_drawdown, _check_liquidation_mode)",
+      },
+      reporting: {
+        title: "Reporting",
+        color: COLORS.report,
+        desc: "Generates HTML reports and dashboards from logged signals and trade plans.",
+        bullets: [
+          "visualize_logs.py → daily_report.html (Heartbeat Timeline, Safety Buffer, Logic Distribution)",
+          "trade_plan_report.py → trade_plan_{TICKER}.html (8-section per-ticker HTML report)",
+          "Reads signals.jsonl + trade_plan_*.json",
+          "Run manually or via cron (*/5 10-15 * * 1-5)",
+        ],
+        file: "visualize_logs.py + trade_plan_report.py",
       },
     };
 
@@ -293,6 +327,35 @@
                 </div>
               </div>
 
+              {/* Cycle Guards */}
+              <div style={{
+                background: "#1a140a",
+                border: "2px solid #1e293b",
+                borderLeft: `3px solid ${COLORS.guard.border}`,
+                borderRight: `3px solid ${COLORS.guard.border}`,
+                padding: "8px 14px",
+              }}>
+                <div style={{ color: COLORS.guard.label, fontWeight: 700, fontSize: 12,
+                  marginBottom: 6, display: "flex", alignItems: "center", gap: 6 }}>
+                  <span>🛑</span> CYCLE GUARDS — run before every stage
+                </div>
+                <div style={{ display: "flex", gap: 8, alignItems: "stretch" }}>
+                  <Box color={COLORS.guard} title="After-Hours Shutdown" icon="🕐"
+                    items={["9:25 AM – 4:05 PM ET", "Mon–Fri only", "FORCE_MARKET_OPEN bypass"]}
+                    onClick={() => toggle("guards")} active={active === "guards"} />
+                  <Arrow color={COLORS.guard.border} />
+                  <Box color={COLORS.guard} title="Drawdown Circuit Breaker" icon="📉"
+                    items={["Daily loss limit check", "Persists in daily_state.json", "Halts all trading"]}
+                    onClick={() => toggle("guards")} active={active === "guards"} />
+                  <Arrow color={COLORS.guard.border} />
+                  <Box color={COLORS.guard} title="Liquidation Mode" icon="⚠️"
+                    items={["Buying power > 80%", "Skips new entries", "Monitor-only mode"]}
+                    onClick={() => toggle("guards")} active={active === "guards"} />
+                </div>
+              </div>
+
+              <div style={{ background: "#1e293b", height: 1 }} />
+
               {/* Stage 1 */}
               <div style={{
                 background: "#0d1a0d",
@@ -330,7 +393,7 @@
               }}>
                 <div style={{ color: COLORS.plan.label, fontWeight: 700, fontSize: 12,
                   marginBottom: 8, display: "flex", alignItems: "center", gap: 6 }}>
-                  <span>🎯</span> STAGE 2 — Open New Positions (Per Ticker: SPY, QQQ, AAPL, MSFT, AMZN, IWM)
+                  <span>🎯</span> STAGE 2 — Open New Positions (Per Ticker: SPY, QQQ + configurable via TICKERS env)
                 </div>
 
                 <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
@@ -340,9 +403,26 @@
                   <Arrow color={COLORS.perceive.border} />
 
                   <Box color={COLORS.classify} title="II · Classify" icon="🧭"
-                    items={["SMA-50/200", "Bollinger Bands", "RSI-14"]}
+                    items={["SMA-50/200", "BB + MR signal", "RS vs SPY/QQQ", "IV Rank"]}
                     onClick={() => toggle("classify")} active={active === "classify"} />
                   <Arrow color={COLORS.classify.border} />
+
+                  {/* Inline guards between classify and plan */}
+                  <div style={{ display: "flex", flexDirection: "column", gap: 4, flex: 0.8, minWidth: 0 }}>
+                    <div style={{
+                      background: COLORS.guard.bg,
+                      border: `1px solid ${COLORS.guard.border}88`,
+                      borderRadius: 7, padding: "4px 8px", fontSize: 10,
+                      color: COLORS.guard.text, textAlign: "center",
+                    }}>🛡 Macro Guard<br/><span style={{color:"#94a3b8"}}>price &lt; SMA-200<br/>blocks bull spreads</span></div>
+                    <div style={{
+                      background: COLORS.guard.bg,
+                      border: `1px solid ${COLORS.guard.border}88`,
+                      borderRadius: 7, padding: "4px 8px", fontSize: 10,
+                      color: COLORS.guard.text, textAlign: "center",
+                    }}>🌡 High-IV Block<br/><span style={{color:"#94a3b8"}}>IV rank &gt; 95th pct<br/>blocks all entries</span></div>
+                  </div>
+                  <Arrow color={COLORS.plan.border} />
 
                   <Box color={COLORS.plan} title="III · Plan" icon="📐"
                     items={["Select strategy", "Pick strikes", "45 DTE target"]}
@@ -350,7 +430,7 @@
                   <Arrow color={COLORS.plan.border} />
 
                   <Box color={COLORS.risk} title="IV · Risk" icon="🛡"
-                    items={["6 guardrails", "Max loss 2%", "Paper only"]}
+                    items={["8 guardrails", "Max loss 2%", "Paper only", "BP ≤ 80%"]}
                     onClick={() => toggle("risk")} active={active === "risk"} />
                   <Arrow color={COLORS.risk.border} />
 
@@ -369,6 +449,7 @@
                     { regime: "BULLISH", strategy: "Bull Put Spread", color: COLORS.perceive },
                     { regime: "BEARISH", strategy: "Bear Call Spread", color: COLORS.risk },
                     { regime: "SIDEWAYS", strategy: "Iron Condor", color: COLORS.classify },
+                    { regime: "MEAN REVERSION", strategy: "Counter-Trend Spread", color: COLORS.guard },
                   ].map((r) => (
                     <div key={r.regime} style={{
                       flex: 1, background: r.color.bg,
@@ -397,8 +478,9 @@
               }}>
                 {[
                   { label: "Max Loss", value: "(Width − Credit) × 100", color: COLORS.risk },
-                  { label: "Min Credit Ratio", value: "≥ 33% of spread width", color: COLORS.plan },
-                  { label: "Sold Delta", value: "≤ 0.20 (OTM)", color: COLORS.classify },
+                  { label: "Min Credit Ratio", value: "≥ 25% of spread width", color: COLORS.plan },
+                  { label: "Sold Delta", value: "≤ 0.25 (OTM)", color: COLORS.classify },
+                  { label: "Buying Power Cap", value: "≤ 80% of equity", color: COLORS.guard },
                 ].map((g) => (
                   <div key={g.label} style={{ display: "flex", gap: 5, alignItems: "center" }}>
                     <span style={{ color: "#475569", fontSize: 11 }}>{g.label}:</span>
@@ -414,7 +496,7 @@
             {/* RIGHT: Intelligence Layer */}
             <div style={{ display: "flex", flexDirection: "column", gap: 8, width: 190, flexShrink: 0 }}>
               <div style={{ color: "#475569", fontSize: 10, fontWeight: 700, textTransform: "uppercase",
-                letterSpacing: 1, textAlign: "center" }}>Intelligence Layer</div>
+                letterSpacing: 1, textAlign: "center" }}>Intelligence &amp; Reporting</div>
 
               <Box color={COLORS.intelligence} icon="🧠" title="LLM Client"
                 items={["Ollama / Mistral 7B", "OpenAI-compatible API", "Swappable provider"]}
@@ -424,13 +506,17 @@
                 items={["nomic-embed-text", "Cosine similarity", "Trades + Lessons"]}
                 onClick={() => toggle("intelligence")} active={active === "intelligence"} />
 
-              <Box color={COLORS.intelligence} icon="📓" title="Trade Journal"
-                items={["Full lifecycle log", "Win/loss stats", "Post-trade analysis"]}
+              <Box color={COLORS.intelligence} icon="📓" title="Trade Journal + KB"
+                items={["Full lifecycle log", "signals.jsonl (JournalKB)", "Win/loss stats"]}
                 onClick={() => toggle("intelligence")} active={active === "intelligence"} />
 
               <Box color={COLORS.storage} icon="🎓" title="Fine-Tuning Pipeline"
                 items={["Chat JSONL", "Alpaca format", "DPO pairs"]}
                 onClick={() => toggle("finetune")} active={active === "finetune"} />
+
+              <Box color={COLORS.report} icon="📊" title="Reporting"
+                items={["daily_report.html", "trade_plan_{TICKER}.html", "Plotly charts"]}
+                onClick={() => toggle("reporting")} active={active === "reporting"} />
             </div>
           </div>
 
@@ -459,6 +545,8 @@
                 { icon: "🧠", label: "Better Decisions\nNext Cycle", color: COLORS.classify },
                 { arrow: true, label: "after 20+ trades", color: "#eab308" },
                 { icon: "🎓", label: "Fine-Tune\nLocal Model", color: COLORS.storage },
+                { arrow: true, label: "visualized by", color: "#0d9488" },
+                { icon: "📊", label: "Daily Report\ndaily_report.html", color: COLORS.report },
               ].map((item, i) =>
                 item.arrow ? (
                   <div key={i} style={{ flex: 1, display: "flex", flexDirection: "column",
@@ -498,6 +586,7 @@
             marginTop: 14, flexWrap: "wrap" }}>
             {[
               { color: COLORS.data, label: "Market Data" },
+              { color: COLORS.guard, label: "Cycle Guards" },
               { color: COLORS.monitor, label: "Position Monitor" },
               { color: COLORS.perceive, label: "Phases I-II" },
               { color: COLORS.plan, label: "Phases III-IV" },
@@ -505,6 +594,7 @@
               { color: COLORS.execute, label: "Execution" },
               { color: COLORS.intelligence, label: "Intelligence" },
               { color: COLORS.storage, label: "Fine-Tuning" },
+              { color: COLORS.report, label: "Reporting" },
             ].map((l) => (
               <div key={l.label} style={{ display: "flex", alignItems: "center", gap: 5 }}>
                 <div style={{ width: 10, height: 10, borderRadius: 3,
@@ -515,7 +605,7 @@
           </div>
 
           <div style={{ textAlign: "center", color: "#334155", fontSize: 11, marginTop: 12 }}>
-            80 tests passing · SPY QQQ AAPL MSFT AMZN IWM · Alpaca Paper Trading
+            120 tests passing · SPY QQQ (+ configurable) · Alpaca Paper Trading · 8 risk guardrails
           </div>
         </div>
       );

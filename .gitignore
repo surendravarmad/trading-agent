@@ -3,7 +3,9 @@ __pycache__/
 *.pyc
 logs/
 trade_plans/
+trade_journal/
 *.egg-info/
 dist/
 build/
 .venv/
+.vscode/launch.json

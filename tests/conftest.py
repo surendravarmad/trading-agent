@@ -52,7 +52,8 @@ def test_config(tmp_path):
 def bullish_prices():
     """Generate 200 days of prices in a clear uptrend above SMA-200."""
     np.random.seed(42)
-    dates = pd.date_range(end=datetime.now(), periods=200, freq="B")
+    _end = pd.offsets.BDay().rollback(pd.Timestamp.today().normalize())
+    dates = pd.bdate_range(end=_end, periods=200)
     base = np.linspace(400, 500, 200)
     noise = np.random.normal(0, 8.0, 200)
     prices = base + noise
@@ -69,7 +70,8 @@ def bullish_prices():
 def bearish_prices():
     """Generate 200 days of prices in a clear downtrend below SMA-200."""
     np.random.seed(42)
-    dates = pd.date_range(end=datetime.now(), periods=200, freq="B")
+    _end = pd.offsets.BDay().rollback(pd.Timestamp.today().normalize())
+    dates = pd.bdate_range(end=_end, periods=200)
     base = np.linspace(500, 400, 200)
     noise = np.random.normal(0, 8.0, 200)
     prices = base + noise
@@ -86,7 +88,8 @@ def bearish_prices():
 def sideways_prices():
     """Generate 200 days of prices oscillating in a narrow range."""
     np.random.seed(42)
-    dates = pd.date_range(end=datetime.now(), periods=200, freq="B")
+    _end = pd.offsets.BDay().rollback(pd.Timestamp.today().normalize())
+    dates = pd.bdate_range(end=_end, periods=200)
     base = 450 + 3 * np.sin(np.linspace(0, 8 * np.pi, 200))
     noise = np.random.normal(0, 0.5, 200)
     prices = base + noise

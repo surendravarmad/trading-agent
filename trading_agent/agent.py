@@ -131,6 +131,7 @@ class TradingAgent:
             max_delta=config.trading.max_delta,
             liquidity_max_spread=config.trading.liquidity_max_spread,
             max_buying_power_pct=config.trading.max_buying_power_pct,
+            margin_multiplier=config.trading.margin_multiplier,
         )
         self.executor = OrderExecutor(
             api_key=config.alpaca.api_key,
@@ -549,30 +550,6 @@ class TradingAgent:
         logger.info("[%s] Phase II — CLASSIFY", ticker)
         analysis: RegimeAnalysis = self.regime_classifier.classify(ticker)
 
-        # --- Macro Guard: price < SMA-200 blocks Bull Put Spreads ---
-        if getattr(analysis, "macro_guard_active", False):
-            expected = self._regime_to_strategy(analysis.regime)
-            if expected == "Bull Put Spread":
-                reason = (
-                    f"MacroGuard: price ({analysis.current_price:.2f}) < "
-                    f"SMA-200 ({analysis.sma_200:.2f}) — blocking bull spread")
-                logger.warning("[%s] %s | strategy_mode=defense_first", ticker, reason)
-                self.journal_kb.log_defense_first(
-                    ticker, reason, analysis.current_price,
-                    {"regime": analysis.regime.value,
-                     "macro_guard_active": True,
-                     "iv_rank": getattr(analysis, "iv_rank", 0.0)})
-                return {
-                    "ticker": ticker,
-                    "regime": analysis.regime.value,
-                    "strategy": "Bull Put Spread",
-                    "plan_valid": False,
-                    "risk_approved": False,
-                    "status": "skipped",
-                    "reason": reason,
-                    "strategy_mode": "defense_first",
-                }
-
         # --- High-IV block: IV rank > 95th pct blocks all new entries ---
         if getattr(analysis, "high_iv_warning", False):
             reason = (
@@ -876,8 +853,10 @@ class TradingAgent:
         signalling the agent should close positions rather than open new ones.
         """
         if equity <= 0:
-            return False
-        pct_used = 1.0 - (buying_power / equity)
+            logger.warning("Equity <= 0 (%.2f) — Emergency Liquidation Mode", equity)
+            return True
+        initial_bp = equity * self.config.trading.margin_multiplier
+        pct_used = 1.0 - (buying_power / initial_bp)
         limit = self.config.trading.max_buying_power_pct
         if pct_used > limit:
             logger.warning(

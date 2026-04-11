@@ -35,19 +35,21 @@ class RiskManager:
     5. Account type           == "paper"
     6. Market is open
     7. Underlying liquidity   — bid/ask spread < liquidity_max_spread
-    8. Buying power           — available BP ≥ (1 - max_buying_power_pct) × equity
+    8. Buying power           — available BP ≥ (1 - max_buying_power_pct) × (equity × margin_multiplier)
     """
 
     def __init__(self, max_risk_pct: float = 0.02,
                  min_credit_ratio: float = 0.25,
                  max_delta: float = 0.25,
                  liquidity_max_spread: float = 0.05,
-                 max_buying_power_pct: float = 0.80):
+                 max_buying_power_pct: float = 0.80,
+                 margin_multiplier: float = 2.0):
         self.max_risk_pct = max_risk_pct
         self.min_credit_ratio = min_credit_ratio
         self.max_delta = max_delta
         self.liquidity_max_spread = liquidity_max_spread
         self.max_buying_power_pct = max_buying_power_pct
+        self.margin_multiplier = margin_multiplier
 
     def evaluate(self, plan: SpreadPlan,
                  account_balance: float,
@@ -125,7 +127,8 @@ class RiskManager:
 
         # --- Check 8: buying power availability ---
         if account_buying_power is not None and account_balance > 0:
-            pct_used = 1.0 - (account_buying_power / account_balance)
+            initial_bp = account_balance * self.margin_multiplier
+            pct_used = 1.0 - (account_buying_power / initial_bp)
             if pct_used <= self.max_buying_power_pct:
                 passed.append(
                     f"Buying power {pct_used*100:.1f}% used "

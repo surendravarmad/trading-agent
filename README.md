@@ -617,3 +617,225 @@ pytest tests/test_visualize_logs.py -v
 | `LLM_TEMPERATURE` | `0.3` | Sampling temperature |
 | `TRADE_JOURNAL_DIR` | `trade_journal` | Trade lifecycle logs + signal journal |
 | `KNOWLEDGE_BASE_DIR` | `knowledge_base` | RAG vector store |
+
+---
+
+## Streamlit Live Dashboard
+
+An interactive browser dashboard with three tabs: real-time portfolio monitoring, historical backtesting, and an LLM-powered trade analyst chat.
+
+### Run
+
+```bash
+# Install dependencies
+pip install "streamlit>=1.42.0" "plotly>=6.0.0"
+
+# Launch dashboard (always run from repo root)
+streamlit run trading_agent/streamlit/app.py
+```
+
+The dashboard auto-discovers your `.env` file — no extra config needed.
+
+### Tabs
+
+| Tab | Features |
+|-----|---------|
+| **📡 Live Monitoring** | Equity · P&L · regime badge · cycle countdown · open positions table · equity curve · 8-guardrail status cards · market status + SMA drift · journal expander · auto-refresh every 30 s · Emergency Pause button |
+| **📊 Backtesting** | Date range · multi-ticker · timeframe (1Day/5Min) · simulated Bull Put / Bear Call / Iron Condor P&L · metric cards (trades, win%, profit factor, maxDD%, Sharpe, avg hold) · per-regime bar chart · equity + drawdown charts · sortable trade log · CSV/JSON/Journal export |
+| **🤖 LLM Extension** | Chat with local Ollama model (RAG over journal) · pre-built buttons: analyze last 10 trades, next-week plan, VIX +20% what-if · Optimize Strategy → one-click `.env` update |
+
+---
+
+### Backtesting — Full Reference
+
+The backtester simulates your live credit-spread strategy on historical price data without placing any real orders. It uses the same regime classification rules, strike placement logic, and risk parameters as the live agent, so results are directly comparable to live performance.
+
+---
+
+#### What the backtester is (and is not)
+
+| It IS | It is NOT |
+|-------|-----------|
+| A faithful replay of your strategy's decision rules | A live options pricer using real bid/ask |
+| A fast way to compare regimes, tickers, and date ranges | A Monte Carlo or walk-forward optimizer |
+| Useful for spotting which regime loses money | A guarantee of future performance |
+| Based on real daily closing prices from yfinance | Accounting for slippage, early assignment, or pin risk |
+
+Credit collected and max-loss are calculated from fixed spread parameters (not live option chains), so treat the output as **directional signal**, not exact dollar P&L.
+
+---
+
+#### Architecture — what runs when you click "Run Backtest"
+
+```
+Sidebar inputs
+  │
+  ▼
+yfinance.download(ticker, start, end, interval="1d")
+  │  Downloads OHLCV daily bars for every selected ticker.
+  │  Requires internet access. Data is cached for the session.
+  ▼
+SMA-200 Warmup (first 200 bars — no trades placed)
+  │  Builds enough history to compute a valid 200-day simple
+  │  moving average. Trades only start from bar 201 onward.
+  ▼
+For every 45th bar after warmup:
+  │
+  ├─ Step 1: Regime Classification
+  │    Computes SMA-50, SMA-200, and SMA-50 slope over the
+  │    last 5 bars. Applies the same three-way rule as the
+  │    live RegimeClassifier.
+  │
+  ├─ Step 2: Strategy Selection
+  │    BULLISH  → Bull Put Spread  (sell OTM put, buy lower put)
+  │    BEARISH  → Bear Call Spread (sell OTM call, buy higher call)
+  │    SIDEWAYS → Iron Condor      (sell OTM put + call, buy wings)
+  │
+  ├─ Step 3: Short Strike Placement
+  │    Short strike = current close ± 3%
+  │    Bull Put:  short put at  price × 0.97  (3% below)
+  │    Bear Call: short call at price × 1.03  (3% above)
+  │    Iron Condor: short put at −3%, short call at +3%
+  │
+  ├─ Step 4: Outcome Simulation (look-forward over next 45 bars)
+  │    Scans every subsequent closing price until hold period ends.
+  │    If price crosses the short strike at any point → LOSS
+  │    If price never crosses the short strike        → WIN
+  │
+  ├─ Step 5: P&L Calculation
+  │    WIN:  pnl = (credit × 100 × 0.50) − $2.60 commission
+  │    LOSS: pnl = −((spread_width − credit) × 100) − $2.60
+  │
+  └─ Step 6: Record & Advance
+       Append SimTrade to the trade log.
+       Update running equity.
+       Move entry cursor forward 45 bars (one trade at a time).
+```
+
+---
+
+#### Regime classification rules (same as live agent)
+
+```
+SMA-50  = average of last 50 daily closes
+SMA-200 = average of last 200 daily closes
+Slope   = SMA-50 average over last 5 bars − SMA-50 average over bars 6–10
+
+BULLISH:        price > SMA-200  AND  slope > 0
+BEARISH:        price < SMA-200  AND  slope < 0
+SIDEWAYS:       everything else (price between MAs, or slope flat)
+```
+
+The dominant regime across all tickers is shown in the results breakdown table and bar chart so you can see which market environment drove most of your simulated P&L.
+
+---
+
+#### Fixed simulation parameters
+
+| Parameter | Value | Notes |
+|-----------|-------|-------|
+| Spread width | $5.00 | Distance between short and long strikes |
+| Credit collected | $1.50 (30% of width) | Approximates a 0.30 delta short strike |
+| Profit target | 50% of credit ($0.75) | Matches the live agent's 50% take-profit |
+| Max loss | $3.50 (width − credit) | Per-contract, before commission |
+| Target DTE | 45 days | Days-to-expiration at entry |
+| Short strike OTM % | 3% | From current close price |
+| Commission (round trip) | $2.60 | 4 legs × $0.65/contract |
+| Starting equity | $100,000 | Paper account starting balance |
+| Trade frequency | Every 45 bars | One trade per ticker at a time |
+
+---
+
+#### Output metrics explained
+
+| Metric | Formula | What it tells you |
+|--------|---------|-------------------|
+| **Total Trades** | Count of all SimTrades | How many opportunities the strategy found |
+| **Win Rate** | Wins ÷ total trades × 100 | % of trades that hit profit target before strike breach |
+| **Profit Factor** | Gross wins ÷ gross losses | > 1.0 = net profitable; > 1.5 = strong edge |
+| **Max Drawdown %** | Largest peak-to-trough equity drop | Risk of ruin signal — keep below 20% |
+| **Sharpe Ratio** | Mean trade P&L ÷ std dev × √252 | Risk-adjusted return; > 1.0 is good |
+| **Avg Hold Days** | Mean bars between entry and exit | How long capital is tied up per trade |
+
+---
+
+#### Date range requirement — critical
+
+The SMA-200 warmup consumes the first 200 trading days of data before a single trade can be placed. **If your date range is shorter than ~10 months, the loop is empty and every metric shows 0.**
+
+| Date range selected | Trading days downloaded | Trades possible |
+|---------------------|------------------------|-----------------|
+| 3 months | ~63 bars | **0 — all zeros** |
+| 6 months | ~126 bars | **0 — all zeros** |
+| 10 months | ~210 bars | ~1–2 per ticker |
+| 1 year (default) | ~252 bars | ~1–3 per ticker |
+| 2 years | ~504 bars | ~5–7 per ticker |
+| 3 years (recommended) | ~756 bars | ~15+ per ticker |
+
+**Use 2–3 years for meaningful results.** With only 1 year the warmup consumes most of the data. With 3 years you get 15+ trades per ticker and enough sample size for the metrics to be statistically meaningful.
+
+---
+
+#### Step-by-step usage
+
+1. Open the **sidebar** (left panel — click `>` if collapsed)
+2. Set **Start Date** at least 1 year ago; 2–3 years is recommended
+3. Set **End Date** to yesterday (today's close is not yet available)
+4. Select **Tickers** — start with `SPY, QQQ, IWM` for broad coverage
+5. Choose **Timeframe**:
+   - `1Day` — fast, recommended for all backtests
+   - `5Min` — downloads ~78× more data per ticker; slow, and the warmup rule still applies (needs 200 intraday bars, which is only ~3.5 trading days — so 5Min ranges can be short)
+6. Leave **Use Alpaca Data** off (reserved for future use; falls back to yfinance automatically)
+7. Click **Run Backtest** — results appear within a few seconds
+8. Explore outputs:
+   - **Metric cards** — headline numbers at a glance
+   - **Regime table + bar chart** — which regime earned/lost the most
+   - **Equity curve** — visualise compounding over time
+   - **Drawdown chart** — worst losing streaks
+   - **Trade log** — sort by any column; click headers to re-sort
+9. Export:
+   - **Export CSV** — spreadsheet of every simulated trade
+   - **Export JSON** — machine-readable trade log
+   - **Export to Journal** — writes a summary entry to `trade_journal/signals.jsonl` so the LLM tab can reference backtest history
+
+---
+
+#### Common issues and fixes
+
+| Symptom | Cause | Fix |
+|---------|-------|-----|
+| All metrics show 0 | Date range too short (< 200 bars) | Set Start Date ≥ 2 years ago |
+| "Skipped: SPY (only N bars)" warning | yfinance returned fewer bars than expected | Widen date range or try again (rate limit) |
+| No trades for a ticker despite long range | Regime stayed sideways; all attempts breached 3% band | Normal — try a different ticker or period |
+| 5Min timeframe is very slow | Downloads 78× more data | Switch to 1Day |
+| Results look too optimistic | Look-forward bias is minimal here (we use close-to-close) | Credit/loss are fixed, not real option prices — directional signal only |
+
+---
+
+### Live Monitoring — How It Works
+
+The Live Monitoring tab reads from two sources:
+
+- **Alpaca account API** — live equity, buying power, open positions
+- **`trade_journal/signals.jsonl`** — every cycle's regime, guardrail checks, and RSI/SMA values
+
+It refreshes automatically every 30 seconds as a Streamlit fragment (non-blocking — the other tabs stay usable). The **Emergency Pause** button writes a `PAUSED` file to the repo root; the agent checks for this file at the start of every cycle and skips all order submissions until it is removed (click **▶ Resume** to clear it).
+
+---
+
+### Screenshots
+
+<!-- Live Monitoring tab -->
+![Live Monitoring](docs/screenshots/live_monitor.png)
+
+<!-- Backtesting tab -->
+![Backtesting](docs/screenshots/backtest.png)
+
+<!-- LLM Extension tab -->
+![LLM Extension](docs/screenshots/llm_extension.png)
+
+### Run tests
+
+```bash
+pytest tests/test_streamlit/ -v
+```

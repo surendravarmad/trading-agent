@@ -296,7 +296,24 @@ class MarketDataProvider:
 
     @staticmethod
     def sma_slope(sma_series: pd.Series, lookback: int = 5) -> float:
-        """Average daily slope of an SMA over the last *lookback* periods."""
+        """Average daily change of an SMA over the last *lookback* periods.
+
+        Units — **dollars per day** (not a percentage).  Returns
+        ``(SMA[t] − SMA[t−lookback]) / lookback`` as a raw price delta.
+
+        A reading of ``0.50`` for ``lookback=5`` means the SMA rose by
+        an average of 50 cents per day over the five trading days ending
+        at ``t``.  To interpret magnitude as a fraction of the underlying,
+        divide by ``SMA[t]`` (``slope / sma.iloc[-1]``) at the call site.
+
+        All current downstream consumers use the **sign** of this value
+        (``slope > 0`` → bullish trend continuation; ``slope < 0`` →
+        bearish; see ``RegimeClassifier._determine_regime``), and the
+        sign is unit-invariant so the dimensional form is harmless.
+        Code or LLM prompts that treat this number as a percentage would
+        misread it — see ``RegimeAnalysis.sma_50_slope`` and the
+        "SMA-50 slope units" note in ``README.md``.
+        """
         recent = sma_series.dropna().tail(lookback)
         if len(recent) < 2:
             return 0.0

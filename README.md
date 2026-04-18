@@ -55,6 +55,8 @@ Strategy selection follows a strict priority order:
 | 5 | **Bearish** | Price < SMA-200 AND SMA-50 slope < 0 | Bear Call Spread |
 | 6 | **Sideways** | Between SMAs or narrow Bollinger Bands | Iron Condor |
 
+**SMA-50 slope units.** `MarketDataProvider.sma_slope()` returns the 5-day average **dollar change per day** of the SMA — a raw price delta, not a percentage. Every downstream consumer (`RegimeClassifier._determine_regime`, `trade_journal`, `fine_tuning`) only reads the sign (`> 0` → bullish trend; `< 0` → bearish), and the sign is unit-invariant, so the dimensional form is harmless. Logs and the LLM analyst prompt are annotated with `$/day` so a reader doesn't mistake the magnitude for a percentage. To convert to a percentage rate-of-change, divide by `sma_50` at the call site.
+
 ### Mean Reversion Spreads
 
 When price reaches a **3-standard-deviation Bollinger Band** (statistically extreme), the agent expects reversion toward the mean and sells a spread in the direction of the expected move:
@@ -96,12 +98,15 @@ Phase III  fetch_option_chain()   ← full chain, 3-min TTL cache (scanning)
               ↓
 Phase VI   fetch_option_quotes([sold_symbol, bought_symbol])  ← no cache, 2 symbols only
               live_credit = sold.bid − bought.ask
-              limit_price = −live_credit                      ← current market price
+              _recheck_live_economics(plan, live_credit, equity)   ← re-runs guardrails #2 & #4
+              qty = _calculate_qty(plan, equity, live_credit)      ← sizes off live credit
+              limit_price = −live_credit                           ← current market price
 ```
 
-- If the live credit deviates **> 10%** from the plan, a `WARNING` is logged
-- If the quote fetch fails (API timeout), the planned credit is used as fallback with a warning — the order still goes out
-- The `PRICE_DRIFT_WARN_PCT = 0.10` threshold is a class constant in `OrderExecutor` and can be tightened
+- If the live credit deviates **> 10%** from the plan, a `WARNING` is logged (`PRICE_DRIFT_WARN_PCT = 0.10` class constant, tightenable)
+- The two **economics-bearing** guardrails are re-validated against `live_credit` before the order is submitted: credit/width ≥ `MIN_CREDIT_RATIO` and per-contract max-loss ≤ `MAX_RISK_PCT × equity`. If either fails, the order is **rejected** with reason `live_credit_risk: …` and never hits the wire. Environment-dependent guardrails (market-open, paper account, buying power, underlying liquidity) are not re-checked — they haven't changed in the seconds since planning.
+- Position sizing also divides by the refreshed `live_credit`, so a 10%-drifted credit produces a correspondingly smaller qty rather than over-sizing from the stale planning-time number.
+- If the quote fetch fails (API timeout), the planned credit is used as fallback — the re-check runs against the plan values, which already passed the full risk check at planning time, so it's effectively a no-op and the order still goes out.
 
 ### Expiration Date Selection
 

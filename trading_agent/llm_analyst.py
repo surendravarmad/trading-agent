@@ -73,7 +73,7 @@ ANALYSIS_PROMPT_TEMPLATE = """## Proposed Trade
 
 **Ticker:** {ticker}
 **Strategy:** {strategy_name}
-**Regime:** {regime} (SMA50 slope: {sma_50_slope:.4f})
+**Regime:** {regime} (SMA50 slope: ${sma_50_slope:.4f}/day — raw price delta, sign indicates trend direction)
 
 **Market Data:**
 - Current Price: ${current_price:.2f}

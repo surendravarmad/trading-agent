@@ -36,7 +36,7 @@ import json
 import logging
 import os
 from datetime import datetime, timezone
-from typing import TYPE_CHECKING, Dict, Optional
+from typing import TYPE_CHECKING, Dict, Optional, Tuple
 
 import requests
 
@@ -65,17 +65,19 @@ class OrderExecutor:
                  trade_plan_dir: str = "trade_plans",
                  dry_run: bool = True,
                  data_provider: Optional["MarketDataProvider"] = None,
-                 max_risk_pct: float = 0.02):
+                 max_risk_pct: float = 0.02,
+                 min_credit_ratio: float = 0.33):
         self.api_key = api_key
         self.secret_key = secret_key
         self.base_url = base_url
         self.trade_plan_dir = trade_plan_dir
         self.dry_run = dry_run
         self.data_provider = data_provider   # used for live quote refresh
-        # Same ceiling the RiskManager enforces as guardrail #4.  Sizing shares
-        # this budget so sizing and risk validation never disagree on the
-        # definition of "max loss per trade as fraction of equity".
+        # Same ceilings the RiskManager enforces as guardrails #2 and #4.
+        # Sizing AND the live-credit re-check share these so planning-time
+        # validation and execution-time validation never drift apart.
         self.max_risk_pct = max_risk_pct
+        self.min_credit_ratio = min_credit_ratio
         os.makedirs(self.trade_plan_dir, exist_ok=True)
 
     def _headers(self) -> Dict[str, str]:
@@ -126,7 +128,8 @@ class OrderExecutor:
     # Alpaca order submission
     # ------------------------------------------------------------------
 
-    def _calculate_qty(self, plan: SpreadPlan, account_balance: float) -> int:
+    def _calculate_qty(self, plan: SpreadPlan, account_balance: float,
+                       live_credit: Optional[float] = None) -> int:
         """
         Size contracts so the position's total max loss stays within the
         same budget the RiskManager validated against (``max_risk_pct ×
@@ -134,9 +137,14 @@ class OrderExecutor:
 
         ::
 
-            max_loss_per_contract = (spread_width − net_credit) × 100
+            credit                 = live_credit if provided else plan.net_credit
+            max_loss_per_contract  = (spread_width − credit) × 100
             qty                    = floor(max_risk_pct × equity
                                            / max_loss_per_contract)
+
+        Passing ``live_credit`` ensures sizing reflects the refreshed
+        bid/ask at submission time rather than the stale planning-time
+        credit — see ``_submit_order``.
 
         Returns **0** when no integer quantity fits inside the budget (e.g.
         a single contract's max loss alone exceeds the ceiling, or inputs
@@ -144,11 +152,60 @@ class OrderExecutor:
         — never silently floor to 1, which would otherwise bypass the
         guardrail.
         """
-        max_loss_per_contract = (plan.spread_width - plan.net_credit) * 100
+        credit = live_credit if live_credit is not None else plan.net_credit
+        max_loss_per_contract = (plan.spread_width - credit) * 100
         if max_loss_per_contract <= 0 or account_balance <= 0:
             return 0
         max_risk_dollars = account_balance * self.max_risk_pct
         return int(max_risk_dollars // max_loss_per_contract)
+
+    def _recheck_live_economics(self, plan: SpreadPlan,
+                                live_credit: float,
+                                account_balance: float) -> Tuple[bool, str]:
+        """
+        Re-validate the two economics-bearing guardrails against live bid/ask.
+
+        Between planning (Phase III) and execution (Phase VI) the net credit
+        can drift materially with the book.  Only the market-independent
+        checks (market-open, account-type, buying-power, underlying
+        liquidity) stay valid; ``credit_to_width_ratio`` and ``max_loss``
+        must be recomputed from ``live_credit`` and re-validated against
+        the same thresholds the RiskManager uses:
+
+          * guardrail #2  — credit / width  ≥  ``min_credit_ratio``
+          * guardrail #4  — max_loss (per contract) ≤ ``max_risk_pct × equity``
+
+        Returns
+        -------
+        (ok, reason)
+            ``ok`` is True when both checks pass; ``reason`` is empty on
+            success, else a short human-readable "live_credit_risk: ..."
+            string describing the first failure.
+        """
+        width = plan.spread_width
+        if width <= 0:
+            return (False,
+                    f"live_credit_risk: spread_width {width} is non-positive")
+
+        live_ratio = live_credit / width
+        if live_ratio < self.min_credit_ratio:
+            return (False,
+                    f"live_credit_risk: credit/width {live_ratio:.4f} < "
+                    f"{self.min_credit_ratio} "
+                    f"(live_credit=${live_credit:.2f}, width=${width:.2f}, "
+                    f"planning ratio was {plan.credit_to_width_ratio:.4f})")
+
+        live_max_loss = (width - live_credit) * 100
+        max_allowed = account_balance * self.max_risk_pct
+        if live_max_loss > max_allowed:
+            return (False,
+                    f"live_credit_risk: max_loss ${live_max_loss:.2f} > "
+                    f"{self.max_risk_pct*100:.0f}% × ${account_balance:,.2f} "
+                    f"(=${max_allowed:.2f}) "
+                    f"(live_credit=${live_credit:.2f}, "
+                    f"planning max_loss was ${plan.max_loss:.2f})")
+
+        return (True, "")
 
     def _submit_order(self, plan: SpreadPlan, plan_path: str,
                       run_id: str, account_balance: float = 0.0) -> Dict:
@@ -203,17 +260,41 @@ class OrderExecutor:
                 logger.info("[%s] Live credit $%.2f (plan was $%.2f)",
                             plan.ticker, live_credit, plan.net_credit)
 
+        # Re-validate the economics-bearing guardrails against LIVE credit.
+        # The RiskManager approved this plan at planning time using
+        # plan.net_credit; if the bid/ask has drifted materially the
+        # credit-to-width or max-loss checks may no longer hold.  The
+        # other guardrails (market-open, paper, buying-power, underlying
+        # liquidity) are environment-dependent and haven't changed.
+        ok, recheck_reason = self._recheck_live_economics(
+            plan, live_credit, account_balance)
+        if not ok:
+            logger.error("[%s] Live-credit risk recheck FAILED — %s. "
+                         "Aborting order submission.",
+                         plan.ticker, recheck_reason)
+            result = {
+                "status": "rejected",
+                "reason": recheck_reason,
+                "plan_file": plan_path,
+                "run_id": run_id,
+            }
+            self._append_to_plan(plan_path, run_id, {"order_result": result})
+            return result
+
         # Alpaca sign convention: credit → negative limit_price
         limit_price_value = -abs(live_credit)
 
-        qty = self._calculate_qty(plan, account_balance)
+        # Size off the LIVE credit so qty reflects the economics we're
+        # actually submitting, not the stale planning-time credit.
+        qty = self._calculate_qty(plan, account_balance, live_credit=live_credit)
         if qty < 1:
-            max_loss_per_contract = (plan.spread_width - plan.net_credit) * 100
+            max_loss_per_contract = (plan.spread_width - live_credit) * 100
             max_risk_dollars = account_balance * self.max_risk_pct
             reason = (
                 f"qty=0: max_loss_per_contract ${max_loss_per_contract:.2f} "
                 f"> sizing budget ${max_risk_dollars:.2f} "
-                f"({self.max_risk_pct*100:.0f}% × ${account_balance:,.2f})"
+                f"({self.max_risk_pct*100:.0f}% × ${account_balance:,.2f}) "
+                f"(live_credit=${live_credit:.2f})"
             )
             logger.error(
                 "[%s] Position sizing produced qty=0 — %s. Aborting order "

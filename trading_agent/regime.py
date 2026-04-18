@@ -30,6 +30,10 @@ class RegimeAnalysis:
     current_price: float
     sma_50: float
     sma_200: float
+    # Raw **dollars-per-day** slope of the 50-day SMA over the last 5 bars
+    # (see ``MarketDataProvider.sma_slope``).  Used by downstream code as a
+    # sign check only (slope > 0 → bullish trend).  NOT a percentage —
+    # dividing by ``sma_50`` gives the equivalent % rate of change.
     sma_50_slope: float
     rsi_14: float
     bollinger_width: float

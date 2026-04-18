@@ -290,3 +290,191 @@ class TestPositionSizing:
 
         assert result["status"] == "rejected"
         assert "qty=0" in result["reason"]
+
+    def test_qty_uses_live_credit_override(self, tmp_path):
+        """Passing live_credit must change qty when it differs from plan."""
+        executor = OrderExecutor(
+            api_key="k", secret_key="s",
+            trade_plan_dir=str(tmp_path), dry_run=True,
+            max_risk_pct=0.02,
+        )
+        plan = _make_sized_plan(spread_width=5.0, net_credit=0.40)
+        # Planned credit: qty = floor(2000 / 460) = 4
+        assert executor._calculate_qty(plan, 100_000) == 4
+        # Live credit dropped to 0.20: max_loss_per_contract = $480
+        # qty = floor(2000 / 480) = 4 — same bucket
+        assert executor._calculate_qty(plan, 100_000, live_credit=0.20) == 4
+        # Live credit dropped hard to 0.05: max_loss_per_contract = $495
+        # qty = floor(2000 / 495) = 4 — still 4
+        # Drop further to 0.01: max_loss = $499, qty = 4
+        # Pick a value that genuinely changes the bucket: wider width scenario
+        wide_plan = _make_sized_plan(spread_width=10.0, net_credit=4.00)
+        # Planned: max_loss = $600, budget $2000 → qty = 3
+        assert executor._calculate_qty(wide_plan, 100_000) == 3
+        # Live credit crashed to 1.50: max_loss = $850, budget $2000 → qty = 2
+        assert executor._calculate_qty(
+            wide_plan, 100_000, live_credit=1.50) == 2
+
+
+# ------------------------------------------------------------------
+# Live-credit risk re-check before order submission
+# ------------------------------------------------------------------
+
+class TestLiveCreditRecheck:
+    """Guardrails #2 (credit/width) and #4 (max-loss) must be re-validated
+    against the LIVE credit before the order hits the wire."""
+
+    def _make_provider_with_credit(self, live_credit: float, plan_width: float):
+        """Build a data_provider whose refreshed quotes yield `live_credit`
+        for a spread with total `plan_width`."""
+        provider = MagicMock()
+        # Use the spread's two symbols from _make_plan().  Sold leg is the
+        # one with action='sell' (priced at bid); bought leg pays ask.
+        # Target: sold.bid − bought.ask == live_credit.  Choose sold.bid = 1.00.
+        sold_bid = 1.00
+        bought_ask = sold_bid - live_credit
+        provider.fetch_option_quotes.return_value = {
+            "SPY250425P00480000": {"bid": sold_bid, "ask": sold_bid + 0.05, "mid": sold_bid + 0.025},
+            "SPY250425P00475000": {"bid": bought_ask - 0.05, "ask": bought_ask, "mid": bought_ask - 0.025},
+        }
+        return provider
+
+    def test_rejects_when_live_credit_breaks_min_credit_ratio(self, tmp_path):
+        """Credit/width drops below threshold → rejected, no POST."""
+        provider = self._make_provider_with_credit(
+            live_credit=0.50, plan_width=5.0)   # 0.50/5.0 = 0.10 < 0.33
+        executor = OrderExecutor(
+            api_key="k", secret_key="s",
+            trade_plan_dir=str(tmp_path), dry_run=False,
+            data_provider=provider,
+            max_risk_pct=0.02, min_credit_ratio=0.33,
+        )
+        plan = _make_plan()  # plan.credit_to_width_ratio=0.08 too, but
+        plan.net_credit = 1.70                     # plan passed at credit 1.70
+        plan.credit_to_width_ratio = 1.70 / 5.0    # = 0.34 (above threshold)
+        plan.spread_width = 5.0
+        plan.max_loss = 330.0
+
+        with patch("trading_agent.executor.requests.post") as mock_post:
+            result = executor.execute(_make_verdict(approved=True, plan=plan))
+            assert mock_post.called is False
+
+        assert result["status"] == "rejected"
+        assert "live_credit_risk" in result["reason"]
+        assert "credit/width" in result["reason"]
+
+    def test_rejects_when_live_credit_breaks_max_loss_guardrail(self, tmp_path):
+        """Live max-loss exceeds equity ceiling even though credit/width is fine.
+
+        Width=10, live_credit=4.00 → credit/width=0.40 (passes #2),
+        max_loss=$600.  Shrink equity so 2% budget = $500 → $600 > $500
+        fails #4 — the max-loss check alone must trip."""
+        provider = self._make_provider_with_credit(
+            live_credit=4.00, plan_width=10.0)
+        executor = OrderExecutor(
+            api_key="k", secret_key="s",
+            trade_plan_dir=str(tmp_path), dry_run=False,
+            data_provider=provider,
+            max_risk_pct=0.02, min_credit_ratio=0.33,
+        )
+        plan = _make_plan()
+        plan.spread_width = 10.0
+        plan.net_credit = 4.00
+        plan.credit_to_width_ratio = 0.40
+        plan.max_loss = 600.0
+
+        verdict = _make_verdict(approved=True, plan=plan)
+        verdict.account_balance = 25_000       # 2% × 25k = $500 budget
+
+        with patch("trading_agent.executor.requests.post") as mock_post:
+            result = executor.execute(verdict)
+            assert mock_post.called is False
+
+        assert result["status"] == "rejected"
+        assert "live_credit_risk" in result["reason"]
+        assert "max_loss" in result["reason"]
+
+    def test_accepts_when_live_credit_stays_within_guardrails(self, tmp_path):
+        """Live credit close to plan → no drift abort, order submitted."""
+        provider = self._make_provider_with_credit(
+            live_credit=1.70, plan_width=5.0)  # 0.34 ratio, max_loss=$330
+        executor = OrderExecutor(
+            api_key="k", secret_key="s",
+            trade_plan_dir=str(tmp_path), dry_run=False,
+            data_provider=provider,
+            max_risk_pct=0.02, min_credit_ratio=0.33,
+        )
+        plan = _make_plan()
+        plan.spread_width = 5.0
+        plan.net_credit = 1.70
+        plan.credit_to_width_ratio = 0.34
+        plan.max_loss = 330.0
+
+        with patch("trading_agent.executor.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(
+                status_code=200,
+                json=lambda: {"id": "order-123", "status": "accepted"},
+            )
+            result = executor.execute(_make_verdict(approved=True, plan=plan))
+
+        assert mock_post.called, "Order must be submitted when live recheck passes"
+        assert result["status"] == "submitted"
+
+    def test_recheck_skipped_content_when_refresh_fails(self, tmp_path):
+        """When refresh fails we fall back to plan.net_credit — the
+        recheck runs against that same credit, so it's effectively a
+        no-op (plan was already approved at planning time)."""
+        provider = MagicMock()
+        provider.fetch_option_quotes.return_value = {}   # refresh fails
+        executor = OrderExecutor(
+            api_key="k", secret_key="s",
+            trade_plan_dir=str(tmp_path), dry_run=False,
+            data_provider=provider,
+            max_risk_pct=0.02, min_credit_ratio=0.33,
+        )
+        plan = _make_plan()
+        plan.spread_width = 5.0
+        plan.net_credit = 1.70
+        plan.credit_to_width_ratio = 0.34
+        plan.max_loss = 330.0
+
+        with patch("trading_agent.executor.requests.post") as mock_post:
+            mock_post.return_value = MagicMock(
+                status_code=200,
+                json=lambda: {"id": "x", "status": "accepted"},
+            )
+            result = executor.execute(_make_verdict(approved=True, plan=plan))
+
+        # Refresh failed → fell back to plan.net_credit → recheck passes →
+        # order still submitted (fallback behavior from Task #6 preserved).
+        assert mock_post.called
+        assert result["status"] == "submitted"
+
+    def test_recheck_helper_returns_reason_for_credit_ratio_break(self, tmp_path):
+        executor = OrderExecutor(
+            api_key="k", secret_key="s", trade_plan_dir=str(tmp_path),
+            dry_run=True, min_credit_ratio=0.33,
+        )
+        plan = _make_plan()
+        plan.spread_width = 5.0
+        plan.credit_to_width_ratio = 0.34      # was fine at planning
+        ok, reason = executor._recheck_live_economics(
+            plan, live_credit=0.50, account_balance=100_000)
+        assert ok is False
+        assert "live_credit_risk" in reason
+        assert "credit/width" in reason
+
+    def test_recheck_helper_returns_ok_for_identical_live_credit(self, tmp_path):
+        executor = OrderExecutor(
+            api_key="k", secret_key="s", trade_plan_dir=str(tmp_path),
+            dry_run=True, max_risk_pct=0.02, min_credit_ratio=0.33,
+        )
+        plan = _make_plan()
+        plan.spread_width = 5.0
+        plan.net_credit = 1.70
+        plan.credit_to_width_ratio = 0.34
+        plan.max_loss = 330.0
+        ok, reason = executor._recheck_live_economics(
+            plan, live_credit=1.70, account_balance=100_000)
+        assert ok is True
+        assert reason == ""

@@ -39,8 +39,8 @@ class RiskManager:
     """
 
     def __init__(self, max_risk_pct: float = 0.02,
-                 min_credit_ratio: float = 0.25,
-                 max_delta: float = 0.25,
+                 min_credit_ratio: float = 0.33,
+                 max_delta: float = 0.20,
                  liquidity_max_spread: float = 0.05,
                  max_buying_power_pct: float = 0.80,
                  margin_multiplier: float = 2.0):

@@ -82,8 +82,10 @@ def load_config(env_path: str = None) -> AppConfig:
         tickers=tickers,
         mode=os.getenv("MODE", "dry_run"),
         max_risk_pct=float(os.getenv("MAX_RISK_PCT", "0.02")),
-        min_credit_ratio=float(os.getenv("MIN_CREDIT_RATIO", "0.25")),  # lowered for more trades
-        max_delta=float(os.getenv("MAX_DELTA", "0.25")),  # increased for more options
+        # Defaults reflect the README design intent (premium-rich, ~80% POP).
+        # Override per-deployment via .env if you want a looser fill policy.
+        min_credit_ratio=float(os.getenv("MIN_CREDIT_RATIO", "0.33")),
+        max_delta=float(os.getenv("MAX_DELTA", "0.20")),
         dry_run=os.getenv("DRY_RUN", "true").lower() in ("true", "1", "yes"),
         force_market_open=os.getenv("FORCE_MARKET_OPEN", "false").lower() in ("true", "1", "yes"),
         daily_drawdown_limit=float(os.getenv("DAILY_DRAWDOWN_LIMIT", "0.05")),

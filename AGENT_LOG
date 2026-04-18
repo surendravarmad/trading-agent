@@ -1,6 +1,200 @@
-[2026-04-12 20:03:18 UTC] --- One-shot cycle start ---
-2026-04-12 16:03:22 | INFO     | root                           | Logging initialised — level=INFO, file=logs/trading_agent_20260412.log
-2026-04-12 16:03:22 | INFO     | __main__                       | Intelligence layer DISABLED — rule-based mode only
-2026-04-12 16:03:22 | INFO     | __main__                       | Outside NYSE market hours (Sunday 16:03 ET) — shutting down cleanly
-2026-04-12 16:03:22 | ERROR    | trading_agent.journal_kb       | JournalKB cycle_error: after_hours_shutdown
-[2026-04-12 20:03:22 UTC] --- One-shot cycle end (exit=0) ---
+2026-04-13 16:01:52 | INFO     | __main__                       | ======================================================================
+2026-04-13 16:01:52 | INFO     | trading_agent.position_monitor | Fetched 8 total positions, 8 are options
+2026-04-13 16:01:52 | INFO     | __main__                       | Loaded 79 trade plan(s) from trade_plans
+2026-04-13 16:01:52 | INFO     | trading_agent.position_monitor | Grouped positions into 1 spread(s)
+2026-04-13 16:01:53 | INFO     | trading_agent.regime           | [GOOG] Regime → sideways | Price=319.19 SMA50=307.75 SMA200=268.65 Slope=-0.3264 BB=0.1709 RSI=61.8 MR=none RS_SPY=0.0007 IVRank=83.3 HighVol=False
+2026-04-13 16:01:53 | INFO     | __main__                       | [GOOG] Current regime: sideways
+2026-04-13 16:01:53 | WARNING  | trading_agent.position_monitor | [GOOG] EXIT SIGNAL: stop_loss (debounce) — Loss $321.00 ≥ 50% of max loss $361.00 | P&L=$-321.00
+2026-04-13 16:01:53 | INFO     | __main__                       | [GOOG] Exit signal stop_loss vote 1/3 — debouncing (next check in ~5 min)
+2026-04-13 16:01:53 | INFO     | __main__                       | ======================================================================
+2026-04-13 16:01:53 | INFO     | __main__                       | STAGE 2 — OPEN NEW POSITIONS
+2026-04-13 16:01:53 | INFO     | __main__                       | ======================================================================
+2026-04-13 16:01:53 | INFO     | __main__                       | --------------------------------------------------
+2026-04-13 16:01:53 | INFO     | __main__                       | [SPY] Phase I  — PERCEIVE
+2026-04-13 16:01:54 | INFO     | __main__                       | [SPY] Phase II — CLASSIFY
+2026-04-13 16:01:54 | INFO     | trading_agent.regime           | [SPY] Regime → sideways | Price=685.99 SMA50=672.99 SMA200=660.97 Slope=-0.2829 BB=0.0775 RSI=68.0 MR=none RS_SPY=0.0000 IVRank=100.0 HighVol=True
+2026-04-13 16:01:54 | WARNING  | __main__                       | [SPY] HighIV: IV rank 100.0 > 95th pct — extreme volatility, blocking all new entries | strategy_mode=defense_first
+2026-04-13 16:01:54 | INFO     | __main__                       | --------------------------------------------------
+2026-04-13 16:01:54 | INFO     | __main__                       | [QQQ] Phase I  — PERCEIVE
+2026-04-13 16:01:54 | INFO     | __main__                       | [QQQ] Phase II — CLASSIFY
+2026-04-13 16:01:54 | INFO     | trading_agent.regime           | [QQQ] Regime → sideways | Price=617.29 SMA50=600.09 SMA200=595.32 Slope=-0.3737 BB=0.0950 RSI=65.4 MR=none RS_SPY=0.0000 IVRank=100.0 HighVol=True
+2026-04-13 16:01:54 | WARNING  | __main__                       | [QQQ] HighIV: IV rank 100.0 > 95th pct — extreme volatility, blocking all new entries | strategy_mode=defense_first
+2026-04-13 16:01:54 | INFO     | __main__                       | --------------------------------------------------
+2026-04-13 16:01:54 | INFO     | __main__                       | [IWM] Phase I  — PERCEIVE
+2026-04-13 16:01:54 | INFO     | __main__                       | [IWM] Phase II — CLASSIFY
+2026-04-13 16:01:55 | INFO     | trading_agent.regime           | [IWM] Regime → sideways | Price=264.94 SMA50=256.09 SMA200=242.96 Slope=-0.0732 BB=0.0952 RSI=71.3 MR=none RS_SPY=-0.0005 IVRank=100.0 HighVol=True
+2026-04-13 16:01:55 | WARNING  | __main__                       | [IWM] HighIV: IV rank 100.0 > 95th pct — extreme volatility, blocking all new entries | strategy_mode=defense_first
+2026-04-13 16:01:55 | INFO     | __main__                       | --------------------------------------------------
+2026-04-13 16:01:55 | INFO     | __main__                       | [GOOG] Phase I  — PERCEIVE
+2026-04-13 16:01:55 | INFO     | __main__                       | [GOOG] Phase II — CLASSIFY
+2026-04-13 16:01:56 | INFO     | trading_agent.regime           | [GOOG] Regime → sideways | Price=319.19 SMA50=307.75 SMA200=268.65 Slope=-0.3264 BB=0.1709 RSI=61.8 MR=none RS_SPY=0.0007 IVRank=83.3 HighVol=False
+2026-04-13 16:01:56 | INFO     | __main__                       | [GOOG] Phase III — PLAN (sideways → Iron Condor)
+2026-04-13 16:01:56 | INFO     | trading_agent.strategy         | [GOOG] Planning sideways strategy, expiration 2026-05-29
+2026-04-13 16:01:56 | INFO     | trading_agent.market_data      | Fetching put option chain for GOOG exp 2026-05-29
+2026-04-13 16:01:56 | INFO     | trading_agent.market_data      | Received 52 put contracts for GOOG
+2026-04-13 16:01:56 | INFO     | trading_agent.market_data      | Fetching call option chain for GOOG exp 2026-05-29
+2026-04-13 16:01:56 | INFO     | trading_agent.market_data      | Received 52 call contracts for GOOG
+2026-04-13 16:01:56 | INFO     | __main__                       | [GOOG] Phase IV — RISK CHECK
+2026-04-13 16:01:56 | WARNING  | trading_agent.risk_manager     | [GOOG] Risk verdict: REJECTED: 5 passed, 4 failed
+2026-04-13 16:01:56 | WARNING  | trading_agent.risk_manager     |   FAIL: Plan invalid: Credit-to-width ratio -0.4040 < minimum 0.25
+2026-04-13 16:01:56 | WARNING  | trading_agent.risk_manager     |   FAIL: Credit/Width ratio -0.4040 < 0.25
+2026-04-13 16:01:56 | WARNING  | trading_agent.risk_manager     |   FAIL: Market is currently CLOSED
+2026-04-13 16:01:56 | WARNING  | trading_agent.risk_manager     |   FAIL: Underlying bid/ask spread $31.7900 >= $0.05 (illiquid)
+2026-04-13 16:01:56 | INFO     | __main__                       | [GOOG] Phase VI — EXECUTE
+2026-04-13 16:01:56 | INFO     | trading_agent.executor         | Trade plan saved to trade_plans/trade_plan_GOOG.json (run_id=20260413_200156, history=4)
+2026-04-13 16:01:57 | WARNING  | trading_agent.executor         | [GOOG] Trade REJECTED by risk manager — skipping.
+2026-04-13 16:01:57 | INFO     | trading_agent.order_tracker    | Fetched 0 orders (status=open)
+2026-04-13 16:01:57 | INFO     | trading_agent.order_tracker    | Fetched 10 orders (status=closed)
+2026-04-13 16:01:57 | INFO     | __main__                       | Open orders: 0 | Recent fills: 10
+2026-04-13 16:01:57 | INFO     | __main__                       | ======================================================================
+2026-04-13 16:01:57 | INFO     | __main__                       | TRADING CYCLE COMPLETE — 4 tickers processed
+2026-04-13 16:01:57 | INFO     | __main__                       |
+Ticker | Regime     | Strategy           | Valid    | Risk OK    | Status
+2026-04-13 16:01:57 | INFO     | __main__                       | --------------------------------------------------------------------------------
+2026-04-13 16:01:57 | INFO     | __main__                       | SPY    | sideways   | skipped            | False    | False      | skipped
+2026-04-13 16:01:57 | INFO     | __main__                       | QQQ    | sideways   | skipped            | False    | False      | skipped
+2026-04-13 16:01:57 | INFO     | __main__                       | IWM    | sideways   | skipped            | False    | False      | skipped
+2026-04-13 16:01:57 | INFO     | __main__                       | GOOG   | sideways   | Iron Condor        | False    | False      | rejected
+2026-04-13 16:01:57 | INFO     | __main__                       | ======================================================================
+2026-04-13 16:01:57 | INFO     | __main__                       | Cycle completed in 7.4s / 270s budget
+{
+  "timestamp": "2026-04-13T20:01:57.367135+00:00",
+  "account_balance": 99454.72,
+  "monitor": {
+    "total_spreads": 1,
+    "total_unrealized_pl": -321.0,
+    "signals": {
+      "stop_loss": 1
+    },
+    "positions": [
+      {
+        "underlying": "GOOG",
+        "strategy": "Iron Condor",
+        "pl": -321.0,
+        "signal": "stop_loss",
+        "reason": "Loss $321.00 \u2265 50% of max loss $361.00",
+        "expiration": "2026-05-15",
+        "short_strikes": [
+          265.0,
+          330.0
+        ]
+      }
+    ],
+    "closed": []
+  },
+  "new_trades": [
+    {
+      "ticker": "SPY",
+      "regime": "sideways",
+      "strategy": "skipped",
+      "plan_valid": false,
+      "risk_approved": false,
+      "status": "skipped",
+      "reason": "HighIV: IV rank 100.0 > 95th pct \u2014 extreme volatility, blocking all new entries",
+      "strategy_mode": "defense_first"
+    },
+    {
+      "ticker": "QQQ",
+      "regime": "sideways",
+      "strategy": "skipped",
+      "plan_valid": false,
+      "risk_approved": false,
+      "status": "skipped",
+      "reason": "HighIV: IV rank 100.0 > 95th pct \u2014 extreme volatility, blocking all new entries",
+      "strategy_mode": "defense_first"
+    },
+    {
+      "ticker": "IWM",
+      "regime": "sideways",
+      "strategy": "skipped",
+      "plan_valid": false,
+      "risk_approved": false,
+      "status": "skipped",
+      "reason": "HighIV: IV rank 100.0 > 95th pct \u2014 extreme volatility, blocking all new entries",
+      "strategy_mode": "defense_first"
+    },
+    {
+      "ticker": "GOOG",
+      "regime": "sideways",
+      "strategy": "Iron Condor",
+      "plan_valid": false,
+      "risk_approved": false,
+      "execution": {
+        "status": "rejected",
+        "reason": "REJECTED: 5 passed, 4 failed",
+        "plan_file": "trade_plans/trade_plan_GOOG.json",
+        "run_id": "20260413_200156"
+      },
+      "analysis": {
+        "price": 319.19,
+        "sma_50": 307.7463726806641,
+        "sma_200": 268.6505099487305,
+        "rsi": 61.81438642760275,
+        "reasoning": "Price (319.19) is between SMAs or slope direction doesn't confirm a trend. SMA-50=307.75, SMA-200=268.65, slope=-0.3264."
+      }
+    }
+  ],
+  "order_summary": {
+    "open_orders": {
+      "total": 0,
+      "by_status": {},
+      "open": 0,
+      "filled": 0,
+      "failed": 0
+    },
+    "recent_fills": {
+      "total": 10,
+      "by_status": {
+        "filled": 10
+      },
+      "open": 0,
+      "filled": 10,
+      "failed": 0
+    }
+  }
+}
+[2026-04-13 20:01:58 UTC] --- Cycle end [LIVE] (exit=0) ---
+[2026-04-13 20:07:00 UTC] --- Cycle start [LIVE] ---
+2026-04-13 16:07:10 | INFO     | root                           | Logging initialised — level=INFO, file=logs/trading_agent_20260413.log
+2026-04-13 16:07:10 | INFO     | __main__                       | Intelligence layer DISABLED — rule-based mode only
+2026-04-13 16:07:10 | INFO     | __main__                       | Outside NYSE market hours (Monday 16:07 ET) — shutting down cleanly
+2026-04-13 16:07:10 | ERROR    | trading_agent.journal_kb       | JournalKB cycle_error: after_hours_shutdown
+[2026-04-13 20:07:10 UTC] --- Cycle end [LIVE] (exit=0) ---
+[2026-04-13 20:12:12 UTC] --- Cycle start [LIVE] ---
+2026-04-13 16:12:21 | INFO     | root                           | Logging initialised — level=INFO, file=logs/trading_agent_20260413.log
+2026-04-13 16:12:21 | INFO     | __main__                       | Intelligence layer DISABLED — rule-based mode only
+2026-04-13 16:12:21 | INFO     | __main__                       | Outside NYSE market hours (Monday 16:12 ET) — shutting down cleanly
+2026-04-13 16:12:21 | ERROR    | trading_agent.journal_kb       | JournalKB cycle_error: after_hours_shutdown
+[2026-04-13 20:12:21 UTC] --- Cycle end [LIVE] (exit=0) ---
+[2026-04-13 20:17:23 UTC] --- Cycle start [LIVE] ---
+2026-04-13 16:17:24 | INFO     | root                           | Logging initialised — level=INFO, file=logs/trading_agent_20260413.log
+2026-04-13 16:17:24 | INFO     | __main__                       | Intelligence layer DISABLED — rule-based mode only
+2026-04-13 16:17:24 | INFO     | __main__                       | Outside NYSE market hours (Monday 16:17 ET) — shutting down cleanly
+2026-04-13 16:17:24 | ERROR    | trading_agent.journal_kb       | JournalKB cycle_error: after_hours_shutdown
+[2026-04-13 20:17:24 UTC] --- Cycle end [LIVE] (exit=0) ---
+[2026-04-13 20:22:25 UTC] --- Cycle start [LIVE] ---
+2026-04-13 16:22:27 | INFO     | root                           | Logging initialised — level=INFO, file=logs/trading_agent_20260413.log
+2026-04-13 16:22:27 | INFO     | __main__                       | Intelligence layer DISABLED — rule-based mode only
+2026-04-13 16:22:27 | INFO     | __main__                       | Outside NYSE market hours (Monday 16:22 ET) — shutting down cleanly
+2026-04-13 16:22:27 | ERROR    | trading_agent.journal_kb       | JournalKB cycle_error: after_hours_shutdown
+[2026-04-13 20:22:27 UTC] --- Cycle end [LIVE] (exit=0) ---
+[2026-04-13 20:28:02 UTC] --- Cycle start [LIVE] ---
+2026-04-13 16:28:10 | INFO     | root                           | Logging initialised — level=INFO, file=logs/trading_agent_20260413.log
+2026-04-13 16:28:10 | INFO     | __main__                       | Intelligence layer DISABLED — rule-based mode only
+2026-04-13 16:28:10 | INFO     | __main__                       | Outside NYSE market hours (Monday 16:28 ET) — shutting down cleanly
+2026-04-13 16:28:10 | ERROR    | trading_agent.journal_kb       | JournalKB cycle_error: after_hours_shutdown
+[2026-04-13 20:28:10 UTC] --- Cycle end [LIVE] (exit=0) ---
+[2026-04-13 20:33:13 UTC] --- Cycle start [LIVE] ---
+2026-04-13 16:33:27 | INFO     | root                           | Logging initialised — level=INFO, file=logs/trading_agent_20260413.log
+2026-04-13 16:33:27 | INFO     | __main__                       | Intelligence layer DISABLED — rule-based mode only
+2026-04-13 16:33:27 | INFO     | __main__                       | Outside NYSE market hours (Monday 16:33 ET) — shutting down cleanly
+2026-04-13 16:33:27 | ERROR    | trading_agent.journal_kb       | JournalKB cycle_error: after_hours_shutdown
+[2026-04-13 20:33:27 UTC] --- Cycle end [LIVE] (exit=0) ---
+[2026-04-13 20:38:29 UTC] --- Cycle start [LIVE] ---
+2026-04-13 16:38:42 | INFO     | root                           | Logging initialised — level=INFO, file=logs/trading_agent_20260413.log
+2026-04-13 16:38:42 | INFO     | __main__                       | Intelligence layer DISABLED — rule-based mode only
+2026-04-13 16:38:42 | INFO     | __main__                       | Outside NYSE market hours (Monday 16:38 ET) — shutting down cleanly
+2026-04-13 16:38:42 | ERROR    | trading_agent.journal_kb       | JournalKB cycle_error: after_hours_shutdown
+[2026-04-13 20:38:42 UTC] --- Cycle end [LIVE] (exit=0) ---
+[2026-04-13 20:43:32 UTC] Stop requested from dashboard
+[2026-04-13 20:43:32 UTC] Agent loop stopped

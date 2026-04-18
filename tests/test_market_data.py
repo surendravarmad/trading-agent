@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 import pytest
 
-from trading_agent.market_data import MarketDataProvider
+from trading_agent.market_data import MarketDataProvider, InsufficientDataError
 
 
 class TestSMA:
@@ -208,3 +208,41 @@ class TestStrikeExtraction:
 
     def test_invalid_symbol(self):
         assert MarketDataProvider._extract_strike("INVALID") == 0.0
+
+
+class TestInsufficientDataGuard:
+    """fetch_historical_prices must fail loud when too few bars are returned,
+    so the regime classifier never silently misclassifies as SIDEWAYS."""
+
+    def _patch_yf(self, monkeypatch, returned_df):
+        from unittest.mock import MagicMock
+        fake_ticker = MagicMock()
+        fake_ticker.history = MagicMock(return_value=returned_df)
+        monkeypatch.setattr("yfinance.Ticker", lambda *a, **kw: fake_ticker)
+
+    def test_empty_dataframe_raises(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        self._patch_yf(monkeypatch, pd.DataFrame())
+        with pytest.raises(InsufficientDataError, match="No price data"):
+            provider.fetch_historical_prices("NEWCO", period_days=200)
+        # Cache must not be populated on failure
+        assert "NEWCO" not in provider._price_cache
+
+    def test_too_few_bars_raises(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        # Build a 50-row df even though caller asks for 200
+        idx = pd.date_range("2025-01-01", periods=50, freq="B")
+        short_df = pd.DataFrame({"Close": np.linspace(100, 110, 50)}, index=idx)
+        self._patch_yf(monkeypatch, short_df)
+        with pytest.raises(InsufficientDataError, match="only 50 bars"):
+            provider.fetch_historical_prices("NEWCO", period_days=200)
+        assert "NEWCO" not in provider._price_cache
+
+    def test_exactly_enough_bars_succeeds(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        idx = pd.date_range("2024-01-01", periods=200, freq="B")
+        ok_df = pd.DataFrame({"Close": np.linspace(100, 200, 200)}, index=idx)
+        self._patch_yf(monkeypatch, ok_df)
+        result = provider.fetch_historical_prices("SPY", period_days=200)
+        assert len(result) == 200
+        assert "SPY" in provider._price_cache

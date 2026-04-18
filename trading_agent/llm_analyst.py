@@ -382,8 +382,8 @@ class LLMAnalyst:
             f"- {l.text}" for l in recent_lessons[-20:])
 
         prompt = TUNING_PROMPT_TEMPLATE.format(
-            max_delta=current_params.get("max_delta", 0.25),
-            min_credit_ratio=current_params.get("min_credit_ratio", 0.25),
+            max_delta=current_params.get("max_delta", 0.20),
+            min_credit_ratio=current_params.get("min_credit_ratio", 0.33),
             max_risk_pct=current_params.get("max_risk_pct", 0.02),
             target_dte=current_params.get("target_dte", 45),
             stop_loss_pct=current_params.get("stop_loss_pct", 0.50),

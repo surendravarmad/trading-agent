@@ -416,7 +416,7 @@ Every trade attempt is logged as a single JSON line, regardless of LLM state:
 }
 ```
 
-Action values: `dry_run`, `submitted`, `rejected`, `skipped_by_llm`, `skipped_existing`, `skipped_liquidation_mode`, `error`, `cycle_timeout`, `daily_drawdown_circuit_breaker`.
+Action values: `dry_run`, `submitted`, `rejected`, `skipped_by_llm`, `skipped_existing`, `skipped_liquidation_mode`, `skipped` (insufficient data), `error`, `cycle_timeout`, `daily_drawdown_circuit_breaker`.
 
 ---
 
@@ -427,6 +427,10 @@ Action values: `dry_run`, `submitted`, `rejected`, `skipped_by_llm`, `skipped_ex
 | **Yahoo Finance** | Regime Detection | 200-day OHLCV for SMAs, RSI-14, Bollinger Bands |
 | **Alpaca Market Data** | Snapshots + Options | Real-time prices (batch), Greeks (Delta/Theta/Vega), Bid/Ask |
 | **Alpaca Paper API** | Order Execution | Account equity, market clock, paper trading sandbox |
+
+**Adjusted vs raw closes.** The live agent fetches Yahoo history with `auto_adjust=False` so its SMAs / Bollinger Bands are comparable to Alpaca's raw real-time price (`latestTrade.p`). The backtest UI (`streamlit/backtest_ui.py`) deliberately uses `auto_adjust=True` instead, because a P&L simulation needs total-return series that reflect dividends. Don't unify these — the mismatch is intentional.
+
+**Insufficient-data guard.** `fetch_historical_prices()` raises `InsufficientDataError` whenever Yahoo returns fewer bars than the caller requested (200 for classification). Without this guard, `sma_200.iloc[-1]` is `NaN` and `price > NaN` is `False`, which silently falls through to SIDEWAYS — a quiet misclassification on new or thinly-traded tickers. The agent catches this, logs a warning, and records the ticker with status `skipped` / `reason=insufficient_data` so it's visible in the journal without paging as an error.
 
 ---
 

@@ -99,12 +99,15 @@ class StrategyPlanner:
     SPREAD_WIDTH = 5.0          # standardised width — controls buying-power usage
     TARGET_DTE = 45             # bias toward upper DTE range to reduce gamma risk
     DTE_RANGE = (35, 50)        # tightened window; upper bound slows gamma impact
-    # Delta targeting window for the short leg: maximises POP while capping risk
-    MIN_DELTA = 0.20            # floor — below this is too far OTM (low credit)
-    # max_delta passed via __init__ (default 0.25)
+    # Delta targeting window for the short leg: maximises POP while capping risk.
+    # Lowered from 0.20 to 0.15 to preserve a meaningful sweet-spot range when
+    # max_delta is 0.20 (default). With MIN_DELTA == max_delta the band would
+    # collapse to a single point and every trade would land in the fallback branch.
+    MIN_DELTA = 0.15            # floor — below this is too far OTM (low credit)
+    # max_delta passed via __init__ (default 0.20 — matches README design, ~80% POP)
 
     def __init__(self, data_provider: MarketDataProvider,
-                 max_delta: float = 0.25,   # ceiling for short-leg delta
+                 max_delta: float = 0.20,   # ceiling for short-leg delta (~80% POP)
                  min_credit_ratio: float = 0.33):
         self.data = data_provider
         self.max_delta = max_delta

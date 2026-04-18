@@ -45,7 +45,7 @@ from zoneinfo import ZoneInfo
 from trading_agent.config import AppConfig, load_config
 from trading_agent.journal_kb import JournalKB
 from trading_agent.logger_setup import setup_logging
-from trading_agent.market_data import MarketDataProvider
+from trading_agent.market_data import MarketDataProvider, InsufficientDataError
 from trading_agent.regime import Regime, RegimeClassifier, RegimeAnalysis
 from trading_agent.strategy import StrategyPlanner, SpreadPlan
 from trading_agent.risk_manager import RiskManager, RiskVerdict
@@ -405,6 +405,16 @@ class TradingAgent:
                     ticker, account_balance, account_buying_power,
                     account_type, market_open)
                 new_trade_results.append(result)
+            except InsufficientDataError as exc:
+                # Expected condition — ticker has too little history for a
+                # reliable SMA-200 classification. Log as a warning and
+                # skip cleanly; this is not an error worth paging on.
+                logger.warning("[%s] Skipped — %s", ticker, exc)
+                new_trade_results.append({
+                    "ticker": ticker,
+                    "status": "skipped",
+                    "reason": f"insufficient_data: {exc}",
+                })
             except Exception as exc:
                 logger.exception("[%s] Unhandled error: %s", ticker, exc)
                 self.journal_kb.log_error(

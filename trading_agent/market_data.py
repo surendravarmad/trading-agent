@@ -45,6 +45,15 @@ OPTION_CHAIN_TTL = 180       # 3 minutes — Greeks move but not millisecond-fas
 _MAX_PREFETCH_WORKERS = 5
 
 
+class InsufficientDataError(ValueError):
+    """
+    Raised when a historical fetch returns fewer bars than the caller
+    requires. Classifying a regime with < 200 bars leaves SMA-200 as NaN,
+    which silently falls through to SIDEWAYS. Callers should catch this
+    and skip the ticker rather than trade on a broken signal.
+    """
+
+
 class MarketDataProvider:
     """Fetches and caches market data from Yahoo Finance and Alpaca."""
 
@@ -94,13 +103,30 @@ class MarketDataProvider:
                               "Install with: pip install yfinance")
 
         tk = yf.Ticker(ticker)
+        # auto_adjust=False returns raw (unadjusted) closes so that our SMAs
+        # and Bollinger Bands are comparable to Alpaca's real-time price
+        # (latestTrade.p), which is also raw. Mixing adjusted and unadjusted
+        # series causes spurious regime flips around dividends and splits.
         df = tk.history(start=start.strftime("%Y-%m-%d"),
-                        end=end.strftime("%Y-%m-%d"))
+                        end=end.strftime("%Y-%m-%d"),
+                        auto_adjust=False)
 
         if df.empty:
-            raise ValueError(f"No price data returned for {ticker}")
+            raise InsufficientDataError(
+                f"No price data returned for {ticker} "
+                f"(requested {period_days} bars)")
 
         df = df.tail(period_days).copy()
+
+        # Regime classification needs period_days bars (default 200) for
+        # SMA-200 to be non-NaN. Without this guard, sma_200.iloc[-1] is NaN,
+        # `price > NaN` is False, and the regime silently falls through to
+        # SIDEWAYS — a quiet misclassification. Fail loud instead.
+        if len(df) < period_days:
+            raise InsufficientDataError(
+                f"{ticker}: only {len(df)} bars returned, "
+                f"need {period_days} for reliable classification")
+
         self._price_cache[ticker] = df
         self._price_cache_ts[ticker] = time.monotonic()
         logger.info("Received %d rows for %s (cached)", len(df), ticker)

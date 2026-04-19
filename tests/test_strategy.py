@@ -79,12 +79,16 @@ class TestPickExpiration:
         exp = datetime.strptime(expiry_str, "%Y-%m-%d").date()
         return (exp - from_date).days
 
-    def test_result_is_always_friday(self):
+    def test_result_is_last_trading_day_of_week(self):
+        """Expiration is the last trading day of a week — usually Friday,
+        but Thursday during holiday-Friday weeks (e.g. Good Friday).
+        """
         from datetime import datetime
         planner = self._planner()
         exp = planner._pick_expiration()
         exp_date = datetime.strptime(exp, "%Y-%m-%d").date()
-        assert exp_date.weekday() == 4, f"{exp} is not a Friday"
+        # Thursday (3) acceptable on holiday-Friday weeks; Friday (4) is the norm.
+        assert exp_date.weekday() in (3, 4), f"{exp} is not a Thu/Fri expiration"
 
     def test_result_within_dte_range(self):
         from datetime import datetime
@@ -147,6 +151,30 @@ class TestPickExpiration:
         broken_dte = (broken_expiry - fake_today).days
         # Confirm the old code would have been outside range
         assert broken_dte > 45
+
+    def test_good_friday_week_falls_back_to_thursday(self):
+        """When the Friday in the chosen week is a market holiday
+        (Good Friday — e.g. 2026-04-03), the NYSE calendar returns the
+        preceding Thursday as the effective weekly expiration.
+
+        Old naive-weekday math returned April 3 — a closed-market day —
+        which broke downstream strike lookups.
+        """
+        from datetime import date
+        from unittest.mock import patch
+        from trading_agent.calendar_utils import next_weekly_expiration
+
+        # fake_today = Feb 17, 2026 → target ≈ April 3 (Good Friday 2026)
+        # The week containing April 3 should resolve to April 2 (Thursday)
+        # because NYSE is closed on Good Friday.
+        fake_today = date(2026, 2, 17)
+        # Call the helper directly so the test doesn't depend on planner state
+        exp = next_weekly_expiration(
+            today=fake_today, target_dte=45, dte_min=35, dte_max=50)
+        # Expected: Thursday April 2, 2026 — Good Friday is April 3
+        assert exp == date(2026, 4, 2), (
+            f"Expected Thu 2026-04-02 (Good Friday fallback), got {exp}")
+        assert exp.weekday() == 3  # Thursday
 
 
 class TestMeanReversionStrategy:

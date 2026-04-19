@@ -10,6 +10,7 @@ from enum import Enum
 
 import numpy as np
 import pandas as pd
+from scipy.stats import percentileofscore
 
 from trading_agent.market_data import MarketDataProvider
 
@@ -163,7 +164,14 @@ class RegimeClassifier:
         ------
         1. Compute rolling *window*-day annualised realised vol over the full
            price series, stepping every 5 days for speed.
-        2. Rank today's reading against that distribution → iv_rank [0–100].
+        2. Rank today's reading against that distribution via
+           ``scipy.stats.percentileofscore`` (``kind='mean'``) — this is the
+           standard percentile definition and handles ties symmetrically
+           (half the equal-valued observations count below, half above).
+           Previous implementation used ``np.sum(hist < current) / n``,
+           which is strictly the "strict" (``kind='strict'``) variant and
+           systematically under-reports rank whenever ties exist in the
+           vol distribution.
         3. Set high_iv_warning = True when iv_rank > *high_iv_pct* (default 95).
 
         Returns (iv_rank: float, high_iv_warning: bool).
@@ -183,7 +191,7 @@ class RegimeClassifier:
         if not hist_vols:
             return 0.0, False
 
-        iv_rank = float(np.sum(np.array(hist_vols) < current_vol) / len(hist_vols) * 100)
+        iv_rank = float(percentileofscore(hist_vols, current_vol, kind="mean"))
         high_iv_warning = iv_rank > high_iv_pct
         return round(iv_rank, 1), high_iv_warning
 

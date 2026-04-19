@@ -19,8 +19,8 @@ Runs a two-stage cycle:
 ------------------------------
 • run_cycle() is wrapped in a 270-second (4.5 min) hard-timeout guard.
   If the cycle has not completed by then, a TIMEOUT event is logged to
-  JournalKB and the guard fires os._exit(1) so the cron scheduler can
-  cleanly launch the next run without a zombie process.
+  JournalKB and the guard calls shutdown.hard_exit(1) so the cron
+  scheduler can cleanly launch the next run without a zombie process.
 
 • All historical price data is pre-fetched in parallel via
   prefetch_historical_parallel() before the per-ticker loop begins.
@@ -30,6 +30,19 @@ Runs a two-stage cycle:
 
 • JournalKB.log_signal() is called for EVERY ticker on EVERY cycle
   regardless of LLM enablement, execution mode, or failure type.
+
+Week 3-4 modularization
+-----------------------
+Several concerns previously inlined in this file were extracted:
+
+  • market_hours.py  — NYSE trading-hours guard
+  • daily_state.py   — DailyStateStore + drawdown + debounce policy
+  • thesis_builder.py — raw_signal thesis dict
+  • shutdown.py      — graceful vs hard exit paths, signal handlers
+  • file_locks.py    — locked appends + atomic JSON writes
+  • logger_setup.py  — now uses RotatingFileHandler
+
+The TradingAgent class is a thin orchestrator over those modules.
 """
 
 import glob
@@ -40,7 +53,6 @@ import threading
 import time
 from datetime import datetime, timezone
 from typing import Dict, List, Optional
-from zoneinfo import ZoneInfo
 
 from trading_agent.config import AppConfig, load_config
 from trading_agent.journal_kb import JournalKB
@@ -55,51 +67,32 @@ from trading_agent.position_monitor import (
 )
 from trading_agent.order_tracker import OrderTracker
 from trading_agent.llm_client import LLMClient, LLMConfig
-from trading_agent.trade_journal import TradeJournal, TradeEntry
+from trading_agent.trade_journal import TradeJournal
 from trading_agent.knowledge_base import KnowledgeBase
 from trading_agent.llm_analyst import LLMAnalyst, AnalystDecision
+
+# --- Week 3-4 extractions ---
+from trading_agent.market_hours import (
+    EASTERN,
+    is_within_market_hours as _is_within_market_hours,
+    market_window_str,
+)
+from trading_agent.daily_state import (
+    DailyStateStore,
+    check_daily_drawdown,
+    tally_exit_vote,
+)
+from trading_agent.thesis_builder import build_thesis
+from trading_agent import shutdown as _shutdown
 
 logger = logging.getLogger(__name__)
 
 # Kill the process if a cycle takes longer than this (seconds).
 # The external scheduler (cron / APScheduler) will start the next run cleanly.
-CYCLE_TIMEOUT_SECONDS = 270  # 4 min 30 sec
+CYCLE_TIMEOUT_SECONDS = 270   # 4 min 30 sec
 
-# File that persists daily equity baseline for the drawdown circuit breaker.
-DAILY_STATE_FILENAME = "daily_state.json"
-
-# ---------------------------------------------------------------------------
-# Market-hours guard
-# ---------------------------------------------------------------------------
-_EASTERN = ZoneInfo("America/New_York")
-
-# NYSE core session: 9:30 AM – 4:00 PM ET.
-# 5-minute buffers let a cron job scheduled exactly on the boundary finish
-# its current cycle before the next invocation would be blocked.
-_MARKET_OPEN_HOUR, _MARKET_OPEN_MINUTE   = 9, 25   # 5 min before 9:30
-_MARKET_CLOSE_HOUR, _MARKET_CLOSE_MINUTE = 16, 5   # 5 min after  16:00
-
-
-def _is_within_market_hours() -> bool:
-    """
-    Return True if the current moment is within NYSE trading hours
-    (9:25 AM – 4:05 PM ET, Monday through Friday).
-
-    The 5-minute buffers ensure a cron job firing exactly at the open or
-    close boundary completes its cycle rather than being immediately killed.
-    """
-    now = datetime.now(_EASTERN)
-    if now.weekday() >= 5:          # Saturday=5, Sunday=6
-        return False
-    open_boundary = now.replace(
-        hour=_MARKET_OPEN_HOUR, minute=_MARKET_OPEN_MINUTE,
-        second=0, microsecond=0,
-    )
-    close_boundary = now.replace(
-        hour=_MARKET_CLOSE_HOUR, minute=_MARKET_CLOSE_MINUTE,
-        second=0, microsecond=0,
-    )
-    return open_boundary <= now <= close_boundary
+# Number of consecutive cycles an exit signal must repeat before acting.
+EXIT_DEBOUNCE_REQUIRED = 3
 
 
 class TradingAgent:
@@ -156,10 +149,20 @@ class TradingAgent:
 
         # JournalKB writes signals.jsonl + signals.md into the same
         # trade_journal/ directory — no extra folder needed.
-        journal_dir = (config.intelligence.journal_dir
-                       if config.intelligence and config.intelligence.journal_dir
-                       else "trade_journal")
+        journal_dir = (
+            config.intelligence.journal_dir
+            if config.intelligence and config.intelligence.journal_dir
+            else "trade_journal"
+        )
         self.journal_kb = JournalKB(journal_dir)
+
+        # Daily state store (drawdown + exit debounce)
+        self.daily_state = DailyStateStore(config.logging.trade_plan_dir)
+
+        # Register graceful-shutdown handlers so SIGTERM (docker stop,
+        # systemctl stop, cron cancel) flushes the journal + logs
+        # instead of losing the in-flight write buffer.
+        _shutdown.install_signal_handlers(journal=self.journal_kb)
 
         # Intelligence layer (LLM + RAG + Journal) — optional
         self.llm_analyst = self._init_intelligence(config)
@@ -192,13 +195,18 @@ class TradingAgent:
                 knowledge_base=kb,
                 enabled=True,
             )
-            logger.info("Intelligence layer ENABLED — model=%s, provider=%s",
-                         intel_cfg.llm_model, intel_cfg.llm_provider)
+            logger.info(
+                "Intelligence layer ENABLED — model=%s, provider=%s",
+                intel_cfg.llm_model, intel_cfg.llm_provider,
+            )
             return analyst
 
         except Exception as exc:
-            logger.warning("Failed to initialize intelligence layer: %s — "
-                          "continuing in rule-based mode", exc)
+            logger.warning(
+                "Failed to initialize intelligence layer: %s — "
+                "continuing in rule-based mode",
+                exc,
+            )
             return None
 
     @classmethod
@@ -222,14 +230,18 @@ class TradingAgent:
         """
         # --- Timeout guard -----------------------------------------------
         def _on_timeout():
-            msg = (f"Cycle TIMEOUT after {CYCLE_TIMEOUT_SECONDS}s "
-                   "— killing process to unblock scheduler")
-            logger.error(msg)
+            reason = (
+                f"Cycle TIMEOUT after {CYCLE_TIMEOUT_SECONDS}s "
+                "— killing process to unblock scheduler"
+            )
+            logger.error(reason)
             self.journal_kb.log_cycle_error(
                 "cycle_timeout",
                 {"timeout_seconds": CYCLE_TIMEOUT_SECONDS},
             )
-            os._exit(1)   # noqa: SLF001  intentional hard kill
+            # Use hard_exit — process may be hung on a syscall or
+            # deadlocked on a mutex; clean teardown is unsafe.
+            _shutdown.hard_exit(1, reason=reason)
 
         timer = threading.Timer(CYCLE_TIMEOUT_SECONDS, _on_timeout)
         timer.daemon = True
@@ -242,7 +254,7 @@ class TradingAgent:
         except Exception as exc:
             logger.exception("CYCLE FAILED with unhandled exception: %s", exc)
             self.journal_kb.log_cycle_error(
-                str(exc), {"tickers": self.config.trading.tickers}
+                str(exc), {"tickers": self.config.trading.tickers},
             )
             result = {
                 "status": "error",
@@ -253,12 +265,16 @@ class TradingAgent:
             timer.cancel()
 
         elapsed = time.monotonic() - cycle_start
-        logger.info("Cycle completed in %.1fs / %ds budget",
-                    elapsed, CYCLE_TIMEOUT_SECONDS)
+        logger.info(
+            "Cycle completed in %.1fs / %ds budget",
+            elapsed, CYCLE_TIMEOUT_SECONDS,
+        )
         if elapsed > CYCLE_TIMEOUT_SECONDS * 0.8:
-            logger.warning("Cycle used %.0f%% of time budget — consider "
-                           "reducing ticker count or increasing interval",
-                           100 * elapsed / CYCLE_TIMEOUT_SECONDS)
+            logger.warning(
+                "Cycle used %.0f%% of time budget — consider "
+                "reducing ticker count or increasing interval",
+                100 * elapsed / CYCLE_TIMEOUT_SECONDS,
+            )
         return result
 
     # ==================================================================
@@ -273,33 +289,36 @@ class TradingAgent:
         # Set FORCE_MARKET_OPEN=true (or force_market_open=True in config)
         # to bypass this check in tests or paper-trading outside hours.
         if not self.config.trading.force_market_open and not _is_within_market_hours():
-            now_et = datetime.now(_EASTERN)
-            msg = (
+            now_et = datetime.now(EASTERN)
+            reason = (
                 f"Outside NYSE market hours "
                 f"({now_et.strftime('%A %H:%M ET')}) — shutting down cleanly"
             )
-            logger.info(msg)
+            logger.info(reason)
             self.journal_kb.log_cycle_error(
                 "after_hours_shutdown",
                 {
                     "local_time_et": now_et.isoformat(),
-                    "market_window": (
-                        f"{_MARKET_OPEN_HOUR:02d}:{_MARKET_OPEN_MINUTE:02d}–"
-                        f"{_MARKET_CLOSE_HOUR:02d}:{_MARKET_CLOSE_MINUTE:02d} ET "
-                        f"Mon–Fri"
-                    ),
+                    "market_window": market_window_str(),
                 },
             )
-            os._exit(0)   # noqa: SLF001  intentional clean shutdown
+            # graceful_exit: we decided to stop; logs + journal are healthy.
+            _shutdown.graceful_exit(0, reason="after_hours_shutdown", context={
+                "local_time_et": now_et.isoformat(),
+            })
         # ------------------------------------------------------------------
 
         logger.info("=" * 70)
-        logger.info("TRADING CYCLE START — %s",
-                    datetime.now(timezone.utc).isoformat())
-        logger.info("Tickers: %s | Mode: %s | Dry-run: %s",
-                     self.config.trading.tickers,
-                     self.config.trading.mode,
-                     self.config.trading.dry_run)
+        logger.info(
+            "TRADING CYCLE START — %s",
+            datetime.now(timezone.utc).isoformat(),
+        )
+        logger.info(
+            "Tickers: %s | Mode: %s | Dry-run: %s",
+            self.config.trading.tickers,
+            self.config.trading.mode,
+            self.config.trading.dry_run,
+        )
         logger.info("=" * 70)
 
         # Pre-flight: fetch account info
@@ -308,29 +327,43 @@ class TradingAgent:
             msg = "Cannot fetch account info — aborting cycle."
             logger.error(msg)
             self.journal_kb.log_cycle_error(msg)
-            return {"status": "error", "reason": "Account info unavailable",
-                    "timestamp": datetime.now(timezone.utc).isoformat()}
+            return {
+                "status": "error",
+                "reason": "Account info unavailable",
+                "timestamp": datetime.now(timezone.utc).isoformat(),
+            }
 
         account_balance = float(account.get("equity", 0))
         account_buying_power = float(account.get("buying_power", account_balance))
-        account_type = ("paper"
-                        if "paper" in self.config.alpaca.base_url else "live")
-        market_open = self.data_provider.is_market_open(
-            self.config.alpaca.base_url)
+        account_type = "paper" if "paper" in self.config.alpaca.base_url else "live"
+        market_open = self.data_provider.is_market_open(self.config.alpaca.base_url)
 
-        logger.info("Account: balance=$%s, buying_power=$%s, type=%s, market_open=%s",
-                     f"{account_balance:,.2f}",
-                     f"{account_buying_power:,.2f}",
-                     account_type, market_open)
+        logger.info(
+            "Account: balance=$%s, buying_power=$%s, type=%s, market_open=%s",
+            f"{account_balance:,.2f}",
+            f"{account_buying_power:,.2f}",
+            account_type, market_open,
+        )
         logger.info("Schedule interval: %s", self.config.trading.schedule_interval)
 
         # --- Daily Drawdown Circuit Breaker ---
-        if self._check_daily_drawdown(account_balance):
-            msg = (f"Daily drawdown limit "
-                   f"({self.config.trading.daily_drawdown_limit*100:.0f}%) "
-                   f"exceeded — stopping all trading")
-            logger.critical(msg)
-            os._exit(1)   # noqa: SLF001  intentional hard kill
+        if check_daily_drawdown(
+            self.daily_state,
+            current_equity=account_balance,
+            drawdown_limit=self.config.trading.daily_drawdown_limit,
+            journal_kb=self.journal_kb,
+        ):
+            reason = (
+                f"Daily drawdown limit "
+                f"({self.config.trading.daily_drawdown_limit * 100:.0f}%) "
+                f"exceeded — stopping all trading"
+            )
+            logger.critical(reason)
+            # graceful_exit: drawdown is a decided policy stop, not a hang.
+            _shutdown.graceful_exit(1, reason="daily_drawdown_breaker", context={
+                "equity": account_balance,
+                "limit_pct": self.config.trading.daily_drawdown_limit * 100,
+            })
 
         # --- Liquidation Mode Check ---
         liquidation_mode = self._check_liquidation_mode(
@@ -339,7 +372,8 @@ class TradingAgent:
             logger.warning(
                 "LIQUIDATION MODE: buying power >%.0f%% used — "
                 "closing positions only, no new trades",
-                self.config.trading.max_buying_power_pct * 100)
+                self.config.trading.max_buying_power_pct * 100,
+            )
 
         # ------------------------------------------------------------------
         # Pre-fetch data for all tickers in parallel (5-min optimisation)
@@ -372,9 +406,15 @@ class TradingAgent:
 
         new_trade_results = []
         for ticker in tickers:
+            # Check for shutdown between tickers so a SIGTERM mid-cycle
+            # stops the loop cleanly at the next safe point.
+            if _shutdown.shutdown_requested():
+                logger.warning(
+                    "Shutdown requested — aborting ticker loop at %s", ticker)
+                break
+
             if ticker in tickers_with_positions:
-                logger.info("[%s] Already has an open spread — skipping",
-                            ticker)
+                logger.info("[%s] Already has an open spread — skipping", ticker)
                 self.journal_kb.log_signal(
                     ticker=ticker,
                     action="skipped_existing",
@@ -405,7 +445,8 @@ class TradingAgent:
             try:
                 result = self._process_ticker(
                     ticker, account_balance, account_buying_power,
-                    account_type, market_open)
+                    account_type, market_open,
+                )
                 new_trade_results.append(result)
             except InsufficientDataError as exc:
                 # Expected condition — ticker has too little history for a
@@ -436,8 +477,10 @@ class TradingAgent:
         order_summary = self._check_order_statuses()
 
         logger.info("=" * 70)
-        logger.info("TRADING CYCLE COMPLETE — %d tickers processed",
-                     len(new_trade_results))
+        logger.info(
+            "TRADING CYCLE COMPLETE — %d tickers processed",
+            len(new_trade_results),
+        )
         self._print_summary(new_trade_results)
         logger.info("=" * 70)
 
@@ -476,8 +519,10 @@ class TradingAgent:
             try:
                 analysis = self.regime_classifier.classify(ticker)
                 current_regimes[ticker] = analysis.regime
-                logger.info("[%s] Current regime: %s",
-                            ticker, analysis.regime.value)
+                logger.info(
+                    "[%s] Current regime: %s",
+                    ticker, analysis.regime.value,
+                )
             except Exception as exc:
                 logger.warning("[%s] Could not classify regime: %s", ticker, exc)
             price = self._cached_price(ticker)
@@ -494,7 +539,8 @@ class TradingAgent:
                     logger.info(
                         "[%s] DRY RUN — would close %s (%s: %s)",
                         spread.underlying, spread.strategy_name,
-                        spread.exit_signal.value, spread.exit_reason)
+                        spread.exit_signal.value, spread.exit_reason,
+                    )
                     closed.append({
                         "underlying": spread.underlying,
                         "signal": spread.exit_signal.value,
@@ -566,13 +612,17 @@ class TradingAgent:
         if getattr(analysis, "high_iv_warning", False):
             reason = (
                 f"HighIV: IV rank {getattr(analysis, 'iv_rank', 0):.1f} > 95th pct "
-                f"— extreme volatility, blocking all new entries")
+                f"— extreme volatility, blocking all new entries"
+            )
             logger.warning("[%s] %s | strategy_mode=defense_first", ticker, reason)
             self.journal_kb.log_defense_first(
                 ticker, reason, analysis.current_price,
-                {"regime": analysis.regime.value,
-                 "iv_rank": getattr(analysis, "iv_rank", 0.0),
-                 "high_iv_warning": True})
+                {
+                    "regime": analysis.regime.value,
+                    "iv_rank": getattr(analysis, "iv_rank", 0.0),
+                    "high_iv_warning": True,
+                },
+            )
             return {
                 "ticker": ticker,
                 "regime": analysis.regime.value,
@@ -584,9 +634,11 @@ class TradingAgent:
                 "strategy_mode": "defense_first",
             }
 
-        logger.info("[%s] Phase III — PLAN (%s → %s)", ticker,
-                     analysis.regime.value,
-                     self._regime_to_strategy(analysis.regime))
+        logger.info(
+            "[%s] Phase III — PLAN (%s → %s)",
+            ticker, analysis.regime.value,
+            self._regime_to_strategy(analysis.regime),
+        )
         plan: SpreadPlan = self.strategy_planner.plan(ticker, analysis)
 
         logger.info("[%s] Phase IV — RISK CHECK", ticker)
@@ -608,7 +660,8 @@ class TradingAgent:
                 logger.warning(
                     "[%s] LLM SKIPPED trade (confidence=%.2f): %s",
                     ticker, llm_decision.confidence,
-                    llm_decision.reasoning[:150])
+                    llm_decision.reasoning[:150],
+                )
 
                 self._log_signal(
                     ticker, "skipped_by_llm", analysis, plan, verdict,
@@ -645,8 +698,10 @@ class TradingAgent:
                 logger.warning("[%s] Failed to journal trade: %s", ticker, exc)
 
         # Always log to JournalKB
-        self._log_signal(ticker, exec_result.get("status", "unknown"),
-                         analysis, plan, verdict, llm_decision, exec_result)
+        self._log_signal(
+            ticker, exec_result.get("status", "unknown"),
+            analysis, plan, verdict, llm_decision, exec_result,
+        )
 
         result = {
             "ticker": ticker,
@@ -681,8 +736,7 @@ class TradingAgent:
         exec_result: Optional[Dict],
     ) -> None:
         """Build raw_signal dict and write to JournalKB."""
-        # Build trade thesis for JournalKB — answers why, why now, exit plan
-        thesis = self._build_thesis(analysis, plan, verdict)
+        thesis = build_thesis(analysis, plan, verdict)
 
         raw: Dict = {
             "regime": analysis.regime.value,
@@ -692,8 +746,9 @@ class TradingAgent:
             "risk_approved": verdict.approved,
             "net_credit": plan.net_credit if plan.valid else None,
             "max_loss": plan.max_loss if plan.valid else None,
-            "credit_to_width_ratio": (plan.credit_to_width_ratio
-                                      if plan.valid else None),
+            "credit_to_width_ratio": (
+                plan.credit_to_width_ratio if plan.valid else None
+            ),
             "spread_width": plan.spread_width if plan.valid else None,
             "expiration": plan.expiration if plan.valid else None,
             "sma_50": analysis.sma_50,
@@ -708,9 +763,10 @@ class TradingAgent:
             "checks_failed": verdict.checks_failed,
             "llm_decision": llm_decision.action if llm_decision else None,
             "llm_confidence": llm_decision.confidence if llm_decision else None,
-            "order_id": (exec_result.get("order_id")
-                         if exec_result else None),
-            "run_id": (exec_result.get("run_id") if exec_result else None),
+            "order_id": (
+                exec_result.get("order_id") if exec_result else None
+            ),
+            "run_id": exec_result.get("run_id") if exec_result else None,
             "thesis": thesis,
         }
 
@@ -728,134 +784,46 @@ class TradingAgent:
             logger.warning("[%s] JournalKB log failed: %s", ticker, exc)
 
     # ==================================================================
-    # Risk guardrail helpers
+    # Risk guardrail helpers (delegated to daily_state module)
     # ==================================================================
-
-    # ------------------------------------------------------------------
-    # Daily state helpers  (shared by drawdown check + debounce)
-    # ------------------------------------------------------------------
-
-    def _load_daily_state(self) -> Dict:
-        """Load daily_state.json; return {} on missing or corrupt file."""
-        state_path = os.path.join(
-            self.config.logging.trade_plan_dir, DAILY_STATE_FILENAME)
-        try:
-            with open(state_path) as fh:
-                return json.load(fh)
-        except (FileNotFoundError, json.JSONDecodeError):
-            return {}
-        except Exception as exc:
-            logger.warning("Could not read daily state: %s", exc)
-            return {}
-
-    def _save_daily_state(self, state: Dict) -> None:
-        """Persist state dict to daily_state.json."""
-        state_path = os.path.join(
-            self.config.logging.trade_plan_dir, DAILY_STATE_FILENAME)
-        try:
-            os.makedirs(os.path.dirname(state_path), exist_ok=True)
-            with open(state_path, "w") as fh:
-                json.dump(state, fh)
-        except Exception as exc:
-            logger.warning("Could not write daily state: %s", exc)
-
-    def _check_daily_drawdown(self, current_equity: float) -> bool:
-        """
-        Check if today's equity has fallen beyond the daily drawdown limit.
-        Persists day-start equity in {trade_plan_dir}/daily_state.json,
-        resetting automatically each calendar day.
-
-        Returns True if the circuit breaker should fire.
-        """
-        today = datetime.now().date().isoformat()
-        state = self._load_daily_state()
-
-        if state.get("date") != today:
-            # New day — reset baseline (preserve exit_vote_counts if present)
-            state = {
-                "date": today,
-                "start_equity": current_equity,
-                "exit_vote_counts": {},
-            }
-            self._save_daily_state(state)
-            logger.info("Daily state reset: start_equity=$%.2f", current_equity)
-            return False
-
-        start_equity = float(state.get("start_equity", current_equity))
-        if start_equity == 0:
-            return False
-        drawdown = (current_equity - start_equity) / start_equity
-        limit = self.config.trading.daily_drawdown_limit
-
-        if drawdown < -limit:
-            logger.critical(
-                "DAILY DRAWDOWN CIRCUIT BREAKER TRIGGERED: "
-                "%.2f%% loss today (limit=%.0f%%, start=$%.2f, now=$%.2f)",
-                abs(drawdown) * 100, limit * 100,
-                start_equity, current_equity,
-            )
-            self.journal_kb.log_cycle_error(
-                "daily_drawdown_circuit_breaker",
-                {
-                    "drawdown_pct": round(drawdown * 100, 3),
-                    "start_equity": start_equity,
-                    "current_equity": current_equity,
-                    "limit_pct": limit * 100,
-                    "date": today,
-                },
-            )
-            return True
-
-        logger.info("Daily drawdown check OK: %.2f%% (limit=%.0f%%)",
-                    drawdown * 100, limit * 100)
-        return False
 
     def _should_exit_spread(self, spread: SpreadPosition) -> bool:
         """
         3-cycle debounce guard for non-immediate exit signals.
 
         Immediate signals (HARD_STOP, STRIKE_PROXIMITY, DTE_SAFETY) bypass
-        debounce and return True immediately.
-
-        All other signals require the SAME signal on 3 consecutive cycles
-        before this returns True.  Vote counts are persisted in daily_state.json
-        and reset each calendar day.
+        debounce and return True immediately.  All other signals require
+        the SAME signal on 3 consecutive cycles before this returns True.
         """
         if spread.exit_signal == ExitSignal.HOLD:
             return False
 
-        # Immediate signals bypass debounce
         if spread.exit_signal in IMMEDIATE_EXIT_SIGNALS:
             logger.warning(
                 "[%s] IMMEDIATE exit signal %s — bypassing debounce",
-                spread.underlying, spread.exit_signal.value)
+                spread.underlying, spread.exit_signal.value,
+            )
             return True
 
-        state = self._load_daily_state()
-        vote_counts: Dict = state.get("exit_vote_counts", {})
+        count = tally_exit_vote(
+            self.daily_state,
+            ticker=spread.underlying,
+            signal_val=spread.exit_signal.value,
+            required=EXIT_DEBOUNCE_REQUIRED,
+        )
 
-        ticker = spread.underlying
-        signal_val = spread.exit_signal.value
-
-        existing = vote_counts.get(ticker, {})
-        if existing.get("signal") == signal_val:
-            count = existing.get("count", 0) + 1
-        else:
-            count = 1   # new or changed signal — reset
-
-        vote_counts[ticker] = {"signal": signal_val, "count": count}
-        state["exit_vote_counts"] = vote_counts
-        self._save_daily_state(state)
-
-        if count >= 3:
+        if count >= EXIT_DEBOUNCE_REQUIRED:
             logger.warning(
                 "[%s] Exit signal %s confirmed after %d cycles — acting",
-                spread.underlying, signal_val, count)
+                spread.underlying, spread.exit_signal.value, count,
+            )
             return True
 
         logger.info(
-            "[%s] Exit signal %s vote %d/3 — debouncing (next check in ~5 min)",
-            spread.underlying, signal_val, count)
+            "[%s] Exit signal %s vote %d/%d — debouncing (next check in ~5 min)",
+            spread.underlying, spread.exit_signal.value,
+            count, EXIT_DEBOUNCE_REQUIRED,
+        )
         return False
 
     def _check_liquidation_mode(self, equity: float,
@@ -887,46 +855,6 @@ class TradingAgent:
             return True
         return False
 
-    @staticmethod
-    def _build_thesis(analysis: "RegimeAnalysis",
-                      plan: "SpreadPlan",
-                      verdict: "RiskVerdict") -> Dict:
-        """
-        Build a structured trade thesis for JournalKB:
-          • why       — what the market is doing right now
-          • why_now   — the specific signal that triggered this entry
-          • exit_plan — expiration, profit target, and risk cap
-        """
-        mr = getattr(analysis, "mean_reversion_signal", False)
-        rs_spy = getattr(analysis, "relative_strength_vs_spy", 0.0)
-
-        why = (f"{analysis.regime.value.upper()} regime — "
-               f"price={analysis.current_price:.2f}, "
-               f"SMA50={analysis.sma_50:.2f}, SMA200={analysis.sma_200:.2f}, "
-               f"RSI={analysis.rsi_14:.1f}, BB_width={analysis.bollinger_width:.4f}")
-
-        if mr:
-            direction = getattr(analysis, "mean_reversion_direction", "")
-            why_now = (f"Price touched {direction} 3-std Bollinger Band — "
-                       f"mean reversion trade triggered")
-        elif rs_spy > 0.001:
-            why_now = (f"Ticker outperforming SPY by {rs_spy*100:.2f}% "
-                       f"in 5-min window — relative strength bias")
-        else:
-            why_now = analysis.reasoning[:200]
-
-        if plan.valid:
-            profit_target = round(plan.net_credit * 0.5 * 100, 2)
-            exit_plan = (f"Expiry {plan.expiration} | "
-                         f"Profit target: 50% of credit "
-                         f"(${profit_target:.2f}/contract) | "
-                         f"Max loss: ${plan.max_loss:.2f} | "
-                         f"Close if regime shifts adversely")
-        else:
-            exit_plan = f"No trade — plan rejected: {plan.rejection_reason}"
-
-        return {"why": why, "why_now": why_now, "exit_plan": exit_plan}
-
     # ==================================================================
     # Order status check
     # ==================================================================
@@ -940,8 +868,10 @@ class TradingAgent:
             open_summary = self.order_tracker.summarize_orders(open_orders)
             fill_summary = self.order_tracker.summarize_orders(recent_fills)
 
-            logger.info("Open orders: %d | Recent fills: %d",
-                        open_summary["total"], fill_summary["total"])
+            logger.info(
+                "Open orders: %d | Recent fills: %d",
+                open_summary["total"], fill_summary["total"],
+            )
 
             return {
                 "open_orders": open_summary,
@@ -994,8 +924,10 @@ class TradingAgent:
                         )
                     break
         except Exception as exc:
-            logger.warning("[%s] Post-trade learning failed: %s",
-                          spread.underlying, exc)
+            logger.warning(
+                "[%s] Post-trade learning failed: %s",
+                spread.underlying, exc,
+            )
 
     @staticmethod
     def _regime_to_strategy(regime) -> str:
@@ -1018,18 +950,21 @@ class TradingAgent:
 
     def _print_summary(self, results: List[Dict]):
         """Log a human-readable summary table."""
-        logger.info("\n%-6s | %-10s | %-18s | %-8s | %-10s | %s",
-                     "Ticker", "Regime", "Strategy", "Valid", "Risk OK", "Status")
+        logger.info(
+            "\n%-6s | %-10s | %-18s | %-8s | %-10s | %s",
+            "Ticker", "Regime", "Strategy", "Valid", "Risk OK", "Status",
+        )
         logger.info("-" * 80)
         for r in results:
-            logger.info("%-6s | %-10s | %-18s | %-8s | %-10s | %s",
-                         r.get("ticker", "?"),
-                         r.get("regime", "?"),
-                         r.get("strategy", "?"),
-                         r.get("plan_valid", "?"),
-                         r.get("risk_approved", "?"),
-                         r.get("execution", {}).get(
-                             "status", r.get("status", "?")))
+            logger.info(
+                "%-6s | %-10s | %-18s | %-8s | %-10s | %s",
+                r.get("ticker", "?"),
+                r.get("regime", "?"),
+                r.get("strategy", "?"),
+                r.get("plan_valid", "?"),
+                r.get("risk_approved", "?"),
+                r.get("execution", {}).get("status", r.get("status", "?")),
+            )
 
 
 # ------------------------------------------------------------------

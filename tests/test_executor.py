@@ -270,8 +270,17 @@ class TestPositionSizing:
         good_plan = _make_sized_plan()
         assert executor._calculate_qty(good_plan, 0.0) == 0
 
-    def test_submit_order_aborts_when_qty_is_zero(self, tmp_path):
-        """If sizing returns 0, the order is rejected — never submitted."""
+    def test_submit_order_aborts_when_plan_cannot_be_sized(self, tmp_path):
+        """A plan whose one-contract risk exceeds the sizing budget must
+        be rejected without ever calling requests.post.
+
+        Note: the live-credit recheck (Task #7) now catches oversized plans
+        via the same max_loss / equity formula _calculate_qty uses, so in
+        practice the rejection comes from ``live_credit_risk`` rather than
+        the downstream ``qty=0`` guard. Both are legitimate rejection paths
+        — the critical invariant this test defends is that **no order is
+        submitted** when the plan cannot fit within the risk budget. The
+        old floor-to-1 bypass is gone either way."""
         executor = OrderExecutor(
             api_key="k", secret_key="s",
             trade_plan_dir=str(tmp_path), dry_run=False,
@@ -280,16 +289,21 @@ class TestPositionSizing:
         # Plan whose single-contract loss exceeds the sizing budget
         plan = _make_sized_plan(spread_width=5.0, net_credit=0.10)
         verdict = _make_verdict(approved=True, plan=plan)
-        verdict.account_balance = 20_000  # tiny equity → qty=0
+        verdict.account_balance = 20_000  # tiny equity → no room for one contract
 
         with patch("trading_agent.executor.requests.post") as mock_post:
             result = executor.execute(verdict)
             assert mock_post.called is False, (
-                "requests.post must NOT be called when qty=0 — "
-                "the floor-to-1 bypass is gone")
+                "requests.post must NOT be called for an un-sizeable plan — "
+                "neither the live-credit recheck nor the qty=0 guard may "
+                "silently fall back to floor-to-1")
 
         assert result["status"] == "rejected"
-        assert "qty=0" in result["reason"]
+        # Either rejection path is valid; both prove the bypass is closed.
+        reason = result["reason"].lower()
+        assert ("qty=0" in reason) or ("live_credit_risk" in reason), (
+            f"Expected rejection by sizing or live-credit recheck, got: {reason}"
+        )
 
     def test_qty_uses_live_credit_override(self, tmp_path):
         """Passing live_credit must change qty when it differs from plan."""

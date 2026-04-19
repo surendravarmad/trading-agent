@@ -11,6 +11,7 @@ from typing import Dict, List, Optional, Tuple
 
 from trading_agent.regime import Regime, RegimeAnalysis
 from trading_agent.market_data import MarketDataProvider
+from trading_agent.calendar_utils import next_weekly_expiration
 
 logger = logging.getLogger(__name__)
 
@@ -314,43 +315,22 @@ class StrategyPlanner:
 
     def _pick_expiration(self) -> str:
         """
-        Choose the Friday nearest to TARGET_DTE (45), biasing toward the
-        UPPER end of DTE_RANGE to reduce gamma risk near expiration.
+        Choose the weekly expiration nearest to TARGET_DTE (45), biasing
+        toward the UPPER end of DTE_RANGE to reduce gamma risk.
 
-        When both adjacent Fridays are within the allowed range the further
-        one (higher DTE) is preferred — this keeps theta decay slower and
-        gives more time for the trade to work.
+        Uses NYSE calendar (pandas_market_calendars) so that holiday-Fridays
+        (e.g. Good Friday) correctly resolve to Thursday expiration, which
+        is where the weekly options actually list.
 
         Uses local date (not UTC) to match the cron-run trading day.
         """
         today = datetime.now().date()
-        target = today + timedelta(days=self.TARGET_DTE)
-
-        days_to_next = (4 - target.weekday()) % 7
-        next_friday = target + timedelta(days=days_to_next)
-        prev_friday = next_friday - timedelta(days=7)
-
-        min_expiry = today + timedelta(days=self.DTE_RANGE[0])
-        max_expiry = today + timedelta(days=self.DTE_RANGE[1])
-
-        next_ok = min_expiry <= next_friday <= max_expiry
-        prev_ok = min_expiry <= prev_friday <= max_expiry
-
-        if next_ok and prev_ok:
-            # Both valid — pick the further Friday (higher DTE = less gamma risk)
-            candidate = next_friday
-        elif next_ok:
-            candidate = next_friday
-        elif prev_ok:
-            candidate = prev_friday
-        else:
-            # Neither adjacent Friday fits; clamp to the closest valid Friday
-            candidate = next_friday if days_to_next <= 3 else prev_friday
-            if candidate > max_expiry:
-                candidate -= timedelta(days=7)
-            elif candidate < min_expiry:
-                candidate += timedelta(days=7)
-
+        candidate = next_weekly_expiration(
+            today=today,
+            target_dte=self.TARGET_DTE,
+            dte_min=self.DTE_RANGE[0],
+            dte_max=self.DTE_RANGE[1],
+        )
         dte = (candidate - today).days
         logger.debug("Expiration selected: %s (%d DTE)", candidate, dte)
         return candidate.strftime("%Y-%m-%d")

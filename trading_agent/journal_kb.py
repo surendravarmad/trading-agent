@@ -49,6 +49,8 @@ import os
 from datetime import datetime, timezone
 from typing import Any, Dict, Optional
 
+from trading_agent.file_locks import locked_append
+
 logger = logging.getLogger(__name__)
 
 _MD_HEADER = (
@@ -172,6 +174,22 @@ class JournalKB:
         self._write_jsonl(record)
         logger.error("JournalKB cycle_error: %s", error)
 
+    def log_shutdown(self, reason: str, context: Optional[Dict] = None) -> None:
+        """
+        Log a graceful-shutdown marker to the journal.
+
+        Used by shutdown.graceful_exit() so post-mortem readers can
+        correlate gaps in the cycle log with clean exits vs. crashes.
+        """
+        ts = datetime.now(timezone.utc).isoformat()
+        record: Dict[str, Any] = {
+            "timestamp": ts,
+            "event": "shutdown",
+            "reason": reason[:200],
+            "context": context or {},
+        }
+        self._write_jsonl(record)
+
     # ------------------------------------------------------------------
     # Internal helpers
     # ------------------------------------------------------------------
@@ -179,13 +197,22 @@ class JournalKB:
     def _ensure_md_header(self) -> None:
         """Write the Markdown header if the file doesn't exist yet."""
         if not os.path.exists(self.md_path):
-            with open(self.md_path, "w") as fh:
+            # Header write is one-shot at init; a locked append is overkill
+            # but keeps the concurrency story consistent across this module.
+            with locked_append(self.md_path) as fh:
                 fh.write("# Trade Signal Journal\n\n")
                 fh.write(_MD_HEADER)
 
     def _write_jsonl(self, record: Dict[str, Any]) -> None:
+        """
+        Append one JSON record as a single line, under an exclusive lock.
+
+        The lock guarantees concurrent writers (cron cycle + manual run
+        + Streamlit backtester) don't interleave bytes inside a line
+        and break the JSONL parser.
+        """
         try:
-            with open(self.jsonl_path, "a") as fh:
+            with locked_append(self.jsonl_path) as fh:
                 fh.write(json.dumps(record, default=str) + "\n")
         except Exception as exc:
             logger.error("JournalKB JSONL write failed: %s", exc)
@@ -212,7 +239,7 @@ class JournalKB:
                 f"| {strategy} | {regime} | {risk_ok} | {status} "
                 f"| {conf_str} | {safe_notes} |\n"
             )
-            with open(self.md_path, "a") as fh:
+            with locked_append(self.md_path) as fh:
                 fh.write(row)
         except Exception as exc:
             logger.error("JournalKB Markdown write failed: %s", exc)

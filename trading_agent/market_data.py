@@ -270,26 +270,57 @@ class MarketDataProvider:
 
     @staticmethod
     def compute_sma(prices: pd.Series, window: int) -> pd.Series:
-        """Simple Moving Average."""
+        """Simple Moving Average — pandas rolling mean."""
         return prices.rolling(window=window).mean()
 
     @staticmethod
     def compute_rsi(prices: pd.Series, window: int = 14) -> pd.Series:
-        """Relative Strength Index."""
+        """Relative Strength Index — Wilder's smoothing (RMA).
+
+        Uses exponentially-weighted mean with ``alpha = 1 / window`` — the
+        mathematically correct RSI as defined by J. Welles Wilder,
+        matching the convention used by TA-Lib, pandas-ta, TradingView,
+        and ThinkOrSwim. This differs from a naive rolling-mean RSI (the
+        prior implementation): values are smoother, converge more slowly
+        after price shocks, and persist farther into overbought /
+        oversold territory during sustained trends.
+
+        Why not depend on pandas-ta? pandas-ta ≥0.3.14b unconditionally
+        imports ``numba`` at module load time via
+        ``pandas_ta/utils/_math.py``. On platforms where no numba wheel
+        exists (e.g. Python 3.14 at certain points), the whole package
+        fails to import. pandas' own ``ewm`` produces identical smoothing
+        for the three indicators we need, so we stay lean.
+        """
         delta = prices.diff()
-        gain = delta.where(delta > 0, 0.0)
-        loss = -delta.where(delta < 0, 0.0)
-        avg_gain = gain.rolling(window=window).mean()
-        avg_loss = loss.rolling(window=window).mean()
+        # clip (not where) preserves the bar-0 NaN so the first ewm
+        # window isn't biased by a spurious 0 on the leading position.
+        gain = delta.clip(lower=0.0)
+        loss = (-delta).clip(lower=0.0)
+        # alpha = 1/window reproduces Wilder's RMA. adjust=True (pandas
+        # default) matches pandas-ta's rma() and TradingView's RSI output.
+        # min_periods=window keeps the first window-1 values NaN, so the
+        # first reported RSI appears at bar ``window`` — TA-Lib convention.
+        avg_gain = gain.ewm(alpha=1.0 / window, min_periods=window).mean()
+        avg_loss = loss.ewm(alpha=1.0 / window, min_periods=window).mean()
         rs = avg_gain / avg_loss.replace(0, np.nan)
         return 100 - (100 / (1 + rs))
 
     @staticmethod
     def compute_bollinger_bands(prices: pd.Series, window: int = 20,
                                  num_std: float = 2.0):
-        """Return (upper, middle, lower) Bollinger Bands."""
+        """Return (upper, middle, lower) Bollinger Bands.
+
+        Uses pandas' default sample standard deviation (``ddof=1``) —
+        the unbiased estimator appropriate for finite windows. Note that
+        TA-Lib and many charting platforms default to population std
+        (``ddof=0``), which produces bands ~2.5% narrower at the 20-day
+        default. The regime-detection logic and its tests were
+        calibrated against the sample-std version, so we keep it here;
+        external chart comparisons should account for the ddof choice.
+        """
         middle = prices.rolling(window=window).mean()
-        std = prices.rolling(window=window).std()
+        std = prices.rolling(window=window).std()   # ddof=1 (sample)
         upper = middle + num_std * std
         lower = middle - num_std * std
         return upper, middle, lower

@@ -9,7 +9,7 @@ a sortable trade log, and CSV/JSON/Journal export.
 import json
 from dataclasses import dataclass, field
 from datetime import date, timedelta
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -35,11 +35,36 @@ INTRADAY_MAX_DAYS = 29          # 5m data only available for last ~30 days
 INTRADAY_WARMUP_BARS = 20       # 20 × 5-min bars ≈ 1.5 hours warmup for intraday SMA
 INTRADAY_HOLD_BARS = 12         # 12 × 5-min bars = 1 hour hold per intraday trade
 
-# OTM % for short strike placement
+# OTM % for short strike placement (legacy fixed-% path — kept for backward
+# compatibility with test_backtest_ui.py and as a fallback when realized-vol
+# cannot be computed).
 # Daily: 3% is realistic over a 45-day hold (SPY moves ~1% per day)
 # Intraday: 3% in 60 minutes is nearly impossible → use 0.5% so losses actually occur
 DAILY_OTM_PCT   = 0.03
 INTRADAY_OTM_PCT = 0.005
+
+# --- Sigma-based (delta-proxy) strike placement ----------------------------
+# Sigma multiplier defaults approximate standard short-delta targets:
+#   1.0σ ≈ 16 Δ   (too aggressive for intraday theta)
+#   1.5σ ≈  7 Δ   (balanced intraday default)
+#   2.0σ ≈  2 Δ   (very conservative, small credits)
+DEFAULT_SIGMA_MULT_DAILY    = 1.0
+DEFAULT_SIGMA_MULT_INTRADAY = 1.5
+
+# Bars per year — used to annualize the stdev of log-returns.
+BARS_PER_YEAR_DAILY    = 252
+BARS_PER_YEAR_INTRADAY = 252 * 78     # 6.5h × 12 five-minute bars per session
+
+# Vol window used to estimate realized σ at entry (uses warmup bars by default).
+VOL_WINDOW_DAILY    = 20      # ~1 month of daily bars
+VOL_WINDOW_INTRADAY = 20      # same as warmup → ~1.5h
+
+# --- Early loss-cut ---------------------------------------------------------
+# On first breach of the short strike, close at ``-LOSS_CUT_MULTIPLIER × credit``
+# instead of the full max-loss payoff. This reshapes the loss:win ratio from
+# (width − credit)/(credit × profit_target) ≈ 4.9:1 down to ~4.0:1 at k=2,
+# dropping the breakeven win rate from ~83% to ~80%.
+DEFAULT_LOSS_CUT_MULTIPLIER = 2.0
 
 ALL_TICKERS = [
     "SPY", "QQQ", "IWM", "GOOG", "AAPL",
@@ -103,6 +128,16 @@ class Backtester:
         target_dte: int = 45,
         profit_target_pct: float = 0.50,
         commission: float = COMMISSION_ROUND_TRIP,
+        # --- New (delta-proxy / loss-cut) knobs ---
+        # When ``sigma_mult`` is None the legacy fixed-% OTM path is used and
+        # ``credit`` stays at ``spread_width × credit_pct``. When it is a
+        # positive float, short-strike distance and per-trade credit are both
+        # derived from a realized-vol projection (see _sigma_strike_distance
+        # and _credit_from_sigma).
+        sigma_mult: Optional[float] = None,
+        # When ``loss_cut_multiplier`` is None, breaches pay full max-loss.
+        # When it is a positive float k, breaches pay only ``-k × credit``.
+        loss_cut_multiplier: Optional[float] = None,
     ) -> None:
         self.starting_equity = starting_equity
         self.spread_width = spread_width
@@ -110,6 +145,65 @@ class Backtester:
         self.target_dte = target_dte
         self.profit_target_pct = profit_target_pct
         self.commission = commission
+        self.sigma_mult = sigma_mult
+        self.loss_cut_multiplier = loss_cut_multiplier
+
+    # ── Volatility & credit helpers (sigma-based strike model) ──────────────
+
+    @staticmethod
+    def _realized_vol_annual(
+        prices: pd.Series, idx: int, window: int, bars_per_year: int
+    ) -> float:
+        """
+        Annualized stdev of log returns over the last ``window`` bars ending
+        at (and including) bar ``idx``.
+
+        Returns 0.0 if there's not enough history or if the window is
+        degenerate (flat prices → σ=0).
+        """
+        start = max(0, idx - window)
+        segment = prices.iloc[start: idx + 1]
+        if len(segment) < 3:
+            return 0.0
+        log_ret = np.log(segment / segment.shift(1)).dropna()
+        sd = float(log_ret.std())
+        if not np.isfinite(sd) or sd <= 0.0:
+            return 0.0
+        return sd * float(np.sqrt(bars_per_year))
+
+    @staticmethod
+    def _sigma_strike_distance(
+        sigma_annual: float, hold_bars: int, bars_per_year: int, sigma_mult: float,
+    ) -> float:
+        """
+        Return the fractional distance from entry price to the short strike,
+        projecting annualized σ over the hold horizon and scaling by
+        ``sigma_mult`` (a σ-count proxy for delta placement).
+        """
+        if sigma_annual <= 0.0 or bars_per_year <= 0 or hold_bars <= 0:
+            return 0.0
+        sigma_hold = sigma_annual * float(np.sqrt(hold_bars / bars_per_year))
+        return max(0.0, sigma_mult * sigma_hold)
+
+    @staticmethod
+    def _credit_from_sigma(
+        sigma_mult: float, min_frac: float = 0.05, max_frac: float = 0.45,
+    ) -> float:
+        """
+        Approximate credit as a fraction of width, as a function of strike
+        distance in σ.
+
+        Heuristic (roughly matches listed SPY vertical quotes):
+            0.5σ → 0.40 × width     (close to ATM, big premium)
+            1.0σ → 0.30 × width     (≈ current default 30%)
+            1.5σ → 0.225 × width
+            2.0σ → 0.15 × width
+            2.5σ → 0.075 × width    (clipped to min_frac)
+
+        This prevents the common backtest cheat of moving strikes further
+        OTM while holding credit constant (which is free risk reduction).
+        """
+        return float(np.clip(0.45 - 0.15 * sigma_mult, min_frac, max_frac))
 
     # ── Regime helpers ──────────────────────────────────────────────────────
 
@@ -159,29 +253,62 @@ class Backtester:
     def _simulate(
         self, prices: pd.Series, entry_idx: int, regime: str, credit: float,
         hold_bars: int = None, otm_pct: float = DAILY_OTM_PCT,
+        strike_distance_pct: Optional[float] = None,
+        loss_cut_multiplier: Optional[float] = None,
     ) -> tuple:
+        """
+        Walk forward from ``entry_idx`` and return ``(outcome, pnl, hold_count)``.
+
+        Strike placement
+        ----------------
+        - If ``strike_distance_pct`` is provided, it overrides ``otm_pct`` and
+          is the sigma-based placement supplied by ``run()``.
+        - Otherwise the legacy fixed-% OTM model applies (preserves tests).
+
+        Loss model
+        ----------
+        - If ``loss_cut_multiplier`` is None, a breach pays the full max-loss
+          of ``-(width − credit) × 100`` (legacy behavior).
+        - If set to k, the first breached bar closes the position at
+          ``-k × credit × 100``. ``hold_count`` is the bar index at breach,
+          not the full hold window — so "Avg Hold" also reports the true
+          time-to-exit rather than always the max.
+        """
         if hold_bars is None:
             hold_bars = self.target_dte
         end_idx = min(entry_idx + hold_bars, len(prices) - 1)
         fwd = prices.iloc[entry_idx: end_idx + 1]
         entry_p = prices.iloc[entry_idx]
 
-        lower = entry_p * (1 - otm_pct)
-        upper = entry_p * (1 + otm_pct)
+        distance = strike_distance_pct if strike_distance_pct is not None else otm_pct
+        lower = entry_p * (1 - distance)
+        upper = entry_p * (1 + distance)
 
         if regime == "bullish":
-            breached = (fwd < lower).any()
+            breach_mask = (fwd < lower).to_numpy()
         elif regime == "bearish":
-            breached = (fwd > upper).any()
-        else:  # sideways / iron condor
-            breached = ((fwd < lower) | (fwd > upper)).any()
+            breach_mask = (fwd > upper).to_numpy()
+        else:  # sideways / iron condor — either wing
+            breach_mask = ((fwd < lower) | (fwd > upper)).to_numpy()
 
-        hold_count = end_idx - entry_idx
-        if breached:
-            pnl = -(self.spread_width * 100 - credit * 100) - self.commission
-            return "loss", round(pnl, 2), hold_count
-        pnl = credit * 100 * self.profit_target_pct - self.commission
-        return "win", round(pnl, 2), hold_count
+        # breach_mask[0] is the entry bar itself — by construction entry_p
+        # lies inside [lower, upper] so it's always False. First True is the
+        # first bar that touched the strike.
+        breach_positions = np.flatnonzero(breach_mask)
+        full_hold = end_idx - entry_idx
+
+        if breach_positions.size == 0:
+            # Winner — no touch for the whole hold window
+            pnl = credit * 100.0 * self.profit_target_pct - self.commission
+            return "win", round(pnl, 2), full_hold
+
+        # Loser — close at the first breach
+        breach_bar = int(breach_positions[0])
+        if loss_cut_multiplier is not None and loss_cut_multiplier > 0:
+            pnl = -(loss_cut_multiplier * credit * 100.0) - self.commission
+        else:
+            pnl = -(self.spread_width * 100.0 - credit * 100.0) - self.commission
+        return "loss", round(pnl, 2), breach_bar
 
     # ── Main run ────────────────────────────────────────────────────────────
 
@@ -228,6 +355,19 @@ class Backtester:
 
         warmup_bars = INTRADAY_WARMUP_BARS if is_intraday else 200
         hold_bars = INTRADAY_HOLD_BARS if is_intraday else self.target_dte
+        bars_per_year = BARS_PER_YEAR_INTRADAY if is_intraday else BARS_PER_YEAR_DAILY
+        vol_window = VOL_WINDOW_INTRADAY if is_intraday else VOL_WINDOW_DAILY
+
+        # If the caller didn't set sigma_mult on the instance, fall back to
+        # the timeframe-appropriate default (intraday is tighter because
+        # theta over 1 hour is a small fraction of daily theta).
+        effective_sigma_mult = (
+            self.sigma_mult
+            if self.sigma_mult is not None
+            else (DEFAULT_SIGMA_MULT_INTRADAY if is_intraday else DEFAULT_SIGMA_MULT_DAILY)
+        )
+        # A value ≤ 0 disables the sigma path → legacy fixed-% OTM model.
+        use_sigma_path = effective_sigma_mult > 0.0
 
         all_trades: List[SimTrade] = []
         equity = self.starting_equity
@@ -285,11 +425,35 @@ class Backtester:
 
                 regime = self._classify_bars(prices, i, warmup_bars)
                 strategy = self._strategy(regime)
-                credit = self.spread_width * self.credit_pct
-                max_loss = self.spread_width - credit
 
+                # --- Strike + credit: sigma-based when enabled, else fixed ---
+                strike_distance_pct: Optional[float] = None
+                if use_sigma_path:
+                    sigma_annual = self._realized_vol_annual(
+                        prices, i, vol_window, bars_per_year
+                    )
+                    strike_distance_pct = self._sigma_strike_distance(
+                        sigma_annual, hold_bars, bars_per_year, effective_sigma_mult
+                    )
+                    # Degenerate σ (flat prices, insufficient history) — fall
+                    # back to the legacy fixed-% OTM so we don't inadvertently
+                    # place the strike on top of spot.
+                    if strike_distance_pct <= 0.0:
+                        strike_distance_pct = None
+                        credit = self.spread_width * self.credit_pct
+                    else:
+                        credit_frac = self._credit_from_sigma(effective_sigma_mult)
+                        credit = self.spread_width * credit_frac
+                else:
+                    credit = self.spread_width * self.credit_pct
+
+                max_loss = self.spread_width - credit
                 otm_pct = INTRADAY_OTM_PCT if is_intraday else DAILY_OTM_PCT
-                outcome, pnl, hold_count = self._simulate(prices, i, regime, credit, hold_bars, otm_pct)
+                outcome, pnl, hold_count = self._simulate(
+                    prices, i, regime, credit, hold_bars, otm_pct,
+                    strike_distance_pct=strike_distance_pct,
+                    loss_cut_multiplier=self.loss_cut_multiplier,
+                )
                 equity = round(equity + pnl, 2)
                 last_entry_idx = i
 
@@ -408,8 +572,13 @@ def _run_cached(
     end: date,
     timeframe: str,
     use_alpaca: bool,
+    sigma_mult: Optional[float] = None,
+    loss_cut_multiplier: Optional[float] = None,
 ) -> BacktestResult:
-    return Backtester().run(list(tickers), start, end, timeframe, use_alpaca)
+    return Backtester(
+        sigma_mult=sigma_mult,
+        loss_cut_multiplier=loss_cut_multiplier,
+    ).run(list(tickers), start, end, timeframe, use_alpaca)
 
 
 # ---------------------------------------------------------------------------
@@ -503,6 +672,60 @@ def render_backtest_ui() -> None:
             key="bt_use_alpaca",
             help="Prefer Alpaca historical bars over yfinance (requires live API key).",
         )
+
+        # ── Strategy-realism knobs ────────────────────────────────────────
+        st.markdown("**Strategy Realism**")
+
+        use_sigma = st.toggle(
+            "Sigma-based strikes",
+            value=True,
+            key="bt_use_sigma",
+            help=(
+                "Place short strikes at N × realized σ projected over the "
+                "hold window (delta-proxy). Credit is scaled down as strikes "
+                "move further OTM — prevents the fixed-% free-lunch bias. "
+                "Off = legacy fixed 0.5% / 3% OTM."
+            ),
+        )
+        if use_sigma:
+            default_sigma = (
+                DEFAULT_SIGMA_MULT_INTRADAY if is_intraday else DEFAULT_SIGMA_MULT_DAILY
+            )
+            sigma_mult_value: Optional[float] = st.slider(
+                "σ multiplier (short strike distance)",
+                min_value=0.5, max_value=3.0,
+                value=float(default_sigma), step=0.1,
+                key="bt_sigma_mult",
+                help=(
+                    "1.0σ ≈ 16Δ (aggressive), 1.5σ ≈ 7Δ (balanced), "
+                    "2.0σ ≈ 2Δ (conservative, tiny credits)."
+                ),
+            )
+        else:
+            sigma_mult_value = 0.0   # explicit disable → legacy fixed-% OTM
+
+        use_loss_cut = st.toggle(
+            "Early loss cut",
+            value=True,
+            key="bt_use_loss_cut",
+            help=(
+                "On first breach of the short strike, close at "
+                "−k × credit instead of the full max-loss. Reshapes "
+                "loss:win from ~4.9:1 to ~4.0:1 and drops breakeven "
+                "win rate from 83% to ~80%."
+            ),
+        )
+        if use_loss_cut:
+            loss_cut_value: Optional[float] = st.slider(
+                "Loss-cut multiplier (× credit)",
+                min_value=1.0, max_value=4.0,
+                value=float(DEFAULT_LOSS_CUT_MULTIPLIER), step=0.25,
+                key="bt_loss_cut_mult",
+                help="1.0 = breakeven cut, 2.0 = standard, 4.0 ≈ full max-loss.",
+            )
+        else:
+            loss_cut_value = None
+
         st.divider()
         run_btn = st.button("Run Backtest", type="primary", use_container_width=True)
 
@@ -530,10 +753,16 @@ def render_backtest_ui() -> None:
                 st.error("Start date must be before end date.")
                 return
             result = _run_cached(
-                tuple(sorted(tickers)), start_date, end_date, timeframe, use_alpaca
+                tuple(sorted(tickers)), start_date, end_date, timeframe, use_alpaca,
+                sigma_mult=sigma_mult_value,
+                loss_cut_multiplier=loss_cut_value,
             )
             st.session_state["backtest_result"] = result
             st.session_state["backtest_timeframe"] = timeframe
+            st.session_state["backtest_config"] = {
+                "sigma_mult": sigma_mult_value,
+                "loss_cut_multiplier": loss_cut_value,
+            }
 
         result: Optional[BacktestResult] = st.session_state.get("backtest_result")
         if result is None:
@@ -568,6 +797,18 @@ def render_backtest_ui() -> None:
                     "Try setting Start Date to at least 1 year ago."
                 )
             return
+
+        # ── Active-config caption (so numbers can be tied to knobs) ───────
+        cfg = st.session_state.get("backtest_config", {})
+        cfg_sigma = cfg.get("sigma_mult")
+        cfg_lc = cfg.get("loss_cut_multiplier")
+        sigma_label = (
+            f"σ×{cfg_sigma:.1f}" if cfg_sigma and cfg_sigma > 0 else "fixed-%-OTM"
+        )
+        lc_label = (
+            f"loss-cut@{cfg_lc:.1f}×credit" if cfg_lc else "full-max-loss"
+        )
+        st.caption(f"Strike model: **{sigma_label}** · Loss model: **{lc_label}**")
 
         # ── Summary metric cards ───────────────────────────────────────────
         hold_label = "Avg Hold (bars)" if is_result_intraday else "Avg Hold (days)"

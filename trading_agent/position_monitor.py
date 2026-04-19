@@ -7,7 +7,7 @@ the original trade plan, and generates exit signals based on:
   1. HARD_STOP:        Spread value ≥ 3× initial credit (immediate, no debounce)
   2. PROFIT_TARGET:    50% of max credit captured
   3. STRIKE_PROXIMITY: Underlying within 1% of any short strike (immediate)
-  4. DTE_SAFETY:       Thursday before expiry after 15:30 ET (immediate)
+  4. DTE_SAFETY:       Last trading day before expiry after 15:30 ET (immediate)
   5. REGIME_SHIFT:     Current regime contradicts the position's strategy
 
 Signals marked "immediate" bypass the 3-cycle debounce in agent.py and
@@ -22,6 +22,7 @@ from typing import Dict, List, Optional
 
 import requests
 
+from trading_agent.calendar_utils import is_last_trading_day_before
 from trading_agent.regime import Regime
 
 logger = logging.getLogger(__name__)
@@ -321,11 +322,15 @@ class PositionMonitor:
         """
         Return a non-empty reason string if the DTE safety rule triggers.
 
-        Rule: if today is Thursday AND current time is ≥ 15:30 ET AND the
-        spread expires the following day (Friday), return a warning.
+        Rule: if today is the **last NYSE trading day strictly before
+        expiration** AND current time is ≥ 15:30 ET, return a warning.
 
-        We avoid carrying an option into its final Friday of life to prevent
-        last-day gamma explosion and assignment risk.
+        We avoid carrying an option into its final day of life to prevent
+        last-day gamma explosion and assignment risk. Using the NYSE
+        calendar (pandas_market_calendars) correctly handles holiday
+        weeks — e.g. when Good Friday closes the market, the last trading
+        day before a Friday expiration is Thursday; when a Wednesday
+        expiration week lands (unusual), the rule fires on Tuesday.
         """
         if not expiration:
             return ""
@@ -338,16 +343,15 @@ class PositionMonitor:
             now_et_minute = now_utc.minute
             today = now_utc.date()
 
-            # Thursday = weekday 3
-            is_thursday = today.weekday() == 3
             after_cutoff = (now_et_hour > 15 or
                             (now_et_hour == 15 and now_et_minute >= 30))
-            expires_tomorrow = (exp_date - today).days == 1  # Friday
+            last_day = is_last_trading_day_before(today, exp_date)
 
-            if is_thursday and after_cutoff and expires_tomorrow:
+            if last_day and after_cutoff:
                 return (
-                    f"DTE safety: expiration {expiration} is tomorrow. "
-                    f"Liquidating by 15:30 ET to avoid last-day gamma risk."
+                    f"DTE safety: expiration {expiration} is the next "
+                    f"trading day. Liquidating by 15:30 ET to avoid "
+                    f"last-day gamma risk."
                 )
         except Exception:
             pass

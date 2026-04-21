@@ -365,7 +365,9 @@ trading-agent/
 │
 ├── trading_agent/
 │   ├── agent.py                      # Orchestrator: two-stage cycle, timeout guard, sentiment pipeline
-│   ├── config.py                     # AppConfig + IntelligenceConfig (LLM + FinGPT + verifier)
+│   ├── config.py                     # AppConfig + IntelligenceConfig (LLM + FinGPT + verifier + cache + calendar)
+│   ├── ports.py                      # Hexagonal protocols: MarketDataPort, BrokerPort, SentimentReadout
+│   ├── market_profile.py             # MarketProfile (timezone, session bounds, trading-day oracle)
 │   ├── logger_setup.py
 │   │
 │   │   # ── Core Phases ──
@@ -384,14 +386,17 @@ trading-agent/
 │   ├── journal_kb.py                 # Always-on signal logger (JSONL + Markdown)
 │   ├── trade_journal.py              # Full-lifecycle trade logging (TradeEntry)
 │   ├── knowledge_base.py             # File-based RAG vector store
-│   ├── llm_client.py                 # OpenAI-compatible LLM client (Ollama / Claude / OpenAI)
-│   ├── llm_analyst.py                # Pre/post trade LLM analysis — injects FinGPT sentiment
+│   ├── llm_client.py                 # OpenAI-compatible LLM client + make_llm_client(role) factory
+│   ├── llm_analyst.py                # Pre/post trade LLM analysis — consumes SentimentReadout
 │   ├── fine_tuning.py                # Training data export (JSONL / Alpaca / DPO)
 │   │
 │   │   # ── Multi-Source Sentiment Pipeline ──
-│   ├── news_aggregator.py            # NewsItem + NewsAggregator (Yahoo/SEC/Fed/Reddit/Twitter)
-│   ├── fingpt_analyser.py            # FinGPT specialist — SentimentReport, source-weighted prompts
-│   └── sentiment_verifier.py        # Reasoning verifier — VerifiedSentimentReport, hallucination flags
+│   ├── sentiment_pipeline.py         # SentimentPipeline facade — Tier-0/1/2 gating, cycle-scoped pool
+│   ├── earnings_calendar.py          # Tier-0 — yfinance-backed authoritative event_risk short-circuit
+│   ├── sentiment_cache.py            # Tier-1 — SHA-1 content-hash gate (TTL + LRU)
+│   ├── news_aggregator.py            # Tier-2 — NewsItem + NewsAggregator (Yahoo/SEC/Fed/Reddit/Twitter)
+│   ├── fingpt_analyser.py            # Tier-2 — FinGPT specialist (SentimentReport)
+│   └── sentiment_verifier.py         # Tier-2 — Reasoning verifier (VerifiedSentimentReport)
 │
 ├── trade_journal/                    # Trade lifecycle logs + signal journal (auto-created)
 │   ├── trades/
@@ -459,15 +464,26 @@ LLM_BASE_URL=http://localhost:11434
 LLM_MODEL=qwen2.5-trading
 LLM_EMBEDDING_MODEL=nomic-embed-text
 LLM_TEMPERATURE=0.3
+LLM_MAX_TOKENS=2048
+LLM_TIMEOUT=60
 TRADE_JOURNAL_DIR=trade_journal
 KNOWLEDGE_BASE_DIR=knowledge_base
 
-# ── FinGPT Sentiment Pipeline (optional) ──
+# ── FinGPT Specialist (optional — stage 2/3) ──
 FINGPT_ENABLED=false
 FINGPT_MODEL=qwen2.5-trading
+FINGPT_NEWS_LIMIT=10
+FINGPT_CACHE_TTL=300
+FINGPT_TEMPERATURE=0.1            # deterministic scoring
+FINGPT_MAX_TOKENS=512
+FINGPT_TIMEOUT=45
+
+# ── News Aggregator (stage 1/3) ──
 NEWS_SOURCES=yahoo,sec_edgar,fed_rss
 NEWS_LOOKBACK_HOURS=24
 NEWS_MAX_ITEMS_PER_SOURCE=20
+NEWS_CACHE_TTL=240                # 4 min — survives 5-min cycle jitter
+NEWS_SOURCE_WEIGHTS_JSON=         # optional: JSON overrides
 
 # ── Reddit (optional — auto-adds wsb/stocks/options/investing) ──
 REDDIT_CLIENT_ID=
@@ -477,11 +493,20 @@ REDDIT_USER_AGENT=TradingAgent/1.0
 # ── Twitter / X (optional) ──
 TWITTER_BEARER_TOKEN=
 
-# ── Sentiment Verifier (optional) ──
+# ── Reasoning Verifier (optional — stage 3/3) ──
 VERIFIER_ENABLED=false
 VERIFIER_PROVIDER=ollama          # "ollama" or "anthropic"
 VERIFIER_MODEL=qwq:32b
 VERIFIER_API_KEY=                 # Anthropic key if VERIFIER_PROVIDER=anthropic
+VERIFIER_TEMPERATURE=0.15
+VERIFIER_MAX_TOKENS=2048
+VERIFIER_TIMEOUT=90
+
+# ── Pipeline Efficiency Gates ──
+EARNINGS_CALENDAR_ENABLED=true
+EARNINGS_CALENDAR_LOOKAHEAD_DAYS=7
+EARNINGS_CALENDAR_REFRESH_HOURS=12
+SENTIMENT_HASH_CACHE_SIZE=32
 ```
 
 ### 3. Run the agent
@@ -543,7 +568,7 @@ pytest tests/ -v
 | `LIQUIDITY_MAX_SPREAD` | `0.05` | Skip tickers where underlying bid/ask ≥ $N |
 | `FORCE_MARKET_OPEN` | `false` | Bypass market-hours check (paper testing) |
 
-### Core Intelligence Layer
+### Core Intelligence Layer (Analyst)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
@@ -552,21 +577,35 @@ pytest tests/ -v
 | `LLM_BASE_URL` | `http://localhost:11434` | LLM API endpoint |
 | `LLM_MODEL` | `mistral` | Primary reasoning model |
 | `LLM_EMBEDDING_MODEL` | `nomic-embed-text` | Embeddings model for RAG |
-| `LLM_TEMPERATURE` | `0.3` | Sampling temperature |
+| `LLM_TEMPERATURE` | `0.3` | Analyst sampling temperature |
+| `LLM_MAX_TOKENS` | `2048` | Analyst response cap |
+| `LLM_TIMEOUT` | `60` | Analyst HTTP timeout (s) |
 | `TRADE_JOURNAL_DIR` | `trade_journal` | Trade lifecycle logs |
 | `KNOWLEDGE_BASE_DIR` | `knowledge_base` | RAG vector store |
 
-### FinGPT Sentiment Pipeline
+All three LLM callers (analyst, FinGPT, verifier) share the same `make_llm_client(role, cfg)` factory so their parameters live in one place — there is no more per-module hard-coded `LLMConfig`.
+
+### FinGPT Specialist (Sentiment Stage 2/3)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
 | `FINGPT_ENABLED` | `false` | Enable sentiment pipeline |
 | `FINGPT_MODEL` | `qwen2.5-trading` | Ollama model for FinGPT analysis |
 | `FINGPT_NEWS_LIMIT` | `10` | Max headlines from yfinance fallback |
-| `FINGPT_CACHE_TTL` | `300` | Sentiment cache TTL in seconds |
+| `FINGPT_CACHE_TTL` | `300` | FinGPT in-process cache TTL (s) |
+| `FINGPT_TEMPERATURE` | `0.1` | Keep deterministic — sentiment scoring should be repeatable |
+| `FINGPT_MAX_TOKENS` | `512` | Short JSON response cap |
+| `FINGPT_TIMEOUT` | `45` | HTTP timeout (s) — kept tight so a stuck model won't blow the 5-min budget |
+
+### News Aggregator (Sentiment Stage 1/3)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
 | `NEWS_SOURCES` | `yahoo,sec_edgar,fed_rss` | Comma-separated source keys |
 | `NEWS_LOOKBACK_HOURS` | `24` | How far back to fetch news |
 | `NEWS_MAX_ITEMS_PER_SOURCE` | `20` | Max items fetched per source per cycle |
+| `NEWS_CACHE_TTL` | `240` | Per-`(ticker, source)` cache TTL (s) — 4 min survives 5-min cycle jitter |
+| `NEWS_SOURCE_WEIGHTS_JSON` | _(empty)_ | JSON object overriding `DEFAULT_SOURCE_WEIGHTS` (e.g. `{"yahoo": 0.6}`) |
 
 ### News Source Credentials
 
@@ -577,14 +616,26 @@ pytest tests/ -v
 | `REDDIT_USER_AGENT` | `TradingAgent/1.0` | PRAW user agent string |
 | `TWITTER_BEARER_TOKEN` | _(empty)_ | Twitter API v2 Bearer token — enables Twitter source |
 
-### Sentiment Verifier
+### Reasoning Verifier (Sentiment Stage 3/3)
 
 | Variable | Default | Description |
 |----------|---------|-------------|
-| `VERIFIER_ENABLED` | `false` | Enable reasoning model verification |
+| `VERIFIER_ENABLED` | `false` | Enable reasoning-model verification |
 | `VERIFIER_PROVIDER` | `ollama` | `ollama` (local) or `anthropic` (cloud) |
-| `VERIFIER_MODEL` | `qwq:32b` | Model for verification (`qwq:32b`, `deepseek-r1:32b`, `claude-sonnet-4-6`) |
+| `VERIFIER_MODEL` | `qwq:32b` | Verifier model (`qwq:32b`, `deepseek-r1:32b`, `claude-sonnet-4-6`) |
 | `VERIFIER_API_KEY` | _(empty)_ | Anthropic API key when `VERIFIER_PROVIDER=anthropic` |
+| `VERIFIER_TEMPERATURE` | `0.15` | Low but non-zero — reasoning models benefit |
+| `VERIFIER_MAX_TOKENS` | `2048` | Response cap |
+| `VERIFIER_TIMEOUT` | `90` | HTTP timeout (s) — reasoning is slower than sentiment scoring |
+
+### Pipeline Efficiency Gates
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `EARNINGS_CALENDAR_ENABLED` | `true` | Tier-0 short-circuit: set `event_risk=1.0` when yfinance reports a scheduled earnings date within the lookahead |
+| `EARNINGS_CALENDAR_LOOKAHEAD_DAYS` | `7` | Window for Tier-0 firing |
+| `EARNINGS_CALENDAR_REFRESH_HOURS` | `12` | Per-ticker cache freshness — refresh twice per trading day |
+| `SENTIMENT_HASH_CACHE_SIZE` | `32` | Tier-1 LRU cap. Cache TTL auto-scales to `max(NEWS_CACHE_TTL, FINGPT_CACHE_TTL)` so evidence-level and sentiment-level reuse windows align |
 
 ---
 

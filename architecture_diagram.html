@@ -28,6 +28,7 @@
       execute:     { bg: "#1a2a1a", border: "#10b981", text: "#6ee7b7", label: "#34d399" },
       monitor:     { bg: "#3a2a1a", border: "#f97316", text: "#fed7aa", label: "#fb923c" },
       intelligence:{ bg: "#1a1a3a", border: "#8b5cf6", text: "#c4b5fd", label: "#a78bfa" },
+      sentiment:   { bg: "#1a2e3a", border: "#6366f1", text: "#c7d2fe", label: "#818cf8" },
       storage:     { bg: "#1f1a2e", border: "#6d28d9", text: "#ddd6fe", label: "#a78bfa" },
       alpaca:      { bg: "#0f2a1f", border: "#059669", text: "#6ee7b7", label: "#34d399" },
       guard:       { bg: "#2a1f0a", border: "#f59e0b", text: "#fcd34d", label: "#fbbf24" },
@@ -113,9 +114,9 @@
         color: COLORS.plan,
         desc: "Selects optimal strikes from the options chain based on regime and target delta.",
         bullets: [
-          "Sold strike: |delta| ≤ 0.25 (high probability of expiring worthless)",
+          "Sold strike: |delta| ≤ MAX_DELTA (default 0.20, ≈80% probability OTM)",
           "Spread width: $5 between sold and bought strikes",
-          "Target DTE: 45 days (theta decay sweet spot)",
+          "Target DTE: nearest Friday inside the configured DTE band",
           "Iron Condor: combines bull put + bear call spreads",
           "Mean Reversion trades: uses 3-std BB touch as entry trigger",
           "RS bias: adjusts strike selection based on relative strength vs SPY/QQQ",
@@ -128,13 +129,13 @@
         desc: "Non-negotiable guardrails. All 8 checks must pass or trade is rejected.",
         bullets: [
           "✓ Plan structurally valid",
-          "✓ Credit/Width ≥ 25% (adequate compensation for risk)",
-          "✓ Sold |delta| ≤ 0.25 (OTM, high probability)",
-          "✓ Max loss ≤ 2% of account balance",
+          "✓ Credit/Width ≥ MIN_CREDIT_RATIO (default 0.33)",
+          "✓ Sold |delta| ≤ MAX_DELTA (default 0.20, OTM, high probability)",
+          "✓ Max loss ≤ MAX_RISK_PCT × equity (default 2%)",
           "✓ Account type = paper only",
           "✓ Market must be open",
-          "✓ Underlying bid/ask spread < $0.05 (liquidity check)",
-          "✓ Buying power used ≤ 80% of equity",
+          "✓ Underlying bid/ask spread < LIQUIDITY_MAX_SPREAD (default $0.05)",
+          "✓ Buying power used ≤ MAX_BUYING_POWER_PCT (default 80%)",
         ],
         file: "risk_manager.py",
       },
@@ -145,9 +146,10 @@
         bullets: [
           "Queries RAG for similar past trades and outcomes",
           "Retrieves relevant lessons from the knowledge base",
+          "Consumes VerifiedSentimentReport via SentimentReadout protocol",
           "Reviews performance stats (win rate, avg P&L)",
           "Outputs: action, confidence, reasoning, warnings",
-          "SAFETY: Cannot override risk manager rejections",
+          "SAFETY: Cannot override risk manager rejections — only tightens",
         ],
         file: "llm_analyst.py",
       },
@@ -168,13 +170,91 @@
         color: COLORS.intelligence,
         desc: "The learning system. Builds institutional memory over time and improves decisions.",
         bullets: [
-          "LLM Client: OpenAI-compatible (Ollama/Mistral by default, swappable)",
+          "LLM Client: OpenAI-compatible + make_llm_client(role) factory (one config per role)",
           "Trade Journal: full lifecycle logging for every trade",
           "Journal KB: structured signal/error/defense logging (signals.jsonl)",
           "Knowledge Base: file-based RAG with cosine similarity search",
           "Embeddings: nomic-embed-text (768-dimensional vectors)",
         ],
         file: "llm_client.py + trade_journal.py + journal_kb.py + knowledge_base.py",
+      },
+      sentiment_pipeline: {
+        title: "Sentiment Pipeline (facade)",
+        color: COLORS.intelligence,
+        desc: "Three-tier orchestrator that gates every cycle's sentiment work without weakening anti-hallucination — each tier is stricter than the next, not looser.",
+        bullets: [
+          "Tier 0 — Earnings calendar short-circuit (authoritative event_risk=1.0)",
+          "Tier 1 — Content-hash cache replays previously-verified reports",
+          "Tier 2 — NewsAggregator → FinGPT specialist → Reasoning verifier",
+          "Cycle-scoped ThreadPoolExecutor via __enter__/__exit__",
+          "submit() Future is cancelled when Phase III/IV reject the trade",
+          "Cache only ever holds reports that passed the verifier",
+        ],
+        file: "sentiment_pipeline.py",
+      },
+      earnings: {
+        title: "Tier 0 — Earnings Calendar",
+        color: COLORS.guard,
+        desc: "Authoritative short-circuit backed by yfinance's get_earnings_dates. When tomorrow is an earnings day, no LLM reasoning should override it — it's a binary, known-with-certainty catalyst.",
+        bullets: [
+          "yfinance.get_earnings_dates(limit=6) primary, .calendar fallback",
+          "Per-ticker 12h cache (twice per trading day)",
+          "Returns deterministic VerifiedSentimentReport: event_risk=1.0, recommendation=avoid",
+          "EARNINGS_CALENDAR_LOOKAHEAD_DAYS=7 (configurable)",
+          "Failures degrade to 'unknown' — pipeline runs full chain instead of short-circuiting",
+        ],
+        file: "earnings_calendar.py",
+      },
+      hashcache: {
+        title: "Tier 1 — Content-Hash Cache",
+        color: COLORS.intelligence,
+        desc: "SHA-1 fingerprint over the normalised news evidence — replays a previously-verified report when the news set is unchanged. Tier-1 only stores reports that passed the verifier.",
+        bullets: [
+          "Hash key: sorted source | form_type | slug | minute_timestamp",
+          "Tolerates re-orderings and sub-minute timestamp jitter",
+          "Genuinely new items (or new minute) bust the hash",
+          "TTL = max(NEWS_CACHE_TTL, FINGPT_CACHE_TTL); LRU bound = SENTIMENT_HASH_CACHE_SIZE",
+          "Per-(ticker, news_hash) keying — cross-ticker collisions impossible",
+        ],
+        file: "sentiment_cache.py",
+      },
+      news: {
+        title: "Tier 2 — NewsAggregator",
+        color: COLORS.intelligence,
+        desc: "Parallel multi-source fetcher with TTL caching. Source authority weights are configurable via NEWS_SOURCE_WEIGHTS_JSON.",
+        bullets: [
+          "SEC EDGAR (1.00) · Federal Reserve (0.95) · Yahoo (0.70)",
+          "Twitter (0.50) · Reddit r/options/stocks (0.45) · r/wsb (0.35)",
+          "Per-(ticker, source) TTL cache — default 240s",
+          "Sources degrade gracefully on missing credentials / API errors",
+          "Dedupes by slug across sources",
+        ],
+        file: "news_aggregator.py",
+      },
+      fingpt: {
+        title: "Tier 2 — FinGPT Specialist",
+        color: COLORS.intelligence,
+        desc: "Locally-hosted finance LLM that scores aggregated news with source authority context baked into the prompt. Items are sorted by weight so SEC outranks Reddit before scoring.",
+        bullets: [
+          "Output: SentimentReport (sentiment_score, event_risk, confidence, recommendation)",
+          "FINGPT_TEMPERATURE=0.1 — deterministic scoring",
+          "FINGPT_TIMEOUT=45s — kept tight to protect 5-min budget",
+          "Built via make_llm_client('fingpt', cfg) — no hard-coded LLMConfig",
+        ],
+        file: "fingpt_analyser.py",
+      },
+      verifier: {
+        title: "Tier 2 — Reasoning Verifier",
+        color: COLORS.intelligence,
+        desc: "Stronger reasoning model independently cross-checks every claim in FinGPT's output against the raw evidence. Anti-hallucination gate.",
+        bullets: [
+          "Maps each claim to a specific evidence item (supported/partial/unsupported)",
+          "Flags claims not present in the evidence as hallucinations",
+          "Output: VerifiedSentimentReport with agreement_score + hallucination_flags",
+          "Local: qwq:32b / deepseek-r1:32b   Cloud: claude-sonnet-4-6",
+          "On verifier error → passthrough (never blocks the cycle)",
+        ],
+        file: "sentiment_verifier.py",
       },
       finetune: {
         title: "Fine-Tuning Pipeline",
@@ -443,6 +523,54 @@
                     items={["mleg order", "Alpaca API", "Journal entry"]} />
                 </div>
 
+                {/* Tiered Sentiment Pipeline — submitted after Phase II, resolved at Phase V */}
+                <div style={{
+                  marginTop: 10,
+                  background: COLORS.sentiment.bg,
+                  border: `1.5px dashed ${COLORS.sentiment.border}`,
+                  borderRadius: 8,
+                  padding: "8px 10px",
+                }}>
+                  <div style={{
+                    color: COLORS.sentiment.label, fontWeight: 700, fontSize: 11,
+                    marginBottom: 6, display: "flex", alignItems: "center", gap: 6,
+                  }}>
+                    <span>🧾</span> SENTIMENT PIPELINE — submitted after Phase II · cancelled on plan/risk reject · resolved at Phase V
+                    <span style={{ color: "#64748b", fontWeight: 400, fontSize: 10, marginLeft: 6 }}>
+                      (cycle-scoped ThreadPoolExecutor)
+                    </span>
+                  </div>
+                  <div style={{ display: "flex", gap: 6, alignItems: "stretch" }}>
+                    <Box color={COLORS.guard} title="Tier 0 · Earnings" icon="📅"
+                      items={["yfinance calendar", "≤ 7d lookahead", "event_risk = 1.0", "no LLM call"]}
+                      onClick={() => toggle("earnings")} active={active === "earnings"} />
+                    <Arrow color={COLORS.sentiment.border} />
+                    <Box color={COLORS.sentiment} title="Tier 1 · Hash Cache" icon="#️⃣"
+                      items={["SHA-1 of evidence", "source|slug|minute", "TTL + LRU bound", "replays verified"]}
+                      onClick={() => toggle("hashcache")} active={active === "hashcache"} />
+                    <Arrow color={COLORS.sentiment.border} />
+                    <Box color={COLORS.sentiment} title="Tier 2 · News" icon="📰"
+                      items={["Yahoo / SEC / Fed", "Reddit / Twitter", "source-weighted", "NewsItem list"]}
+                      onClick={() => toggle("news")} active={active === "news"} />
+                    <Arrow color={COLORS.sentiment.border} />
+                    <Box color={COLORS.sentiment} title="Tier 2 · FinGPT" icon="🤖"
+                      items={["Specialist LLM", "temp=0.1", "SentimentReport", "event_risk score"]}
+                      onClick={() => toggle("fingpt")} active={active === "fingpt"} />
+                    <Arrow color={COLORS.sentiment.border} />
+                    <Box color={COLORS.sentiment} title="Tier 2 · Verifier" icon="🔬"
+                      items={["qwq / deepseek-r1", "claim-by-claim check", "hallucination flags", "agreement score"]}
+                      onClick={() => toggle("verifier")} active={active === "verifier"} />
+                  </div>
+                  <div style={{
+                    marginTop: 6, color: "#94a3b8", fontSize: 10,
+                    display: "flex", gap: 10, flexWrap: "wrap",
+                  }}>
+                    <span>• Cache only stores reports that passed Tier-2 verifier</span>
+                    <span>• Each tier is stricter than the next, not looser</span>
+                    <span>• Advisory to Phase V — never overrides the risk manager</span>
+                  </div>
+                </div>
+
                 {/* Regime → Strategy */}
                 <div style={{ display: "flex", gap: 8, marginTop: 10 }}>
                   {[
@@ -478,8 +606,8 @@
               }}>
                 {[
                   { label: "Max Loss", value: "(Width − Credit) × 100", color: COLORS.risk },
-                  { label: "Min Credit Ratio", value: "≥ 25% of spread width", color: COLORS.plan },
-                  { label: "Sold Delta", value: "≤ 0.25 (OTM)", color: COLORS.classify },
+                  { label: "Min Credit Ratio", value: "≥ 33% of spread width", color: COLORS.plan },
+                  { label: "Sold Delta", value: "≤ 0.20 (OTM, ≈80% POP)", color: COLORS.classify },
                   { label: "Buying Power Cap", value: "≤ 80% of equity", color: COLORS.guard },
                 ].map((g) => (
                   <div key={g.label} style={{ display: "flex", gap: 5, alignItems: "center" }}>
@@ -499,7 +627,7 @@
                 letterSpacing: 1, textAlign: "center" }}>Intelligence &amp; Reporting</div>
 
               <Box color={COLORS.intelligence} icon="🧠" title="LLM Client"
-                items={["Ollama / Mistral 7B", "OpenAI-compatible API", "Swappable provider"]}
+                items={["make_llm_client(role)", "One config per role", "Swappable provider"]}
                 onClick={() => toggle("intelligence")} active={active === "intelligence"} />
 
               <Box color={COLORS.intelligence} icon="📚" title="Knowledge Base (RAG)"
@@ -509,6 +637,10 @@
               <Box color={COLORS.intelligence} icon="📓" title="Trade Journal + KB"
                 items={["Full lifecycle log", "signals.jsonl (JournalKB)", "Win/loss stats"]}
                 onClick={() => toggle("intelligence")} active={active === "intelligence"} />
+
+              <Box color={COLORS.sentiment} icon="🧾" title="Sentiment Pipeline"
+                items={["Facade over 3 tiers", "Cycle-scoped pool", "No-hallucination gate"]}
+                onClick={() => toggle("sentiment_pipeline")} active={active === "sentiment_pipeline"} />
 
               <Box color={COLORS.storage} icon="🎓" title="Fine-Tuning Pipeline"
                 items={["Chat JSONL", "Alpaca format", "DPO pairs"]}
@@ -586,13 +718,14 @@
             marginTop: 14, flexWrap: "wrap" }}>
             {[
               { color: COLORS.data, label: "Market Data" },
-              { color: COLORS.guard, label: "Cycle Guards" },
+              { color: COLORS.guard, label: "Cycle Guards / Tier 0" },
               { color: COLORS.monitor, label: "Position Monitor" },
               { color: COLORS.perceive, label: "Phases I-II" },
               { color: COLORS.plan, label: "Phases III-IV" },
               { color: COLORS.llm, label: "LLM Phase V" },
               { color: COLORS.execute, label: "Execution" },
               { color: COLORS.intelligence, label: "Intelligence" },
+              { color: COLORS.sentiment, label: "Sentiment Pipeline" },
               { color: COLORS.storage, label: "Fine-Tuning" },
               { color: COLORS.report, label: "Reporting" },
             ].map((l) => (
@@ -605,7 +738,7 @@
           </div>
 
           <div style={{ textAlign: "center", color: "#334155", fontSize: 11, marginTop: 12 }}>
-            120 tests passing · SPY QQQ (+ configurable) · Alpaca Paper Trading · 8 risk guardrails
+            Tiered sentiment pipeline · cycle-scoped pool · SPY QQQ (+ configurable) · Alpaca Paper Trading · 8 risk guardrails
           </div>
         </div>
       );

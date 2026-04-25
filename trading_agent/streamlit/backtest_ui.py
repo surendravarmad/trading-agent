@@ -28,6 +28,19 @@ Residual drift (documented, not yet closed):
     Residual: bar timescale (live=5min, backtest=whatever timeframe
     selects); open-bar-skip not re-implemented per session day.
 
+Live Quote Refresh — gating contract
+------------------------------------
+The Phase VI ``_refresh_live_quotes`` stage is intentionally a no-op
+in two scenarios.  Both gates live in ``run()`` (search for
+``refresh_eligible``) — DO NOT bypass them without updating
+``tests/test_streamlit/test_backtest_ui.py::TestRefreshGating``:
+
+  1. ``use_alpaca_historical=True`` → the historical plan IS the
+     truthful quote for that bar; refreshing against today's snapshot
+     overwrites honest economics with a stale-vs-actual quote.
+  2. ``(today - entry_dt) > _SNAPSHOT_FRESH_DAYS`` → today's snapshot
+     is structurally meaningless as a proxy for an old entry's quote.
+
 Toggles are **opt-in** on the Backtester class (defaults = None/False so
 existing unit tests keep passing) and default-**on** in the Streamlit UI
 so interactive runs are apples-to-apples with the live agent.
@@ -2485,14 +2498,41 @@ class Backtester:
                 self._funnel.after_max_risk += 1
 
                 otm_pct = INTRADAY_OTM_PCT if is_intraday else DAILY_OTM_PCT
-                
+
                 # ── Live Quote Refresh (Phase VI) ─────────────────────
                 # Mirror the live agent's executor._refresh_limit_price() pattern:
                 # fetch fresh option quotes immediately before execution and
                 # re-validate economics-bearing guardrails.  This prevents
                 # simulating trades on stale quotes that would be rejected
                 # in live trading.
-                if self._alpaca_api_key and self._alpaca_secret_key:
+                #
+                # Two gates govern when this stage actually runs:
+                #
+                #   1. NOT in alpaca_historical mode.  When historical mode
+                #      is on, the planning stage already fetched the REAL
+                #      option chain for entry_dt — there is no truer quote
+                #      we could refresh against.  Re-fetching today's
+                #      snapshot here would *replace* honest historical
+                #      economics with current-market quotes and produce
+                #      garbage drift warnings (e.g. $6 credits on $5-wide
+                #      spreads when the underlying has moved since entry).
+                #
+                #   2. Entry date within _SNAPSHOT_FRESH_DAYS.  Outside
+                #      that window, "today's quote" is structurally
+                #      meaningless as a proxy for "the quote at entry_dt"
+                #      — same reason the snapshot *planning* path is
+                #      disabled for stale dates (line ~2271 below).
+                #
+                # If you change either gate, update the corresponding
+                # tests in test_backtest_ui.py::TestRefreshGating.
+                refresh_age_days = (date.today() - entry_dt).days
+                refresh_eligible = (
+                    self._alpaca_api_key
+                    and self._alpaca_secret_key
+                    and not self.use_alpaca_historical
+                    and refresh_age_days <= self._SNAPSHOT_FRESH_DAYS
+                )
+                if refresh_eligible:
                     (
                         refreshed_strike_distance,
                         refreshed_credit,

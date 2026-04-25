@@ -604,3 +604,161 @@ class TestLoadAnchorVixSeries:
         assert Backtester._load_vix_series(
             date(2025, 1, 1), date(2025, 2, 1), "1d",
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# Live Quote Refresh gating
+# ---------------------------------------------------------------------------
+#
+# Two gates govern whether the per-bar Live Quote Refresh stage actually
+# runs (see backtest_ui.py:run() ~line 2487):
+#
+#   1. NOT in use_alpaca_historical mode (the historical plan IS the
+#      truthful quote — refreshing against today's snapshot would
+#      overwrite honest economics with stale-vs-actual-entry quotes).
+#   2. Entry date age <= _SNAPSHOT_FRESH_DAYS (today's snapshot is a
+#      structurally meaningless proxy for the quote at an old entry).
+#
+# These tests guard against re-introducing the cross-mode pollution
+# that was emitting bogus "Credit drifted XXXX%" warnings in
+# historical-mode runs.
+
+class TestRefreshGating:
+    """Verify _refresh_live_quotes is bypassed in the right configurations."""
+
+    def _mock_yf_close_series(self, n: int = 260, drift: float = 0.0003):
+        return _make_prices(n, drift=drift)
+
+    def _mock_yf_dataframe(self, prices: pd.Series):
+        return pd.DataFrame({
+            "Close": prices, "Open": prices, "High": prices,
+            "Low": prices, "Volume": [1_000_000] * len(prices),
+        })
+
+    @patch("trading_agent.streamlit.backtest_ui.yf.download")
+    def test_historical_mode_never_calls_refresh(self, mock_dl):
+        """Part A: with use_alpaca_historical=True the refresh stage
+        must NOT fire — even when API keys are present and the entry
+        date is fresh."""
+        prices = self._mock_yf_close_series(260)
+        mock_dl.return_value = self._mock_yf_dataframe(prices)
+
+        bt = Backtester(
+            use_alpaca_historical=True,
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+        )
+        # Stub the historical plan to always return a usable plan dict
+        # so the per-bar loop reaches the refresh decision point.
+        bt._alpaca_historical_plan = MagicMock(return_value={
+            "strike_distance_pct": 0.03,
+            "credit": 1.5,
+            "approx_abs_delta": 0.18,
+            "option_type": "put",
+            "short_strike": 485.0,
+            "long_strike": 480.0,
+            "expiration": "2025-12-19",
+        })
+        # Spy on the refresh method — it MUST NOT be called
+        bt._refresh_live_quotes = MagicMock()
+        # Skip the actual exit simulation
+        bt._simulate_alpaca_historical = MagicMock(
+            return_value=("win", 75.0, 5),
+        )
+
+        bt.run(["SPY"], date(2025, 1, 2), date(2025, 12, 31))
+
+        bt._refresh_live_quotes.assert_not_called()
+
+    @patch("trading_agent.streamlit.backtest_ui.yf.download")
+    def test_stale_snapshot_mode_never_calls_refresh(self, mock_dl):
+        """Part B: outside snapshot mode + entry date older than
+        _SNAPSHOT_FRESH_DAYS, refresh must NOT fire (today's quote is
+        a meaningless proxy for that entry's true quote)."""
+        prices = self._mock_yf_close_series(260)
+        mock_dl.return_value = self._mock_yf_dataframe(prices)
+
+        bt = Backtester(
+            use_alpaca_historical=False,
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+        )
+        bt._refresh_live_quotes = MagicMock()
+        # Backtest dates are 2025 — many months older than _SNAPSHOT_FRESH_DAYS=3
+        bt.run(["SPY"], date(2025, 1, 2), date(2025, 12, 31))
+
+        bt._refresh_live_quotes.assert_not_called()
+
+    @patch("trading_agent.streamlit.backtest_ui.yf.download")
+    def test_fresh_snapshot_mode_calls_refresh(self, mock_dl):
+        """Positive control: entry date inside _SNAPSHOT_FRESH_DAYS and
+        snapshot mode → refresh SHOULD fire so we catch quote drift
+        between planning and execution (the original purpose of the
+        feature).
+
+        Notes on test setup:
+
+        * pd.bdate_range can return ``periods-1`` entries when ``end``
+          lands on a weekend (it rolls the boundary back), so we derive
+          n from the actual index length to keep ``closes`` aligned
+          regardless of when the test runs.
+        * The backtest loop spaces entries by ``hold_bars`` (= the
+          instance's ``target_dte``).  With the default ``target_dte=35``
+          on a 260-bar daily series, the latest possible entry lands
+          ~24 business days before the end of the series — well outside
+          the 3-day fresh-snapshot window, so refresh would never fire.
+          We pass ``target_dte=1`` so entries can fire on every bar and
+          the most recent one is guaranteed to be inside the fresh window.
+        * ``_get_option_chain_for_date`` is stubbed to return None so the
+          test doesn't make a real Alpaca API call with fake credentials.
+          The refresh-eligibility check happens AFTER that call regardless
+          of its outcome, so the stub is purely about avoiding network I/O.
+        """
+        end = date.today()
+        idx = pd.bdate_range(end=pd.Timestamp(end), periods=260)
+        n = len(idx)
+        np.random.seed(42)
+        rt = np.random.normal(0.0003, 0.01, n)
+        closes = 500.0 * np.exp(np.cumsum(rt))
+        prices = pd.Series(closes, index=idx, name="Close")
+        mock_dl.return_value = self._mock_yf_dataframe(prices)
+
+        bt = Backtester(
+            use_alpaca_historical=False,
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+            # Tight DTE so entries can land on the last bar (within the
+            # _SNAPSHOT_FRESH_DAYS window).  See docstring above.
+            target_dte=1,
+        )
+        # Avoid hitting the real Alpaca API with fake credentials
+        bt._get_option_chain_for_date = MagicMock(return_value=None)
+        # Stub refresh to a no-op success (returns the inputs unchanged)
+        bt._refresh_live_quotes = MagicMock(
+            side_effect=lambda **kw: (
+                kw.get("strike_distance_pct"),
+                kw.get("credit"),
+                kw.get("approx_abs_delta"),
+                "success",
+            ),
+        )
+        bt.run(["SPY"], date.today() - timedelta(days=400), end)
+        # At least one entry bar must fall inside the fresh-snapshot
+        # window → refresh fires at least once.
+        assert bt._refresh_live_quotes.call_count >= 1
+
+    @patch("trading_agent.streamlit.backtest_ui.yf.download")
+    def test_refresh_skipped_without_api_keys(self, mock_dl):
+        """Without Alpaca credentials the refresh stage cannot run —
+        regardless of mode or entry date."""
+        prices = self._mock_yf_close_series(260)
+        mock_dl.return_value = self._mock_yf_dataframe(prices)
+
+        bt = Backtester(
+            use_alpaca_historical=False,
+            alpaca_api_key="",       # explicitly empty
+            alpaca_secret_key="",
+        )
+        bt._refresh_live_quotes = MagicMock()
+        bt.run(["SPY"], date(2025, 1, 2), date(2025, 12, 31))
+        bt._refresh_live_quotes.assert_not_called()

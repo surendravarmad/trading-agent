@@ -707,7 +707,7 @@ streamlit run trading_agent/streamlit/app.py
 
 #### Backtesting Live Quote Refresh
 
-The backtester now mirrors the live agent's **executor._refresh_limit_price()** pattern:
+The backtester mirrors the live agent's **executor._refresh_limit_price()** pattern:
 
 - **When**: Immediately before simulating each trade (Phase VI)
 - **What**: Fetches fresh option chain from Alpaca API for the trade's underlying
@@ -715,6 +715,13 @@ The backtester now mirrors the live agent's **executor._refresh_limit_price()** 
 - **Guardrails**: Re-validates credit-to-width ratio and max-loss per contract
 - **Drift Detection**: Logs warnings when credit drifts >10% from planning values
 - **Rejection**: Skips trades that fail live quote guardrails (same as live agent)
+
+**Two gates govern when the refresh actually runs** (changes here must be paired with `tests/test_streamlit/test_backtest_ui.py::TestRefreshGating`):
+
+1. **Bypassed in `use_alpaca_historical` mode.** When historical mode is enabled, the planning stage already fetched the REAL option chain for the actual entry date. Refreshing against today's snapshot would *replace* that honest credit with a stale-vs-actual-entry quote and produce nonsense drift warnings (e.g. $6 credits on $5-wide spreads when the underlying has moved since entry). In historical mode the refresh stage is a no-op by design — the historical plan IS the truthful quote.
+2. **Gated by `_SNAPSHOT_FRESH_DAYS` (default 3).** Outside snapshot mode and the entry date is older than 3 days, refresh is skipped because today's quote is structurally meaningless as a proxy for the quote at that bar's timestamp. Same threshold the snapshot *planning* path uses.
+
+**When refresh fires**: snapshot mode (i.e. `use_alpaca_historical=False`) AND `(today - entry_date) <= _SNAPSHOT_FRESH_DAYS`. In practice this means it only fires on the most recent few bars of the backtest, which is exactly when "today's quote" is a defensible approximation of "the quote at entry".
 
 **Configuration**: Enable by setting `ALPACA_API_KEY` and `ALPACA_SECRET_KEY` in your `.env` file. The backtester will automatically use live quotes when available, falling back to simulated quotes when the API is unavailable.
 
@@ -744,6 +751,60 @@ The backtester now applies the **same z-scored leadership and VIX inter-market g
 1. **Bar timescale** — live z-scores fire on 5-minute bars. The backtester runs the same arithmetic on whatever bar interval `timeframe` selects; for `timeframe="1Day"` the gates compare daily return diffs (directionally aligned with the live signal but at a different timescale). For true 5-min parity, use `timeframe="5Min"` (yfinance caps this at the last ~30 days).
 2. **Open-bar skip** — the live `MarketDataProvider` drops the first 2 bars after the 9:30 ET open to suppress the open-print spike. The backtester does not currently re-implement this trim per session day; rolling z-scores on intraday data therefore include those bars. Impact: marginally higher stdev → slightly conservative z-scores (gate fires less, not more, vs live).
 3. **Anchor data source** — live agent fetches from Alpaca; backtester fetches from yfinance. Close-vs-close they align within fractions of a basis point on liquid ETFs, but corporate-action edge cases differ.
+
+#### Backtester Rules vs. Live Agent — Parity Matrix
+
+The backtester runs three different credit-pricing paths depending on configuration. **Only one of them produces a per-bar dynamic credit derived from real option-market data**; the other two are heuristics. This section is the source of truth for what is and isn't replicated from the live `StrategyPlanner` / `RegimeClassifier` / `RiskManager` pipeline.
+
+**Three credit-pricing modes** (`backtest_ui.py::Backtester.run()` lines ~2204-2346):
+
+| Mode | Trigger | Credit formula | Dynamic? | Honest window |
+|---|---|---|---|---|
+| **Alpaca historical** | `use_alpaca_historical=True` | `short_close − long_close` from real `/v1beta1/options/bars` for the entry day | **Yes — truly per-bar** | Last ~30 calendar days (Alpaca options retention) |
+| **σ-credit (synthetic)** | `sigma_mult` set, no Alpaca data | `spread_width × clip(0.45 − 0.15·σ_mult, 0.05, 0.45)` | Quasi — varies with σ-distance, not real IV | Any range, but it's a model not a quote |
+| **Legacy fixed-% OTM** | `sigma_mult=None` | `spread_width × credit_pct` (default `5 × 0.30 = $1.50`) | **No — constant on every trade** | Calibration sanity-check only |
+
+**Rule-by-rule comparison** with the live agent:
+
+| Live rule (`strategy.py` / `regime.py` / `risk_manager.py`) | Backtester behavior | Status |
+|---|---|---|
+| Adaptive spread width: `_pick_spread_width = max(SPREAD_WIDTH=5, 3×grid, 2.5%×spot)`, snapped UP to grid | Fixed `self.spread_width` constructor arg; even Alpaca-historical mode uses the constant as the long-leg target distance | ❌ **Drift** — live SPY/QQQ at $500+ trades $15-20-wide spreads; backtester stays at $5 |
+| Strike picker: filter listed greeks for `MIN_DELTA(0.15) ≤ |Δ| ≤ max_delta(0.20)`, pick widest gap | σ-projection (`sigma_mult × σ_hold`) → snap to closest OTM listed strike. δ is *estimated* from the σ-distance map (`_delta_from_sigma_distance`), not read from the chain | ❌ **Drift** — averages line up long-run; bar-by-bar diverge in vol regimes where realized σ ≠ implied σ |
+| Net credit: `sold.bid − bought.ask` (live limit-style fill) | Synthetic uses heuristic curve; Alpaca-historical uses `close − close` (no bid/ask spread modelled) | ❌ **Drift** — backtester systematically over-estimates fillable credit relative to a real mid-or-better limit |
+| Priority 1 — Mean Reversion (3-std BB touch overrides everything) | Not implemented in backtest run-loop | ❌ **Missing** |
+| Priority 2 — VIX inter-market inhibit (`vix_z > +2σ` demotes Bull Put / Iron Condor → Bear Call) | Wired via `use_macro_signals=True` (`Backtester.vix_inhibited` counter) | ✅ |
+| Priority 3 — Leadership Z-score bias (`leadership_z > +1.5σ` → Bull Put) | Wired via `use_macro_signals=True` (`Backtester.leadership_biased` counter); applied only on SIDEWAYS bars (preserves legacy bullish/bearish paths) | ✅ |
+| `min_credit_ratio = 0.33` (StrategyPlanner gate) | Wired via `min_credit_ratio` param. Skipped when `use_sigma_path` is active because the synthetic curve produces credits below 0.33 for σ ≳ 0.8 — leaving the gate on would silently reject every candidate | ⚠️ Active in fixed-% / Alpaca-historical modes only |
+| `max_delta = 0.20` (short-leg cap) | Wired via `max_delta` param, but compared against the σ-derived approximation, not a chain-sourced delta | ⚠️ Same number, different signal |
+| `RiskManager.max_risk_pct × equity` (per-trade max-loss cap) | Wired via `max_risk_pct` param | ✅ |
+| IV-rank high-vol guard (`RegimeClassifier.high_iv_warning`) | Wired via `use_iv_gate=True` + `iv_high_threshold` | ✅ |
+| Earnings Tier-0 short-circuit (`EarningsCalendar`, default 7-day lookahead) | Wired via `use_earnings_gate=True` + `earnings_lookahead_days` | ✅ |
+| Stop-loss / profit-target exits (50% / 75%) | Wired via `stop_loss_pct` + `profit_target_pct` | ✅ |
+| `executor._refresh_limit_price()` parity (re-fetch quote immediately before fill, re-validate guardrails) | Wired in snapshot mode within `_SNAPSHOT_FRESH_DAYS=3`; intentionally **skipped** in Alpaca-historical mode (see "Backtesting Live Quote Refresh" above) | ✅ — see `TestRefreshGating` |
+
+**Recommended live-parity configuration.** For the closest the codebase can get to apples-to-apples right now:
+
+```python
+Backtester(
+    use_alpaca_historical=True,   # real chain + real entry-day bars
+    use_macro_signals=True,       # VIX inhibit + leadership-z bias
+    use_iv_gate=True,
+    use_earnings_gate=True,
+    min_credit_ratio=0.33,
+    max_delta=0.20,
+    max_risk_pct=0.02,            # match RiskManager default
+    stop_loss_pct=0.50,
+    profit_target_pct=0.75,
+    # Keep the date range inside Alpaca's ~30-day options retention window
+)
+```
+
+**Known residual drift sources** (not yet wired — track here so they don't get rediscovered as "bugs" in production):
+
+1. **Adaptive spread width** — backtester uses the fixed `spread_width` arg everywhere; live scales with spot/grid. Material on $500+ underlyings.
+2. **Chain-sourced δ picker** — backtester picks by σ-distance and labels with an approximation; live picks by the chain's listed delta column.
+3. **Mean-Reversion priority** — Priority 1 of the live plan() is absent from the backtest run-loop.
+4. **Bid/ask spread modelling** — Alpaca-historical uses `close − close`; live fills against bid/ask. Over-estimates real credit.
 
 ---
 

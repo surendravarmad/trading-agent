@@ -1,71 +1,95 @@
-2026-04-24 15:33:44 | WARNING  | trading_agent.risk_manager     |   FAIL: Credit/Width ratio 0.1400 < 0.25
-2026-04-24 15:33:44 | INFO     | __main__                       | [QQQ] Phase VI — EXECUTE
-2026-04-24 15:33:44 | INFO     | trading_agent.executor         | Trade plan saved to trade_plans/trade_plan_QQQ.json (run_id=20260424_193344, history=34)
-2026-04-24 15:33:44 | WARNING  | trading_agent.executor         | [QQQ] Trade REJECTED by risk manager — skipping.
-2026-04-24 15:33:44 | INFO     | __main__                       | --------------------------------------------------
-2026-04-24 15:33:44 | INFO     | __main__                       | [IWM] Phase I  — PERCEIVE
-2026-04-24 15:33:45 | INFO     | __main__                       | [IWM] Phase II — CLASSIFY
-2026-04-24 15:33:45 | WARNING  | trading_agent.market_data      | [IWM] 5-min bar fetch failed: 403 Client Error: Forbidden for url: https://data.alpaca.markets/v2/stocks/IWM/bars?timeframe=5Min&limit=2&adjustment=raw&end=2026-04-24T19%3A29%3A59Z
-2026-04-24 15:33:45 | WARNING  | trading_agent.market_data      | [SPY] 5-min bar fetch failed: 403 Client Error: Forbidden for url: https://data.alpaca.markets/v2/stocks/SPY/bars?timeframe=5Min&limit=2&adjustment=raw&end=2026-04-24T19%3A29%3A59Z
-2026-04-24 15:33:46 | WARNING  | trading_agent.market_data      | [QQQ] 5-min bar fetch failed: 403 Client Error: Forbidden for url: https://data.alpaca.markets/v2/stocks/QQQ/bars?timeframe=5Min&limit=2&adjustment=raw&end=2026-04-24T19%3A29%3A59Z
-2026-04-24 15:33:46 | INFO     | trading_agent.regime           | [IWM] Regime → bullish | Price=276.81 SMA50=258.19 SMA200=246.47 Slope=0.1999 BB=0.1874 RSI=68.4 MR=none RS_SPY=0.0000 IVRank=72.2 HighVol=False
-2026-04-24 15:33:46 | INFO     | __main__                       | [IWM] Phase III — PLAN (bullish → Bull Put Spread)
-2026-04-24 15:33:46 | INFO     | trading_agent.strategy         | [IWM] Planning bullish strategy, expiration 2026-06-12
-2026-04-24 15:33:46 | INFO     | trading_agent.market_data      | Fetching put option chain for IWM exp 2026-06-12 (feed=indicative)
-2026-04-24 15:33:47 | WARNING  | trading_agent.market_data      | [IWM] exact expiration_date=2026-06-12 returned 0 put snapshots; retrying with _gte/_lte window. Raw body (truncated): {"next_page_token":null,"snapshots":{}}
-2026-04-24 15:33:47 | WARNING  | trading_agent.market_data      | [IWM] _gte/_lte retry also empty. effective_url=https://data.alpaca.markets/v1beta1/options/snapshots/IWM?type=put&feed=indicative&limit=1000&expiration_date_gte=2026-06-12&expiration_date_lte=2026-06-12 body={"next_page_token":null,"snapshots":{}}
-2026-04-24 15:33:47 | INFO     | trading_agent.market_data      | [IWM] Catalog lookup: 3 listed expirations in 2026-05-29..2026-06-26 (sample: 2026-05-29,2026-06-05,2026-06-18); nearest to 2026-06-12 = 2026-06-18
-2026-04-24 15:33:47 | WARNING  | trading_agent.market_data      | [IWM] Requested expiration 2026-06-12 not available in indicative feed; swapping to nearest listed expiration 2026-06-18
-2026-04-24 15:33:47 | INFO     | trading_agent.market_data      | [IWM] Catalog fallback recovered 125 put contracts at 2026-06-18 (effective_url=https://data.alpaca.markets/v1beta1/options/snapshots/IWM?type=put&feed=indicative&limit=1000&expiration_date=2026-06-18)
-2026-04-24 15:33:47 | INFO     | trading_agent.market_data      | Received 125 put contracts for IWM
-2026-04-24 15:33:47 | INFO     | __main__                       | [IWM] Phase IV — RISK CHECK
-2026-04-24 15:33:47 | WARNING  | trading_agent.risk_manager     | [IWM] Risk verdict: REJECTED: 6 passed, 2 failed
-2026-04-24 15:33:47 | WARNING  | trading_agent.risk_manager     |   FAIL: Plan invalid: Credit-to-width ratio 0.1380 < minimum 0.25
-2026-04-24 15:33:47 | WARNING  | trading_agent.risk_manager     |   FAIL: Credit/Width ratio 0.1380 < 0.25
-2026-04-24 15:33:47 | INFO     | __main__                       | [IWM] Phase VI — EXECUTE
-2026-04-24 15:33:47 | INFO     | trading_agent.executor         | Trade plan saved to trade_plans/trade_plan_IWM.json (run_id=20260424_193347, history=27)
-2026-04-24 15:33:47 | WARNING  | trading_agent.executor         | [IWM] Trade REJECTED by risk manager — skipping.
-2026-04-24 15:33:47 | INFO     | __main__                       | --------------------------------------------------
-2026-04-24 15:33:47 | INFO     | __main__                       | [GOOG] Phase I  — PERCEIVE
-2026-04-24 15:33:48 | INFO     | __main__                       | [GOOG] Phase II — CLASSIFY
-2026-04-24 15:33:48 | WARNING  | trading_agent.market_data      | [GOOG] 5-min bar fetch failed: 403 Client Error: Forbidden for url: https://data.alpaca.markets/v2/stocks/GOOG/bars?timeframe=5Min&limit=2&adjustment=raw&end=2026-04-24T19%3A29%3A59Z
-2026-04-24 15:33:48 | WARNING  | trading_agent.market_data      | [SPY] 5-min bar fetch failed: 403 Client Error: Forbidden for url: https://data.alpaca.markets/v2/stocks/SPY/bars?timeframe=5Min&limit=2&adjustment=raw&end=2026-04-24T19%3A29%3A59Z
-2026-04-24 15:33:48 | WARNING  | trading_agent.market_data      | [QQQ] 5-min bar fetch failed: 403 Client Error: Forbidden for url: https://data.alpaca.markets/v2/stocks/QQQ/bars?timeframe=5Min&limit=2&adjustment=raw&end=2026-04-24T19%3A29%3A59Z
-2026-04-24 15:33:48 | INFO     | trading_agent.regime           | [GOOG] Regime → bullish | Price=342.54 SMA50=307.95 SMA200=275.98 Slope=0.1756 BB=0.2905 RSI=67.3 MR=none RS_SPY=0.0000 IVRank=69.4 HighVol=False
-2026-04-24 15:33:48 | INFO     | __main__                       | [GOOG] Phase III — PLAN (bullish → Bull Put Spread)
-2026-04-24 15:33:48 | INFO     | trading_agent.strategy         | [GOOG] Planning bullish strategy, expiration 2026-06-12
-2026-04-24 15:33:48 | INFO     | trading_agent.market_data      | Fetching put option chain for GOOG exp 2026-06-12 (feed=indicative)
-2026-04-24 15:33:48 | WARNING  | trading_agent.market_data      | [GOOG] exact expiration_date=2026-06-12 returned 0 put snapshots; retrying with _gte/_lte window. Raw body (truncated): {"next_page_token":null,"snapshots":{}}
-2026-04-24 15:33:48 | WARNING  | trading_agent.market_data      | [GOOG] _gte/_lte retry also empty. effective_url=https://data.alpaca.markets/v1beta1/options/snapshots/GOOG?type=put&feed=indicative&limit=1000&expiration_date_gte=2026-06-12&expiration_date_lte=2026-06-12 body={"next_page_token":null,"snapshots":{}}
-2026-04-24 15:33:48 | INFO     | trading_agent.market_data      | [GOOG] Catalog lookup: 3 listed expirations in 2026-05-29..2026-06-26 (sample: 2026-05-29,2026-06-05,2026-06-18); nearest to 2026-06-12 = 2026-06-18
-2026-04-24 15:33:48 | WARNING  | trading_agent.market_data      | [GOOG] Requested expiration 2026-06-12 not available in indicative feed; swapping to nearest listed expiration 2026-06-18
-2026-04-24 15:33:49 | INFO     | trading_agent.market_data      | [GOOG] Catalog fallback recovered 81 put contracts at 2026-06-18 (effective_url=https://data.alpaca.markets/v1beta1/options/snapshots/GOOG?type=put&feed=indicative&limit=1000&expiration_date=2026-06-18)
-2026-04-24 15:33:49 | INFO     | trading_agent.market_data      | Received 81 put contracts for GOOG
-2026-04-24 15:33:49 | INFO     | __main__                       | [GOOG] Phase IV — RISK CHECK
-2026-04-24 15:33:49 | WARNING  | trading_agent.risk_manager     | [GOOG] Risk verdict: REJECTED: 5 passed, 3 failed
-2026-04-24 15:33:49 | WARNING  | trading_agent.risk_manager     |   FAIL: Plan invalid: Credit-to-width ratio 0.1020 < minimum 0.25
-2026-04-24 15:33:49 | WARNING  | trading_agent.risk_manager     |   FAIL: Credit/Width ratio 0.1020 < 0.25
-2026-04-24 15:33:49 | WARNING  | trading_agent.risk_manager     |   FAIL: Underlying bid/ask spread $12.5800 >= $0.05 (illiquid)
-2026-04-24 15:33:49 | INFO     | __main__                       | [GOOG] Phase VI — EXECUTE
-2026-04-24 15:33:49 | INFO     | trading_agent.executor         | Trade plan saved to trade_plans/trade_plan_GOOG.json (run_id=20260424_193349, history=26)
-2026-04-24 15:33:49 | WARNING  | trading_agent.executor         | [GOOG] Trade REJECTED by risk manager — skipping.
-2026-04-24 15:33:49 | INFO     | trading_agent.order_tracker    | Fetched 0 orders (status=open)
-2026-04-24 15:33:49 | INFO     | trading_agent.sentiment_pipeline | [GOOG] earnings in 5 day(s) — pipeline short-circuits to avoid
-2026-04-24 15:33:49 | INFO     | trading_agent.order_tracker    | Fetched 10 orders (status=closed)
-2026-04-24 15:33:49 | INFO     | __main__                       | Open orders: 0 | Recent fills: 10
-2026-04-24 15:33:49 | INFO     | __main__                       | ======================================================================
-2026-04-24 15:33:49 | INFO     | __main__                       | TRADING CYCLE COMPLETE — 4 tickers processed
-2026-04-24 15:33:49 | INFO     | __main__                       |
+2026-04-25 02:27:02 | INFO     | trading_agent.market_data      | Received 200 rows for SPY (cached)
+2026-04-25 02:27:02 | INFO     | trading_agent.market_data      | Received 200 rows for IWM (cached)
+2026-04-25 02:27:02 | INFO     | trading_agent.market_data      | Batch snapshot: fetched prices for 4/4 tickers
+2026-04-25 02:27:02 | INFO     | __main__                       | ======================================================================
+2026-04-25 02:27:02 | INFO     | __main__                       | STAGE 1 — MONITOR EXISTING POSITIONS
+2026-04-25 02:27:02 | INFO     | __main__                       | ======================================================================
+2026-04-25 02:27:02 | INFO     | trading_agent.position_monitor | Fetched 4 total positions, 4 are options
+2026-04-25 02:27:02 | INFO     | __main__                       | Loaded 172 trade plan(s) from trade_plans
+2026-04-25 02:27:02 | INFO     | trading_agent.position_monitor | Grouped positions into 0 spread(s)
+2026-04-25 02:27:02 | INFO     | __main__                       | Could not match positions to any trade plans.
+2026-04-25 02:27:02 | INFO     | __main__                       | ======================================================================
+2026-04-25 02:27:02 | INFO     | __main__                       | STAGE 2 — OPEN NEW POSITIONS
+2026-04-25 02:27:02 | INFO     | __main__                       | ======================================================================
+2026-04-25 02:27:02 | INFO     | __main__                       | --------------------------------------------------
+2026-04-25 02:27:02 | INFO     | __main__                       | [SPY] Phase I  — PERCEIVE
+2026-04-25 02:27:02 | INFO     | __main__                       | [SPY] Phase II — CLASSIFY
+2026-04-25 02:27:03 | INFO     | trading_agent.market_data      | VIX 5-min change 0.000 pts, z-score -0.19 σ
+2026-04-25 02:27:03 | INFO     | trading_agent.regime           | [SPY] Regime → bullish | Price=713.96 SMA50=676.99 SMA200=668.65 Slope=0.2761 BB=0.1579 RSI=70.1 MR=none Lead=QQQ(z=+0.00) VIXz=-0.19 InhibitBull=False IVRank=91.7 HighVol=False
+2026-04-25 02:27:03 | INFO     | __main__                       | [SPY] Phase III — PLAN (bullish → Bull Put Spread)
+2026-04-25 02:27:03 | INFO     | trading_agent.strategy         | [SPY] Planning bullish strategy, expiration 2026-06-05
+2026-04-25 02:27:03 | INFO     | trading_agent.market_data      | Fetching put option chain for SPY exp 2026-06-05 (feed=indicative)
+2026-04-25 02:27:03 | INFO     | trading_agent.market_data      | Received 224 put contracts for SPY
+2026-04-25 02:27:03 | INFO     | __main__                       | [SPY] Phase IV — RISK CHECK
+2026-04-25 02:27:03 | WARNING  | trading_agent.risk_manager     | [SPY] Risk verdict: REJECTED: 6 passed, 2 failed
+2026-04-25 02:27:03 | WARNING  | trading_agent.risk_manager     |   FAIL: Plan invalid: Credit-to-width ratio 0.0971 < minimum 0.25
+2026-04-25 02:27:03 | WARNING  | trading_agent.risk_manager     |   FAIL: Credit/Width ratio 0.0971 < 0.25
+2026-04-25 02:27:03 | INFO     | __main__                       | [SPY] Phase VI — EXECUTE
+2026-04-25 02:27:03 | INFO     | trading_agent.executor         | Trade plan saved to trade_plans/trade_plan_SPY.json (run_id=20260425_062703, history=34)
+2026-04-25 02:27:03 | WARNING  | trading_agent.executor         | [SPY] Trade REJECTED by risk manager — skipping.
+2026-04-25 02:27:03 | INFO     | __main__                       | --------------------------------------------------
+2026-04-25 02:27:03 | INFO     | __main__                       | [QQQ] Phase I  — PERCEIVE
+2026-04-25 02:27:03 | INFO     | __main__                       | [QQQ] Phase II — CLASSIFY
+2026-04-25 02:27:03 | INFO     | trading_agent.regime           | [QQQ] Regime → bullish | Price=663.74 SMA50=606.42 SMA200=601.36 Slope=0.6648 BB=0.2132 RSI=74.9 MR=none Lead=SPY(z=+0.00) VIXz=-0.19 InhibitBull=False IVRank=86.1 HighVol=False
+2026-04-25 02:27:03 | INFO     | __main__                       | [QQQ] Phase III — PLAN (bullish → Bull Put Spread)
+2026-04-25 02:27:03 | INFO     | trading_agent.strategy         | [QQQ] Planning bullish strategy, expiration 2026-06-05
+2026-04-25 02:27:03 | INFO     | trading_agent.market_data      | Fetching put option chain for QQQ exp 2026-06-05 (feed=indicative)
+2026-04-25 02:27:03 | INFO     | trading_agent.market_data      | Received 181 put contracts for QQQ
+2026-04-25 02:27:03 | INFO     | __main__                       | [QQQ] Phase IV — RISK CHECK
+2026-04-25 02:27:03 | WARNING  | trading_agent.risk_manager     | [QQQ] Risk verdict: REJECTED: 6 passed, 2 failed
+2026-04-25 02:27:03 | WARNING  | trading_agent.risk_manager     |   FAIL: Plan invalid: Credit-to-width ratio 0.1169 < minimum 0.25
+2026-04-25 02:27:03 | WARNING  | trading_agent.risk_manager     |   FAIL: Credit/Width ratio 0.1169 < 0.25
+2026-04-25 02:27:03 | INFO     | __main__                       | [QQQ] Phase VI — EXECUTE
+2026-04-25 02:27:03 | INFO     | trading_agent.executor         | Trade plan saved to trade_plans/trade_plan_QQQ.json (run_id=20260425_062703, history=36)
+2026-04-25 02:27:03 | WARNING  | trading_agent.executor         | [QQQ] Trade REJECTED by risk manager — skipping.
+2026-04-25 02:27:03 | INFO     | __main__                       | --------------------------------------------------
+2026-04-25 02:27:03 | INFO     | __main__                       | [IWM] Phase I  — PERCEIVE
+2026-04-25 02:27:03 | INFO     | __main__                       | [IWM] Phase II — CLASSIFY
+2026-04-25 02:27:03 | INFO     | trading_agent.regime           | [IWM] Regime → bullish | Price=276.71 SMA50=258.42 SMA200=246.74 Slope=0.1606 BB=0.1869 RSI=69.4 MR=none Lead=SPY(z=+0.00) VIXz=-0.19 InhibitBull=False IVRank=58.3 HighVol=False
+2026-04-25 02:27:03 | INFO     | __main__                       | [IWM] Phase III — PLAN (bullish → Bull Put Spread)
+2026-04-25 02:27:03 | INFO     | trading_agent.strategy         | [IWM] Planning bullish strategy, expiration 2026-06-05
+2026-04-25 02:27:03 | INFO     | trading_agent.market_data      | Fetching put option chain for IWM exp 2026-06-05 (feed=indicative)
+2026-04-25 02:27:04 | INFO     | trading_agent.market_data      | Received 99 put contracts for IWM
+2026-04-25 02:27:04 | INFO     | __main__                       | [IWM] Phase IV — RISK CHECK
+2026-04-25 02:27:04 | WARNING  | trading_agent.risk_manager     | [IWM] Risk verdict: REJECTED: 6 passed, 2 failed
+2026-04-25 02:27:04 | WARNING  | trading_agent.risk_manager     |   FAIL: Plan invalid: Credit-to-width ratio 0.1357 < minimum 0.25
+2026-04-25 02:27:04 | WARNING  | trading_agent.risk_manager     |   FAIL: Credit/Width ratio 0.1357 < 0.25
+2026-04-25 02:27:04 | INFO     | __main__                       | [IWM] Phase VI — EXECUTE
+2026-04-25 02:27:04 | INFO     | trading_agent.executor         | Trade plan saved to trade_plans/trade_plan_IWM.json (run_id=20260425_062704, history=29)
+2026-04-25 02:27:04 | WARNING  | trading_agent.executor         | [IWM] Trade REJECTED by risk manager — skipping.
+2026-04-25 02:27:04 | INFO     | __main__                       | --------------------------------------------------
+2026-04-25 02:27:04 | INFO     | __main__                       | [GOOG] Phase I  — PERCEIVE
+2026-04-25 02:27:04 | INFO     | __main__                       | [GOOG] Phase II — CLASSIFY
+2026-04-25 02:27:04 | INFO     | trading_agent.regime           | [GOOG] Regime → bullish | Price=342.28 SMA50=308.57 SMA200=276.80 Slope=0.2832 BB=0.2831 RSI=69.7 MR=none Lead=none(z=+0.00) VIXz=-0.19 InhibitBull=False IVRank=63.9 HighVol=False
+2026-04-25 02:27:04 | INFO     | __main__                       | [GOOG] Phase III — PLAN (bullish → Bull Put Spread)
+2026-04-25 02:27:04 | INFO     | trading_agent.strategy         | [GOOG] Planning bullish strategy, expiration 2026-06-05
+2026-04-25 02:27:04 | INFO     | trading_agent.market_data      | Fetching put option chain for GOOG exp 2026-06-05 (feed=indicative)
+2026-04-25 02:27:04 | INFO     | trading_agent.market_data      | Received 52 put contracts for GOOG
+2026-04-25 02:27:04 | INFO     | __main__                       | [GOOG] Phase IV — RISK CHECK
+2026-04-25 02:27:04 | WARNING  | trading_agent.risk_manager     | [GOOG] Stale-quote soft-pass: spread=$33.8600 rel=10.02% (threshold 1.0%) bid=$320.9100 ask=$354.7700
+2026-04-25 02:27:04 | WARNING  | trading_agent.risk_manager     | [GOOG] Risk verdict: REJECTED: 6 passed, 2 failed
+2026-04-25 02:27:04 | WARNING  | trading_agent.risk_manager     |   FAIL: Plan invalid: Credit-to-width ratio 0.1113 < minimum 0.25
+2026-04-25 02:27:04 | WARNING  | trading_agent.risk_manager     |   FAIL: Credit/Width ratio 0.1113 < 0.25
+2026-04-25 02:27:04 | INFO     | __main__                       | [GOOG] Phase VI — EXECUTE
+2026-04-25 02:27:04 | INFO     | trading_agent.executor         | Trade plan saved to trade_plans/trade_plan_GOOG.json (run_id=20260425_062704, history=28)
+2026-04-25 02:27:04 | WARNING  | trading_agent.executor         | [GOOG] Trade REJECTED by risk manager — skipping.
+2026-04-25 02:27:04 | INFO     | trading_agent.order_tracker    | Fetched 0 orders (status=open)
+2026-04-25 02:27:04 | INFO     | trading_agent.order_tracker    | Fetched 10 orders (status=closed)
+2026-04-25 02:27:04 | INFO     | __main__                       | Open orders: 0 | Recent fills: 10
+2026-04-25 02:27:04 | INFO     | __main__                       | ======================================================================
+2026-04-25 02:27:04 | INFO     | __main__                       | TRADING CYCLE COMPLETE — 4 tickers processed
+2026-04-25 02:27:04 | INFO     | __main__                       |
 Ticker | Regime     | Strategy           | Valid    | Risk OK    | Status
-2026-04-24 15:33:49 | INFO     | __main__                       | --------------------------------------------------------------------------------
-2026-04-24 15:33:49 | INFO     | __main__                       | SPY    | bullish    | Bull Put Spread    | False    | False      | rejected
-2026-04-24 15:33:49 | INFO     | __main__                       | QQQ    | bullish    | Bull Put Spread    | False    | False      | rejected
-2026-04-24 15:33:49 | INFO     | __main__                       | IWM    | bullish    | Bull Put Spread    | False    | False      | rejected
-2026-04-24 15:33:49 | INFO     | __main__                       | GOOG   | bullish    | Bull Put Spread    | False    | False      | rejected
-2026-04-24 15:33:49 | INFO     | __main__                       | ======================================================================
-2026-04-24 15:33:49 | INFO     | __main__                       | Cycle completed in 10.6s / 270s budget
+2026-04-25 02:27:04 | INFO     | __main__                       | --------------------------------------------------------------------------------
+2026-04-25 02:27:04 | INFO     | __main__                       | SPY    | bullish    | Bull Put Spread    | False    | False      | rejected
+2026-04-25 02:27:04 | INFO     | __main__                       | QQQ    | bullish    | Bull Put Spread    | False    | False      | rejected
+2026-04-25 02:27:04 | INFO     | __main__                       | IWM    | bullish    | Bull Put Spread    | False    | False      | rejected
+2026-04-25 02:27:04 | INFO     | __main__                       | GOOG   | bullish    | Bull Put Spread    | False    | False      | rejected
+2026-04-25 02:27:04 | INFO     | __main__                       | ======================================================================
+2026-04-25 02:27:04 | INFO     | trading_agent.sentiment_pipeline | [GOOG] earnings in 4 day(s) — pipeline short-circuits to avoid
+2026-04-25 02:27:04 | INFO     | __main__                       | Cycle completed in 2.8s / 270s budget
 {
-  "timestamp": "2026-04-24T19:33:49.415622+00:00",
+  "timestamp": "2026-04-25T06:27:04.345261+00:00",
   "account_balance": 99164.03,
   "monitor": {
     "total_spreads": 0,
@@ -81,16 +105,16 @@ Ticker | Regime     | Strategy           | Valid    | Risk OK    | Status
       "risk_approved": false,
       "execution": {
         "status": "rejected",
-        "reason": "REJECTED: 5 passed, 3 failed",
+        "reason": "REJECTED: 6 passed, 2 failed",
         "plan_file": "trade_plans/trade_plan_SPY.json",
-        "run_id": "20260424_193343"
+        "run_id": "20260425_062703"
       },
       "analysis": {
-        "price": 713.82,
-        "sma_50": 676.5544006347657,
-        "sma_200": 668.2050988769531,
-        "rsi": 67.76623540847524,
-        "reasoning": "Price (713.82) > SMA-200 (668.21) and SMA-50 slope is positive (0.3126)."
+        "price": 713.96,
+        "sma_50": 676.9940002441406,
+        "sma_200": 668.6544989013672,
+        "rsi": 70.14802774982395,
+        "reasoning": "Price (713.96) > SMA-200 (668.65) and SMA-50 slope is positive (0.2761)."
       }
     },
     {
@@ -103,14 +127,14 @@ Ticker | Regime     | Strategy           | Valid    | Risk OK    | Status
         "status": "rejected",
         "reason": "REJECTED: 6 passed, 2 failed",
         "plan_file": "trade_plans/trade_plan_QQQ.json",
-        "run_id": "20260424_193344"
+        "run_id": "20260425_062703"
       },
       "analysis": {
-        "price": 663.69,
-        "sma_50": 605.4039978027344,
-        "sma_200": 600.8196493530273,
-        "rsi": 70.95483446823536,
-        "reasoning": "Price (663.69) > SMA-200 (600.82) and SMA-50 slope is positive (0.6607)."
+        "price": 663.74,
+        "sma_50": 606.4193981933594,
+        "sma_200": 601.3577993774414,
+        "rsi": 74.8753319169405,
+        "reasoning": "Price (663.74) > SMA-200 (601.36) and SMA-50 slope is positive (0.6648)."
       }
     },
     {
@@ -123,14 +147,14 @@ Ticker | Regime     | Strategy           | Valid    | Risk OK    | Status
         "status": "rejected",
         "reason": "REJECTED: 6 passed, 2 failed",
         "plan_file": "trade_plans/trade_plan_IWM.json",
-        "run_id": "20260424_193347"
+        "run_id": "20260425_062704"
       },
       "analysis": {
-        "price": 276.81,
-        "sma_50": 258.1888003540039,
-        "sma_200": 246.47030014038086,
-        "rsi": 68.40400143093332,
-        "reasoning": "Price (276.81) > SMA-200 (246.47) and SMA-50 slope is positive (0.1999)."
+        "price": 276.71,
+        "sma_50": 258.422799987793,
+        "sma_200": 246.73530014038087,
+        "rsi": 69.41563489323912,
+        "reasoning": "Price (276.71) > SMA-200 (246.74) and SMA-50 slope is positive (0.1606)."
       }
     },
     {
@@ -141,16 +165,16 @@ Ticker | Regime     | Strategy           | Valid    | Risk OK    | Status
       "risk_approved": false,
       "execution": {
         "status": "rejected",
-        "reason": "REJECTED: 5 passed, 3 failed",
+        "reason": "REJECTED: 6 passed, 2 failed",
         "plan_file": "trade_plans/trade_plan_GOOG.json",
-        "run_id": "20260424_193349"
+        "run_id": "20260425_062704"
       },
       "analysis": {
-        "price": 342.535,
-        "sma_50": 307.94579833984375,
-        "sma_200": 275.9788496398926,
-        "rsi": 67.30373838126175,
-        "reasoning": "Price (342.54) > SMA-200 (275.98) and SMA-50 slope is positive (0.1756)."
+        "price": 342.28,
+        "sma_50": 308.5655987548828,
+        "sma_200": 276.8021496582031,
+        "rsi": 69.65628892394628,
+        "reasoning": "Price (342.28) > SMA-200 (276.80) and SMA-50 slope is positive (0.2832)."
       }
     }
   ],
@@ -173,28 +197,4 @@ Ticker | Regime     | Strategy           | Valid    | Risk OK    | Status
     }
   }
 }
-[2026-04-24 19:33:49 UTC] --- Cycle end [LIVE] (exit=0) ---
-[2026-04-24 20:05:17 UTC] --- Cycle start [LIVE] ---
-2026-04-24 16:05:18 | INFO     | root                           | Logging initialised — level=INFO, file=logs/trading_agent.log, rotate=10MB × 7 backups
-2026-04-24 16:05:18 | INFO     | trading_agent.shutdown         | Graceful shutdown handlers installed (immediate=False)
-2026-04-24 16:05:18 | INFO     | __main__                       | Intelligence layer DISABLED — rule-based mode only
-2026-04-24 16:05:18 | INFO     | trading_agent.earnings_calendar | EarningsCalendar ready (lookahead=7d, refresh=12h)
-2026-04-24 16:05:18 | INFO     | trading_agent.sentiment_cache  | SentimentHashCache ready (max=32 entries, ttl=300s)
-2026-04-24 16:05:18 | INFO     | trading_agent.sentiment_pipeline | SentimentPipeline wired: earnings
-2026-04-24 16:05:18 | INFO     | __main__                       | Outside NYSE market hours (Friday 16:05 ET) — shutting down cleanly
-2026-04-24 16:05:18 | ERROR    | trading_agent.journal_kb       | JournalKB cycle_error: after_hours_shutdown
-2026-04-24 16:05:18 | INFO     | trading_agent.shutdown         | graceful_exit(0): after_hours_shutdown
-[2026-04-24 20:05:18 UTC] --- Cycle end [LIVE] (exit=0) ---
-[2026-04-24 20:26:56 UTC] --- Cycle start [LIVE] ---
-2026-04-24 16:26:57 | INFO     | root                           | Logging initialised — level=INFO, file=logs/trading_agent.log, rotate=10MB × 7 backups
-2026-04-24 16:26:57 | INFO     | trading_agent.shutdown         | Graceful shutdown handlers installed (immediate=False)
-2026-04-24 16:26:57 | INFO     | __main__                       | Intelligence layer DISABLED — rule-based mode only
-2026-04-24 16:26:57 | INFO     | trading_agent.earnings_calendar | EarningsCalendar ready (lookahead=7d, refresh=12h)
-2026-04-24 16:26:57 | INFO     | trading_agent.sentiment_cache  | SentimentHashCache ready (max=32 entries, ttl=300s)
-2026-04-24 16:26:57 | INFO     | trading_agent.sentiment_pipeline | SentimentPipeline wired: earnings
-2026-04-24 16:26:57 | INFO     | __main__                       | Outside NYSE market hours (Friday 16:26 ET) — shutting down cleanly
-2026-04-24 16:26:57 | ERROR    | trading_agent.journal_kb       | JournalKB cycle_error: after_hours_shutdown
-2026-04-24 16:26:57 | INFO     | trading_agent.shutdown         | graceful_exit(0): after_hours_shutdown
-[2026-04-24 20:26:57 UTC] --- Cycle end [LIVE] (exit=0) ---
-[2026-04-24 20:31:29 UTC] Stop requested from dashboard
-[2026-04-24 20:31:30 UTC] Agent loop stopped
+[2026-04-25 06:27:04 UTC] --- One-shot cycle end [DRY-RUN] (exit=0) ---

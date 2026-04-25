@@ -230,7 +230,7 @@ class TestRelativeStrengthBias:
         return StrategyPlanner(provider, max_delta=0.20, min_credit_ratio=0.33)
 
     def test_sideways_with_rs_picks_bull_put(self, sample_put_contracts):
-        """SIDEWAYS regime + relative strength outperforming → Bull Put Spread."""
+        """SIDEWAYS regime + Z-score leadership > 1.5 σ → Bull Put Spread."""
         from trading_agent.regime import Regime
         planner = self._make_planner(put_chain=sample_put_contracts)
         analysis = RegimeAnalysis(
@@ -238,14 +238,15 @@ class TestRelativeStrengthBias:
             current_price=500.0, sma_50=498.0, sma_200=490.0,
             sma_50_slope=0.5, rsi_14=55.0, bollinger_width=0.06,
             reasoning="sideways",
-            relative_strength_vs_spy=0.002,   # +0.2% outperforming
+            leadership_anchor="QQQ",
+            leadership_zscore=1.8,           # > 1.5 σ → outperforming
         )
         plan = planner.plan("SPY", analysis)
         assert plan.strategy_name == "Bull Put Spread"
 
     def test_sideways_without_rs_picks_iron_condor(self, sample_put_contracts,
                                                      sample_call_contracts):
-        """SIDEWAYS regime with no RS signal → Iron Condor."""
+        """SIDEWAYS regime with no significant Z-score signal → Iron Condor."""
         from trading_agent.regime import Regime
         planner = self._make_planner(put_chain=sample_put_contracts,
                                       call_chain=sample_call_contracts)
@@ -254,11 +255,110 @@ class TestRelativeStrengthBias:
             current_price=500.0, sma_50=498.0, sma_200=490.0,
             sma_50_slope=0.0, rsi_14=50.0, bollinger_width=0.06,
             reasoning="sideways",
-            relative_strength_vs_spy=0.0,
-            relative_strength_vs_qqq=0.0,
+            leadership_anchor="QQQ",
+            leadership_zscore=0.5,           # below 1.5 σ threshold
         )
         plan = planner.plan("SPY", analysis)
         assert plan.strategy_name == "Iron Condor"
+
+    def test_sub_threshold_leadership_does_not_trigger_bias(
+            self, sample_put_contracts, sample_call_contracts):
+        """Z-score 1.0 σ < threshold 1.5 σ → no bias; SIDEWAYS stays IC."""
+        from trading_agent.regime import Regime
+        planner = self._make_planner(put_chain=sample_put_contracts,
+                                      call_chain=sample_call_contracts)
+        analysis = RegimeAnalysis(
+            regime=Regime.SIDEWAYS,
+            current_price=500.0, sma_50=498.0, sma_200=490.0,
+            sma_50_slope=0.0, rsi_14=50.0, bollinger_width=0.06,
+            reasoning="sideways",
+            leadership_anchor="QQQ",
+            leadership_zscore=1.0,           # below 1.5 σ — sub-threshold
+        )
+        plan = planner.plan("SPY", analysis)
+        assert plan.strategy_name == "Iron Condor"
+
+    def test_no_anchor_means_no_bias(self, sample_put_contracts,
+                                       sample_call_contracts):
+        """Empty leadership_anchor → bias path is skipped even with high z."""
+        from trading_agent.regime import Regime
+        planner = self._make_planner(put_chain=sample_put_contracts,
+                                      call_chain=sample_call_contracts)
+        analysis = RegimeAnalysis(
+            regime=Regime.SIDEWAYS,
+            current_price=500.0, sma_50=498.0, sma_200=490.0,
+            sma_50_slope=0.0, rsi_14=50.0, bollinger_width=0.06,
+            reasoning="sideways",
+            leadership_anchor="",            # no anchor configured
+            leadership_zscore=2.5,           # would otherwise trigger
+        )
+        plan = planner.plan("SPY", analysis)
+        assert plan.strategy_name == "Iron Condor"
+
+
+class TestInterMarketGate:
+    """VIX z-score > +2σ demotes Bull-Put / Iron-Condor to Bear Call."""
+
+    def _make_planner(self, put_chain=None, call_chain=None):
+        provider = MagicMock(spec=MarketDataProvider)
+        provider.fetch_option_chain.side_effect = lambda ticker, exp, opt_type: (
+            put_chain if opt_type == "put" else call_chain
+        )
+        return StrategyPlanner(provider, max_delta=0.20, min_credit_ratio=0.33)
+
+    def test_bullish_demotes_to_bear_call_when_inhibit_set(
+            self, sample_put_contracts, sample_call_contracts):
+        """BULLISH + inter_market_inhibit_bullish → Bear Call Spread."""
+        from trading_agent.regime import Regime
+        planner = self._make_planner(put_chain=sample_put_contracts,
+                                      call_chain=sample_call_contracts)
+        analysis = RegimeAnalysis(
+            regime=Regime.BULLISH,
+            current_price=500.0, sma_50=498.0, sma_200=490.0,
+            sma_50_slope=0.5, rsi_14=55.0, bollinger_width=0.06,
+            reasoning="bullish",
+            leadership_anchor="QQQ",
+            leadership_zscore=2.0,           # would normally bias bullish
+            vix_zscore=2.5,
+            inter_market_inhibit_bullish=True,
+        )
+        plan = planner.plan("SPY", analysis)
+        assert plan.strategy_name == "Bear Call Spread"
+
+    def test_sideways_demotes_to_bear_call_when_inhibit_set(
+            self, sample_put_contracts, sample_call_contracts):
+        """SIDEWAYS + inhibit_bull → Bear Call (no put-wing exposure)."""
+        from trading_agent.regime import Regime
+        planner = self._make_planner(put_chain=sample_put_contracts,
+                                      call_chain=sample_call_contracts)
+        analysis = RegimeAnalysis(
+            regime=Regime.SIDEWAYS,
+            current_price=500.0, sma_50=498.0, sma_200=490.0,
+            sma_50_slope=0.0, rsi_14=50.0, bollinger_width=0.06,
+            reasoning="sideways",
+            leadership_anchor="QQQ",
+            leadership_zscore=0.0,
+            vix_zscore=2.5,
+            inter_market_inhibit_bullish=True,
+        )
+        plan = planner.plan("SPY", analysis)
+        assert plan.strategy_name == "Bear Call Spread"
+
+    def test_inhibit_does_not_affect_bearish_regime(
+            self, sample_call_contracts):
+        """BEARISH + inhibit_bull → Bear Call anyway (gate is no-op here)."""
+        from trading_agent.regime import Regime
+        planner = self._make_planner(call_chain=sample_call_contracts)
+        analysis = RegimeAnalysis(
+            regime=Regime.BEARISH,
+            current_price=500.0, sma_50=498.0, sma_200=520.0,
+            sma_50_slope=-0.5, rsi_14=40.0, bollinger_width=0.06,
+            reasoning="bearish",
+            vix_zscore=2.5,
+            inter_market_inhibit_bullish=True,
+        )
+        plan = planner.plan("SPY", analysis)
+        assert plan.strategy_name == "Bear Call Spread"
 
 
 class TestStrikeGridInference:

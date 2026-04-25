@@ -110,6 +110,17 @@ class MarketDataProvider:
         # relative-strength calculation otherwise produces per cycle.
         self._intraday_return_cache: Dict[str, Tuple[float, float]] = {}
 
+        # intraday 5-min return SERIES cache: ticker → (returns_list, epoch).
+        # The Z-score leadership signal needs ~20 bars of history per ticker
+        # to compute a meaningful rolling stdev; without per-cycle caching
+        # the regime classifier would re-fetch the same window N times.
+        self._intraday_return_series_cache: Dict[str, Tuple[List[float], float]] = {}
+
+        # VIX (volatility-index) cache — one global signal per cycle.
+        # ^VIX is sourced via yfinance because Alpaca doesn't carry it as a
+        # tradable symbol on the IEX/SIP feeds.  Cached for INTRADAY_RETURN_TTL.
+        self._vix_zscore_cache: Optional[Tuple[float, float, float]] = None  # (raw_change, zscore, epoch)
+
     # ------------------------------------------------------------------
     # Yahoo Finance — historical OHLCV
     # ------------------------------------------------------------------
@@ -845,6 +856,186 @@ class MarketDataProvider:
         except requests.RequestException as exc:
             logger.warning("[%s] 5-min bar fetch failed: %s", ticker, exc)
             return None
+
+    # ------------------------------------------------------------------
+    # Rolling 5-min return series & Z-scored leadership signal
+    # ------------------------------------------------------------------
+
+    # Skip the first ``OPEN_BAR_SKIP`` 5-min bars after the 9:30 ET open
+    # because they typically print 3-4× the rest of the day's vol and
+    # would dominate any rolling stdev calculation.  Two bars = first
+    # 10 minutes of the session.
+    OPEN_BAR_SKIP = 2
+    LEADERSHIP_WINDOW_BARS = 21          # 20 returns + 1 anchor close
+    VIX_WINDOW_BARS = 21
+
+    def get_5min_return_series(self, ticker: str,
+                               window: int = LEADERSHIP_WINDOW_BARS
+                               ) -> Optional[List[float]]:
+        """
+        Return up to ``window-1`` consecutive 5-minute log-style returns
+        for *ticker* (most recent last).  Used by the Z-scored leadership
+        signal which needs a rolling stdev, not just the latest bar.
+
+        Cached for ``INTRADAY_RETURN_TTL`` seconds.  Returns ``None`` if
+        the bar feed yields fewer than ``OPEN_BAR_SKIP + 2`` bars (e.g.
+        very early in the session, before the rolling stdev is reliable).
+        """
+        now = time.monotonic()
+        cached = self._intraday_return_series_cache.get(ticker)
+        if cached is not None:
+            cached_series, cached_at = cached
+            if (now - cached_at) < INTRADAY_RETURN_TTL:
+                logger.debug("[%s] 5-min series cache HIT (%d bars)",
+                             ticker, len(cached_series))
+                return cached_series
+
+        url = f"{self.alpaca_data_url}/stocks/{ticker}/bars"
+        feed = os.getenv("ALPACA_STOCKS_FEED", "iex").strip() or "iex"
+        params = {
+            "timeframe": "5Min",
+            "limit": int(window),
+            "adjustment": "raw",
+            "feed": feed,
+            "end": self._last_completed_5min_end(),
+        }
+        try:
+            resp = requests.get(url, headers=self._alpaca_headers(),
+                                params=params, timeout=10)
+            resp.raise_for_status()
+            bars = resp.json().get("bars") or []
+        except requests.RequestException as exc:
+            logger.warning("[%s] 5-min series fetch failed: %s", ticker, exc)
+            return None
+
+        # Drop the first OPEN_BAR_SKIP bars to suppress the open-print spike
+        # (the open auction often prints 3-4× the rest of the day's vol).
+        bars = bars[self.OPEN_BAR_SKIP:]
+        if len(bars) < 2:
+            logger.debug("[%s] Only %d bars after open-skip — series too short",
+                         ticker, len(bars))
+            return None
+
+        closes = [float(b["c"]) for b in bars if b.get("c")]
+        returns: List[float] = []
+        for prev, curr in zip(closes, closes[1:]):
+            if prev > 0:
+                returns.append((curr / prev) - 1.0)
+
+        if len(returns) < 2:
+            return None
+
+        self._intraday_return_series_cache[ticker] = (returns, time.monotonic())
+        logger.debug("[%s] 5-min series fetched (%d returns)", ticker, len(returns))
+        return returns
+
+    def get_leadership_zscore(self, ticker: str, anchor: str,
+                              window: int = LEADERSHIP_WINDOW_BARS
+                              ) -> Optional[Tuple[float, float]]:
+        """
+        Compute the Z-scored 5-minute return differential of
+        ``ticker - anchor`` over a rolling ``window``-bar window.
+
+        Returns ``(raw_diff, zscore)`` or ``None`` when either series
+        is too short or the rolling stdev is degenerate (zero variance).
+
+        Z-score interpretation:
+          * ``zscore > 0``  → ticker is currently leading the anchor
+          * ``zscore > 1.5`` → leadership is statistically significant
+          * ``zscore < 0``  → ticker is lagging
+        """
+        if ticker == anchor:
+            return None  # Self-comparison is always 0 — useless signal.
+
+        ticker_series = self.get_5min_return_series(ticker, window)
+        anchor_series = self.get_5min_return_series(anchor, window)
+        if not ticker_series or not anchor_series:
+            return None
+
+        # Align tail-aligned (most recent N items where N = min length)
+        n = min(len(ticker_series), len(anchor_series))
+        if n < 2:
+            return None
+        diffs = [t - a for t, a in zip(ticker_series[-n:], anchor_series[-n:])]
+
+        # Population stdev — we have the full intraday window, not a sample
+        mean = sum(diffs) / n
+        var = sum((d - mean) ** 2 for d in diffs) / n
+        std = var ** 0.5
+        if std <= 1e-9:                       # degenerate: zero variance
+            return None
+
+        raw_diff = diffs[-1]
+        zscore = (raw_diff - mean) / std
+        return (raw_diff, zscore)
+
+    # ------------------------------------------------------------------
+    # Inter-market gate (VIX volatility index) — yfinance source
+    # ------------------------------------------------------------------
+
+    def get_vix_zscore(self, window: int = VIX_WINDOW_BARS,
+                       symbol: str = "^VIX"
+                       ) -> Optional[Tuple[float, float]]:
+        """
+        Fetch the latest 5-min ``^VIX`` change and Z-score it over a
+        rolling window.  Returns ``(raw_change, zscore)`` or ``None``
+        when yfinance data is unavailable.
+
+        ``zscore > 0`` means VIX is rising vs its rolling mean — i.e.
+        an inter-market fear spike.  Strategies that open new short
+        premium (Bull Put, Iron Condor put wing) should be inhibited
+        when ``zscore > VIX_INHIBIT_ZSCORE`` (default +2.0σ).
+
+        Cached at ``self._vix_zscore_cache`` for ``INTRADAY_RETURN_TTL``
+        so the per-cycle classifier loop only fetches once.
+
+        ^VIX is *not* on the Alpaca tradable feed, so we source it from
+        yfinance.  If yfinance isn't installed or the call fails we
+        return ``None`` and the gate becomes a soft no-op (callers
+        should treat ``None`` as "no inhibit signal available").
+        """
+        now = time.monotonic()
+        if self._vix_zscore_cache is not None:
+            raw, zscore, ts = self._vix_zscore_cache
+            if (now - ts) < INTRADAY_RETURN_TTL:
+                logger.debug("VIX z-score cache HIT (raw=%.4f z=%.2f)", raw, zscore)
+                return (raw, zscore)
+
+        if yf is None:
+            return None
+
+        try:
+            ticker = yf.Ticker(symbol)
+            # 1d / 5m gives us up to ~78 5-min bars in a regular session
+            df = ticker.history(period="1d", interval="5m", auto_adjust=False)
+            if df is None or df.empty or len(df) < self.OPEN_BAR_SKIP + 2:
+                return None
+        except Exception as exc:
+            logger.warning("VIX yfinance fetch failed (%s): %s", symbol, exc)
+            return None
+
+        # Skip the open spike for VIX too — the 9:30 print is dominated
+        # by overnight gap math and is structurally noisy.
+        df = df.iloc[self.OPEN_BAR_SKIP:].tail(int(window))
+        closes = df["Close"].astype(float).tolist()
+        if len(closes) < 2:
+            return None
+
+        # 5-min change in VIX *level* (not %) — a 0.5-point VIX move in
+        # 5 minutes is meaningful regardless of starting VIX value.
+        diffs = [b - a for a, b in zip(closes, closes[1:])]
+        if len(diffs) < 2:
+            return None
+        mean = sum(diffs) / len(diffs)
+        var = sum((d - mean) ** 2 for d in diffs) / len(diffs)
+        std = var ** 0.5
+        if std <= 1e-6:
+            return None
+        raw = diffs[-1]
+        zscore = (raw - mean) / std
+        self._vix_zscore_cache = (raw, zscore, time.monotonic())
+        logger.info("VIX 5-min change %.3f pts, z-score %+.2f σ", raw, zscore)
+        return (raw, zscore)
 
     # ------------------------------------------------------------------
     # Cached-price query — AccountPort / MarketDataPort seam

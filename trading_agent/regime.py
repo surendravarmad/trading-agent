@@ -17,6 +17,46 @@ from trading_agent.market_data import MarketDataProvider
 logger = logging.getLogger(__name__)
 
 
+# ----------------------------------------------------------------------
+# ETF leadership anchor map
+# ----------------------------------------------------------------------
+# For ETFs, raw "vs-SPY" relative strength is a poor signal because:
+#   * SPY-vs-SPY is degenerately zero
+#   * Sector ETFs (XLK, XLF, …) co-move with SPY by construction
+# Anchoring each ticker to a **sibling** benchmark (e.g. QQQ vs SPY,
+# IWM vs SPY, sector ETFs vs SPY) yields a meaningful "leadership"
+# differential that doesn't decay to zero on benchmark instruments.
+#
+# To extend: add a new ticker → anchor_ticker entry here.  Tickers
+# missing from this map fall through to the default benchmark ``SPY``;
+# callers receive ``None`` from the data layer when ticker == anchor,
+# which the classifier treats as "no leadership signal".
+LEADERSHIP_ANCHORS: dict = {
+    "SPY": "QQQ",     # broad market vs growth proxy
+    "QQQ": "SPY",     # growth vs broad market
+    "IWM": "SPY",     # small-cap vs broad market
+    "DIA": "SPY",     # blue-chip vs broad market
+    "XLK": "SPY",     # tech sector vs broad market
+    "XLF": "SPY",     # financial sector vs broad market
+    "XLE": "SPY",     # energy sector vs broad market
+    "XLV": "SPY",     # healthcare sector vs broad market
+    "XLY": "SPY",     # cons. discretionary vs broad market
+    "XLI": "SPY",     # industrial sector vs broad market
+    "XLP": "SPY",     # cons. staples vs broad market
+    "XLU": "SPY",     # utilities sector vs broad market
+    "XLB": "SPY",     # materials sector vs broad market
+    "XLC": "SPY",     # comms sector vs broad market
+    "XLRE": "SPY",    # real-estate sector vs broad market
+}
+
+# Inter-market gate threshold: when VIX 5-min change z-score exceeds
+# this floor, suppress new bullish-premium openings (Bull Put, Iron
+# Condor put-wing).  +2σ corresponds to roughly the top 2.3% of the
+# rolling distribution under a normal assumption — i.e. genuine fear
+# spikes, not routine intraday noise.
+VIX_INHIBIT_ZSCORE: float = 2.0
+
+
 class Regime(Enum):
     BULLISH = "bullish"
     BEARISH = "bearish"
@@ -42,9 +82,25 @@ class RegimeAnalysis:
     # Mean reversion signal — set when price touches a 3-std Bollinger Band
     mean_reversion_signal: bool = False
     mean_reversion_direction: str = ""    # "upper" or "lower"
-    # Relative strength vs benchmarks (5-min return differential)
-    relative_strength_vs_spy: float = 0.0
-    relative_strength_vs_qqq: float = 0.0
+    # ------------------------------------------------------------------
+    # ETF macro signals (Items 1, 2, 3 of the ETF-only patch)
+    # ------------------------------------------------------------------
+    # Item 1 + 2: per-ticker leadership anchor (the sibling we compare
+    # against) plus the Z-scored 5-min return differential vs that
+    # anchor.  ``leadership_anchor`` is "" when the ticker is its own
+    # benchmark or no anchor is configured; ``leadership_zscore`` is
+    # 0.0 in that case (no signal).
+    leadership_anchor: str = ""
+    leadership_zscore: float = 0.0       # Z-score of (ticker - anchor) 5-min return diff
+    leadership_raw_diff: float = 0.0     # last raw differential (informational)
+    # Item 3: VIX inter-market gate.  ``vix_zscore`` is the 5-min change
+    # in ^VIX z-scored against its own intraday distribution; positive
+    # values indicate inter-market fear.  ``inter_market_inhibit_bullish``
+    # is the consumed boolean used by the strategy planner — True when
+    # the gate fires (vix_zscore above VIX_INHIBIT_ZSCORE).
+    vix_zscore: float = 0.0
+    inter_market_inhibit_bullish: bool = False
+    # ------------------------------------------------------------------
     # Capital retainment guards
     iv_rank: float = 0.0               # realized-vol percentile rank 0-100
     high_iv_warning: bool = False      # True when iv_rank > 95 (extreme instability)
@@ -103,17 +159,42 @@ class RegimeClassifier:
         mean_reversion_direction = ("upper" if mr_upper
                                     else "lower" if mr_lower else "")
 
-        # Relative strength: 5-min return vs SPY and QQQ
-        rs_vs_spy = 0.0
-        rs_vs_qqq = 0.0
-        if ticker not in ("SPY", "QQQ") and hasattr(self.data, "get_5min_return"):
-            ticker_ret = self.data.get_5min_return(ticker)
-            spy_ret = self.data.get_5min_return("SPY")
-            qqq_ret = self.data.get_5min_return("QQQ")
-            if ticker_ret is not None and spy_ret is not None:
-                rs_vs_spy = ticker_ret - spy_ret
-            if ticker_ret is not None and qqq_ret is not None:
-                rs_vs_qqq = ticker_ret - qqq_ret
+        # ------------------------------------------------------------------
+        # Item 1+2: Z-scored leadership vs the configured anchor benchmark.
+        # ------------------------------------------------------------------
+        # The pre-ETF code compared every ticker against SPY *and* QQQ
+        # using a flat 0.1% threshold.  That broke for ETFs in two ways:
+        # (a) SPY-vs-SPY is degenerately zero, so SPY never tripped the
+        # bias; (b) sector ETFs co-move with SPY by construction so the
+        # raw differential rarely crossed any flat threshold.  The new
+        # approach picks one anchor per ticker (LEADERSHIP_ANCHORS) and
+        # Z-scores the differential against its own intraday distribution
+        # — a 1.5σ leadership move is meaningful regardless of the
+        # ticker's idiosyncratic volatility.
+        leadership_anchor = LEADERSHIP_ANCHORS.get(ticker, "")
+        leadership_zscore = 0.0
+        leadership_raw_diff = 0.0
+        if leadership_anchor and hasattr(self.data, "get_leadership_zscore"):
+            result = self.data.get_leadership_zscore(ticker, leadership_anchor)
+            if result is not None:
+                leadership_raw_diff, leadership_zscore = result
+
+        # ------------------------------------------------------------------
+        # Item 3: VIX inter-market gate.
+        # ------------------------------------------------------------------
+        # When the volatility index spikes >2σ in 5 minutes vs its rolling
+        # mean, suppress new bullish-premium openings (Bull Put, Iron
+        # Condor put-wing).  This guards short-DTE positions against the
+        # macro-fear regime that historically eats credit spreads alive.
+        # The signal is a soft inhibit — the planner can still open
+        # bearish strategies (Bear Call) when the gate fires.
+        vix_zscore = 0.0
+        inter_market_inhibit_bullish = False
+        if hasattr(self.data, "get_vix_zscore"):
+            vix_result = self.data.get_vix_zscore()
+            if vix_result is not None:
+                _, vix_zscore = vix_result
+                inter_market_inhibit_bullish = vix_zscore > VIX_INHIBIT_ZSCORE
 
         # IV rank from realized-volatility percentile over last 200 days.
         # We use rolling 20-day annualised realized vol as an IV proxy and
@@ -137,18 +218,24 @@ class RegimeClassifier:
             reasoning=reasoning,
             mean_reversion_signal=mean_reversion_signal,
             mean_reversion_direction=mean_reversion_direction,
-            relative_strength_vs_spy=rs_vs_spy,
-            relative_strength_vs_qqq=rs_vs_qqq,
+            leadership_anchor=leadership_anchor,
+            leadership_zscore=leadership_zscore,
+            leadership_raw_diff=leadership_raw_diff,
+            vix_zscore=vix_zscore,
+            inter_market_inhibit_bullish=inter_market_inhibit_bullish,
             iv_rank=iv_rank,
             high_iv_warning=high_iv_warning,
         )
         logger.info(
             "[%s] Regime → %s | Price=%.2f SMA50=%.2f SMA200=%.2f "
-            "Slope=%.4f BB=%.4f RSI=%.1f MR=%s RS_SPY=%.4f "
+            "Slope=%.4f BB=%.4f RSI=%.1f MR=%s "
+            "Lead=%s(z=%+.2f) VIXz=%+.2f InhibitBull=%s "
             "IVRank=%.1f HighVol=%s",
             ticker, regime.value, current_price, current_sma_50,
             current_sma_200, sma_50_slope, bb_width, current_rsi,
-            mean_reversion_direction or "none", rs_vs_spy,
+            mean_reversion_direction or "none",
+            leadership_anchor or "none", leadership_zscore,
+            vix_zscore, inter_market_inhibit_bullish,
             iv_rank, high_iv_warning,
         )
         return analysis

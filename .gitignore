@@ -9,4 +9,3 @@ dist/
 build/
 .venv/
 .vscode/launch.json
-BACKTEST_FIX_SUMMARY.md

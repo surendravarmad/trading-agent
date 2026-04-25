@@ -35,7 +35,10 @@ def build_thesis(analysis, plan, verdict) -> Dict[str, str]:
     to keep this module dependency-free and easy to test.
     """
     mr_signal = getattr(analysis, "mean_reversion_signal", False)
-    rs_vs_spy = getattr(analysis, "relative_strength_vs_spy", 0.0)
+    leadership_z = getattr(analysis, "leadership_zscore", 0.0)
+    leadership_anchor = getattr(analysis, "leadership_anchor", "")
+    vix_z = getattr(analysis, "vix_zscore", 0.0)
+    inhibit_bull = getattr(analysis, "inter_market_inhibit_bullish", False)
 
     why = (
         f"{analysis.regime.value.upper()} regime — "
@@ -50,9 +53,16 @@ def build_thesis(analysis, plan, verdict) -> Dict[str, str]:
             f"Price touched {direction} 3-std Bollinger Band — "
             f"mean reversion trade triggered"
         )
-    elif rs_vs_spy > 0.001:
+    elif inhibit_bull:
+        # VIX inter-market gate fired — surface this as the trigger so the
+        # journal records *why* a Bull Put was demoted to Bear Call.
         why_now = (
-            f"Ticker outperforming SPY by {rs_vs_spy * 100:.2f}% "
+            f"VIX inter-market inhibit (z={vix_z:+.2f} σ) — "
+            f"bullish premium suppressed, demoted to bearish leg"
+        )
+    elif leadership_anchor and leadership_z > 1.5:
+        why_now = (
+            f"Leadership vs {leadership_anchor} z={leadership_z:+.2f} σ "
             f"in 5-min window — relative strength bias"
         )
     else:

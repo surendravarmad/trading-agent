@@ -88,14 +88,29 @@ class StrategyPlanner:
     ──────────────    ───────────────────────────────────────────
     MEAN_REVERSION    Mean Reversion Spread (highest priority)
     BULLISH           Bull Put Spread
-    BULLISH + RS      Bull Put Spread  (relative strength bias)
+    BULLISH + RS_Z    Bull Put Spread  (Z-scored leadership bias)
     BEARISH           Bear Call Spread
     SIDEWAYS          Iron Condor
-    SIDEWAYS + RS     Bull Put Spread  (relative strength bias)
+    SIDEWAYS + RS_Z   Bull Put Spread  (Z-scored leadership bias)
+
+    Inter-market gate (Item 3 of the ETF macro patch)
+    ─────────────────────────────────────────────────
+    When ``analysis.inter_market_inhibit_bullish`` is True (VIX 5-min
+    z-score > +2.0 σ) we suppress new bullish-premium openings:
+      * BULLISH      → demoted to Bear Call Spread
+      * SIDEWAYS     → demoted to Bear Call Spread (no put wing)
+      * MEAN_REVERSION (lower band) → falls through unchanged
     """
 
-    # Minimum relative strength differential (vs SPY or QQQ) to trigger bias
-    RS_THRESHOLD = 0.001   # 0.1% outperformance in 5-min window
+    # ETF-only RS gate: trigger Bull-Put bias when the ticker leads its
+    # configured anchor by ≥ 1.5 σ on the rolling intraday distribution.
+    # Replaces the prior flat 0.1 % threshold which:
+    #   - never fired for SPY (SPY-vs-SPY = 0.0)
+    #   - misfired during low-vol drift (sub-noise flickers tripped it)
+    # 1.5 σ ≈ 13th percentile two-tailed — a real leadership move, not
+    # routine noise, and still loose enough to actually fire several
+    # times per session in a normal regime.
+    RS_ZSCORE_THRESHOLD = 1.5
 
     # Legacy fixed width — retained as a floor; the active width is now
     # computed per-underlying by ``_pick_spread_width`` below.  At spot=$200
@@ -133,30 +148,55 @@ class StrategyPlanner:
 
         Priority order:
           1. Mean Reversion — 3-std BB touch overrides everything
-          2. Relative Strength bias — outperforming SPY/QQQ → Bull Put Spread
-          3. Normal regime → Bull Put / Bear Call / Iron Condor
+          2. Inter-market inhibit — VIX z-score > +2σ demotes Bull-Put / IC
+             to Bear Call (Item 3 of the ETF macro patch)
+          3. Z-scored leadership bias — leadership_zscore > 1.5 σ → Bull Put
+             (Items 1 & 2 of the ETF macro patch)
+          4. Normal regime → Bull Put / Bear Call / Iron Condor
         """
         expiration = self._pick_expiration()
         logger.info("[%s] Planning %s strategy, expiration %s",
                      ticker, analysis.regime.value, expiration)
 
         # --- Priority 1: Mean Reversion (3-std BB touch) ---
+        # Mean reversion intentionally bypasses the inter-market gate —
+        # a 3-std band touch IS a fear-spike condition, and the side
+        # of the trade is dictated by the touch direction, so the gate
+        # is redundant here.
         if analysis.regime == Regime.MEAN_REVERSION:
             return self._plan_mean_reversion(ticker, analysis, expiration)
 
-        # --- Priority 2: Relative Strength bias ---
-        rs_spy = getattr(analysis, "relative_strength_vs_spy", 0.0)
-        rs_qqq = getattr(analysis, "relative_strength_vs_qqq", 0.0)
-        rs_outperforming = (rs_spy > self.RS_THRESHOLD
-                            or rs_qqq > self.RS_THRESHOLD)
-        if rs_outperforming and analysis.regime in (Regime.BULLISH, Regime.SIDEWAYS):
+        # --- Priority 2: Inter-market inhibit (VIX gate) ---
+        # When the macro fear gate fires, refuse to open new bullish
+        # premium (Bull Put, Iron Condor put-wing).  Falls through to
+        # Bear Call — still a credit spread, but oriented to profit
+        # from the downside continuation that the VIX spike implies.
+        # If the regime is already Bearish, the gate is a no-op (we'd
+        # have picked Bear Call anyway).
+        inter_market_inhibit = getattr(
+            analysis, "inter_market_inhibit_bullish", False)
+        if inter_market_inhibit and analysis.regime in (
+                Regime.BULLISH, Regime.SIDEWAYS):
             logger.info(
-                "[%s] Relative strength bias → Bull Put Spread "
-                "(RS_SPY=%.4f, RS_QQQ=%.4f)",
-                ticker, rs_spy, rs_qqq)
+                "[%s] VIX inter-market inhibit (z=%.2f σ) → demoting "
+                "%s to Bear Call Spread",
+                ticker, getattr(analysis, "vix_zscore", 0.0),
+                analysis.regime.value)
+            return self._plan_bear_call(ticker, analysis, expiration)
+
+        # --- Priority 3: Z-scored leadership bias ---
+        leadership_z = getattr(analysis, "leadership_zscore", 0.0)
+        leadership_anchor = getattr(analysis, "leadership_anchor", "")
+        rs_outperforming = (leadership_anchor
+                            and leadership_z > self.RS_ZSCORE_THRESHOLD)
+        if rs_outperforming and analysis.regime in (
+                Regime.BULLISH, Regime.SIDEWAYS):
+            logger.info(
+                "[%s] Z-scored leadership bias (vs %s, z=%.2f σ) → Bull Put Spread",
+                ticker, leadership_anchor, leadership_z)
             return self._plan_bull_put(ticker, analysis, expiration)
 
-        # --- Priority 3: Normal regime mapping ---
+        # --- Priority 4: Normal regime mapping ---
         if analysis.regime == Regime.BULLISH:
             return self._plan_bull_put(ticker, analysis, expiration)
         elif analysis.regime == Regime.BEARISH:

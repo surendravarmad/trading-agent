@@ -23,6 +23,14 @@ class TestRegimeClassification:
         provider.compute_rsi = MarketDataProvider.compute_rsi
         provider.compute_bollinger_bands = MarketDataProvider.compute_bollinger_bands
         provider.sma_slope = MarketDataProvider.sma_slope
+        # ETF macro patch: classify() unpacks the (raw, z) tuple from these
+        # signals.  ``MagicMock(spec=…)`` would otherwise return a bare
+        # MagicMock that *is* iterable but yields zero items, causing
+        # "not enough values to unpack (expected 2, got 0)".  Stub to None
+        # so the classifier takes the no-signal branch and the new fields
+        # land at their dataclass defaults (0.0 / "" / False).
+        provider.get_leadership_zscore = MagicMock(return_value=None)
+        provider.get_vix_zscore = MagicMock(return_value=None)
         return RegimeClassifier(provider)
 
     def test_bullish_regime(self, bullish_prices):
@@ -57,8 +65,12 @@ class TestRegimeClassification:
         result = classifier.classify("SPY")
         assert isinstance(result.mean_reversion_signal, bool)
         assert result.mean_reversion_direction in ("", "upper", "lower")
-        assert isinstance(result.relative_strength_vs_spy, float)
-        assert isinstance(result.relative_strength_vs_qqq, float)
+        # ETF macro patch: Z-score leadership + VIX inter-market gate
+        assert isinstance(result.leadership_anchor, str)
+        assert isinstance(result.leadership_zscore, float)
+        assert isinstance(result.leadership_raw_diff, float)
+        assert isinstance(result.vix_zscore, float)
+        assert isinstance(result.inter_market_inhibit_bullish, bool)
 
 
 class TestMeanReversionDetection:
@@ -73,8 +85,9 @@ class TestMeanReversionDetection:
         provider.compute_rsi = MarketDataProvider.compute_rsi
         provider.compute_bollinger_bands = MarketDataProvider.compute_bollinger_bands
         provider.sma_slope = MarketDataProvider.sma_slope
-        # No 5-min return support so RS stays 0
-        del provider.get_5min_return
+        # No leadership / VIX support so the new signals stay at defaults
+        del provider.get_leadership_zscore
+        del provider.get_vix_zscore
         return RegimeClassifier(provider)
 
     def test_upper_3std_touch_gives_mean_reversion(self, bullish_prices):
@@ -113,3 +126,104 @@ class TestMeanReversionDetection:
         result = classifier.classify("SPY")
         assert result.regime != Regime.MEAN_REVERSION
         assert result.mean_reversion_signal is False
+
+
+class TestLeadershipAnchorMap:
+    """Item 1: every ticker resolves to a sibling anchor (not itself)."""
+
+    def test_spy_anchor_is_qqq(self):
+        from trading_agent.regime import LEADERSHIP_ANCHORS
+        assert LEADERSHIP_ANCHORS["SPY"] == "QQQ"
+
+    def test_qqq_anchor_is_spy(self):
+        from trading_agent.regime import LEADERSHIP_ANCHORS
+        assert LEADERSHIP_ANCHORS["QQQ"] == "SPY"
+
+    def test_iwm_and_sectors_anchor_to_spy(self):
+        from trading_agent.regime import LEADERSHIP_ANCHORS
+        for sector in ("IWM", "XLK", "XLF", "XLE", "XLV", "XLY",
+                       "XLI", "XLP", "XLU", "XLB", "XLC", "XLRE"):
+            assert LEADERSHIP_ANCHORS[sector] == "SPY", (
+                f"{sector} should anchor to SPY")
+
+    def test_no_self_anchor(self):
+        """Self-anchoring is degenerate (raw diff always zero)."""
+        from trading_agent.regime import LEADERSHIP_ANCHORS
+        for ticker, anchor in LEADERSHIP_ANCHORS.items():
+            assert ticker != anchor
+
+
+class TestZScoreLeadershipIntegration:
+    """Item 2: classify() reads leadership_zscore via the data provider."""
+
+    def _make_classifier(self, prices, *, leadership=None, vix=None,
+                         current_price=None):
+        provider = MagicMock(spec=MarketDataProvider)
+        provider.fetch_historical_prices.return_value = prices
+        provider.get_current_price.return_value = float(
+            current_price if current_price is not None
+            else prices["Close"].iloc[-1])
+        provider.compute_sma = MarketDataProvider.compute_sma
+        provider.compute_rsi = MarketDataProvider.compute_rsi
+        provider.compute_bollinger_bands = MarketDataProvider.compute_bollinger_bands
+        provider.sma_slope = MarketDataProvider.sma_slope
+        provider.get_leadership_zscore = MagicMock(return_value=leadership)
+        provider.get_vix_zscore = MagicMock(return_value=vix)
+        return RegimeClassifier(provider), provider
+
+    def test_z_score_propagated_to_analysis(self, bullish_prices):
+        classifier, provider = self._make_classifier(
+            bullish_prices, leadership=(0.0008, 1.9), vix=None)
+        result = classifier.classify("SPY")
+        # Anchor lookup happens against LEADERSHIP_ANCHORS["SPY"] == "QQQ"
+        provider.get_leadership_zscore.assert_called_once_with("SPY", "QQQ")
+        assert result.leadership_anchor == "QQQ"
+        assert result.leadership_zscore == 1.9
+        assert result.leadership_raw_diff == 0.0008
+
+    def test_none_result_keeps_defaults(self, bullish_prices):
+        classifier, _ = self._make_classifier(
+            bullish_prices, leadership=None, vix=None)
+        result = classifier.classify("SPY")
+        assert result.leadership_zscore == 0.0
+        assert result.leadership_raw_diff == 0.0
+
+
+class TestVIXInterMarketGate:
+    """Item 3: VIX z-score > +2σ flips inter_market_inhibit_bullish to True."""
+
+    def _make_classifier(self, prices, *, vix):
+        provider = MagicMock(spec=MarketDataProvider)
+        provider.fetch_historical_prices.return_value = prices
+        provider.get_current_price.return_value = float(prices["Close"].iloc[-1])
+        provider.compute_sma = MarketDataProvider.compute_sma
+        provider.compute_rsi = MarketDataProvider.compute_rsi
+        provider.compute_bollinger_bands = MarketDataProvider.compute_bollinger_bands
+        provider.sma_slope = MarketDataProvider.sma_slope
+        provider.get_leadership_zscore = MagicMock(return_value=None)
+        provider.get_vix_zscore = MagicMock(return_value=vix)
+        return RegimeClassifier(provider)
+
+    def test_high_vix_zscore_inhibits_bullish(self, bullish_prices):
+        classifier = self._make_classifier(bullish_prices, vix=(0.4, 2.5))
+        result = classifier.classify("SPY")
+        assert result.vix_zscore == 2.5
+        assert result.inter_market_inhibit_bullish is True
+
+    def test_low_vix_zscore_does_not_inhibit(self, bullish_prices):
+        classifier = self._make_classifier(bullish_prices, vix=(0.05, 0.4))
+        result = classifier.classify("SPY")
+        assert result.vix_zscore == 0.4
+        assert result.inter_market_inhibit_bullish is False
+
+    def test_threshold_boundary_strictly_greater(self, bullish_prices):
+        """Exactly +2.0 σ is NOT enough — gate uses strict > comparison."""
+        classifier = self._make_classifier(bullish_prices, vix=(0.3, 2.0))
+        result = classifier.classify("SPY")
+        assert result.inter_market_inhibit_bullish is False
+
+    def test_none_vix_keeps_defaults(self, bullish_prices):
+        classifier = self._make_classifier(bullish_prices, vix=None)
+        result = classifier.classify("SPY")
+        assert result.vix_zscore == 0.0
+        assert result.inter_market_inhibit_bullish is False

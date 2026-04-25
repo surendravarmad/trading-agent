@@ -28,7 +28,8 @@ The agent runs a **two-stage loop** on every cycle: first it manages existing op
 │  │  Alpaca snap.    RSI-14         strikes        Liquidity check       │   │
 │  │  Bid/ask check   Bollinger BB   nearest Fri    Buying power          │   │
 │  │  (batch+cached)  3-std MR sig.  in DTE range   Daily DD CB           │   │
-│  │                  RS vs SPY/QQQ                                       │   │
+│  │                  Lead-z vs anchor                                    │   │
+│  │                  VIX-z gate (^VIX)                                   │   │
 │  │                       │                                              │   │
 │  │             ┌─────────┘   ← submitted after Phase II, resolved by V  │   │
 │  │             │                                                        │   │
@@ -69,11 +70,12 @@ Strategy selection follows a strict priority order:
 | Priority | Regime | Detection Rule | Strategy |
 |----------|--------|---------------|----------|
 | **1 (highest)** | **Mean Reversion** | Price touches 3-std Bollinger Band | Mean Reversion Spread |
-| 2 | **Bullish + RS** | Bullish AND ticker outperforming SPY/QQQ by >0.1% in 5-min window | Bull Put Spread (RS bias) |
-| 3 | **Sideways + RS** | Sideways AND ticker outperforming SPY/QQQ by >0.1% | Bull Put Spread (RS bias) |
-| 4 | **Bullish** | Price > SMA-200 AND SMA-50 slope > 0 | Bull Put Spread |
-| 5 | **Bearish** | Price < SMA-200 AND SMA-50 slope < 0 | Bear Call Spread |
-| 6 | **Sideways** | Between SMAs or narrow Bollinger Bands | Iron Condor |
+| 2 | **VIX inhibit** | `vix_zscore > +2σ` AND regime ∈ {Bullish, Sideways} | Bear Call Spread (demoted) |
+| 3 | **Bullish + Lead z** | Bullish AND `leadership_zscore > +1.5σ` vs anchor | Bull Put Spread (leadership bias) |
+| 4 | **Sideways + Lead z** | Sideways AND `leadership_zscore > +1.5σ` vs anchor | Bull Put Spread (leadership bias) |
+| 5 | **Bullish** | Price > SMA-200 AND SMA-50 slope > 0 | Bull Put Spread |
+| 6 | **Bearish** | Price < SMA-200 AND SMA-50 slope < 0 | Bear Call Spread |
+| 7 | **Sideways** | Between SMAs or narrow Bollinger Bands | Iron Condor |
 
 **SMA-50 slope units.** `MarketDataProvider.sma_slope()` returns the 5-day average **dollar change per day** of the SMA — a raw price delta, not a percentage. Every downstream consumer only reads the sign (`> 0` → bullish; `< 0` → bearish). Logs and the LLM analyst prompt annotate with `$/day` so a reader doesn't mistake the magnitude for a percentage.
 
@@ -86,9 +88,17 @@ When price reaches a **3-standard-deviation Bollinger Band** (statistically extr
 | Upper 3-std touch | Price extended to upside → expect reversion down | Bear Call Spread above current price |
 | Lower 3-std touch | Price extended to downside → expect reversion up | Bull Put Spread below current price |
 
-### Relative Strength Bias
+### Z-Scored Leadership Bias (ETF macro patch — Items 1 & 2)
 
-On every cycle, the agent computes each ticker's **5-minute return** via Alpaca bars and compares it to SPY and QQQ. If the ticker outperforms by >0.1% in the 5-min window, the strategy selection is biased toward a Bull Put Spread even in a sideways regime.
+The legacy "5-min return ticker vs SPY+QQQ, threshold 0.1%" was useless on an ETF-only deployment: SPY-vs-SPY is degenerately zero and a flat threshold ignores per-ticker volatility. The new path:
+
+1. **Per-ticker leadership anchor** — `LEADERSHIP_ANCHORS` in `regime.py` maps each ticker to a sibling benchmark (e.g. `SPY → QQQ`, `QQQ → SPY`, sector ETFs → SPY, `IWM → SPY`). To extend coverage, add a row to that dict.
+2. **Z-scored differential** — `MarketDataProvider.get_leadership_zscore(ticker, anchor)` returns `(raw_diff, z)` where `z` is the latest 5-min return differential normalised against its own rolling intraday distribution (population stdev over the last ~20 bars, with the first 2 open bars dropped to suppress the open-print spike).
+3. **Bias trigger** — `StrategyPlanner.RS_ZSCORE_THRESHOLD = 1.5`. When `leadership_zscore > 1.5σ` and the regime is Bullish or Sideways, the planner picks a **Bull Put Spread** instead of the default mapping. 1.5σ ≈ 13th-percentile two-tailed move — strong enough to filter noise, loose enough to actually fire.
+
+### Inter-Market Gate — VIX (ETF macro patch — Item 3)
+
+When inter-market fear spikes, short-DTE bullish premium is the worst position to hold. The classifier samples ^VIX (via `yfinance` — Alpaca doesn't carry the index) and Z-scores its 5-min level change. If `vix_zscore > +2.0σ`, `analysis.inter_market_inhibit_bullish = True` and the planner **demotes** Bull Put / Iron Condor to a **Bear Call Spread** for that cycle. Mean-reversion trades bypass the gate (the band touch already encodes the volatility condition).
 
 ### Adaptive Spread Width
 
@@ -115,6 +125,8 @@ Theta capture is concentrated in the **25-40 DTE** band, so the planner targets 
 | **Batch snapshot call** | `market_data.py` | All current prices retrieved in **one** Alpaca API call |
 | **TTL-based caches** | `market_data.py` | Historical prices (4 h), stock snapshots (60 s), option chains (3 min), 5-min intraday returns (60 s) |
 | **Benchmark dedupe** | `market_data.py` | `get_5min_return("SPY")` / `("QQQ")` calls are collapsed by the 60 s cache — one fetch per cycle |
+| **Leadership series cache** | `market_data.py` | `get_5min_return_series` caches the rolling 21-bar window per ticker for 60 s so the Z-scored leadership signal reuses one fetch across all anchors |
+| **VIX z-score cache** | `market_data.py` | Single global yfinance fetch per cycle (60 s TTL) for the inter-market gate |
 | **Cycle-scoped sentiment pool** | `sentiment_pipeline.py` | A single-worker `ThreadPoolExecutor` is created inside the cycle's `with pipeline:` block and shut down at the end — no stranded threads across cycles |
 | **Concurrent sentiment submit** | `agent.py` | Sentiment work is submitted after Phase II and resolved at Phase V; plan/risk rejection cancels the Future so no LLM call is wasted on a trade that wouldn't execute anyway |
 | **Tier-0 earnings short-circuit** | `earnings_calendar.py` | Authoritative `yfinance` earnings calendar — scheduled catalyst within 7d returns `event_risk=1.0` deterministically, skipping FinGPT and the verifier entirely |

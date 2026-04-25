@@ -492,3 +492,170 @@ class TestStocksFeedParam:
         provider.fetch_batch_snapshots(["SPY"])
 
         assert captured[0]["params"].get("feed") == "sip"
+
+
+class TestFiveMinReturnSeries:
+    """``get_5min_return_series`` — Item 2 dependency.
+
+    Returns up to ``window-1`` 5-minute returns, drops the first
+    ``OPEN_BAR_SKIP`` bars, and caches the result for one TTL.
+    """
+
+    def _bars_response(self, closes, monkeypatch):
+        from unittest.mock import MagicMock
+
+        def _get(url, *args, **kwargs):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json.return_value = {
+                "bars": [{"c": float(c)} for c in closes]
+            }
+            return resp
+
+        monkeypatch.setattr("requests.get", _get)
+
+    def test_drops_open_bars(self, monkeypatch):
+        """First ``OPEN_BAR_SKIP=2`` bars are dropped before computing returns."""
+        provider = MarketDataProvider("k", "s")
+        # 6 bars in → after skipping 2, 4 closes remain → 3 returns
+        self._bars_response([90, 95, 100, 101, 102, 103], monkeypatch)
+        series = provider.get_5min_return_series("SPY", window=21)
+        assert series is not None
+        assert len(series) == 3
+        # First post-skip return: 101/100 - 1 = 0.01
+        assert series[0] == pytest.approx(0.01)
+
+    def test_too_short_after_skip_returns_none(self, monkeypatch):
+        """If fewer than 2 bars remain after the open-skip, return None."""
+        provider = MarketDataProvider("k", "s")
+        # Only 3 bars → after skipping 2, only 1 close remains
+        self._bars_response([100, 101, 102], monkeypatch)
+        assert provider.get_5min_return_series("SPY", window=21) is None
+
+    def test_cache_hit_within_ttl(self, monkeypatch):
+        import time
+        provider = MarketDataProvider("k", "s")
+        provider._intraday_return_series_cache["SPY"] = (
+            [0.001, 0.002], time.monotonic() - 5)
+        monkeypatch.setattr(
+            "requests.get",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("network must not be called on cache hit")),
+        )
+        result = provider.get_5min_return_series("SPY")
+        assert result == [0.001, 0.002]
+
+    def test_network_failure_returns_none(self, monkeypatch):
+        import requests as _requests
+        provider = MarketDataProvider("k", "s")
+        monkeypatch.setattr(
+            "requests.get",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                _requests.RequestException("boom")),
+        )
+        assert provider.get_5min_return_series("SPY") is None
+
+
+class TestLeadershipZScore:
+    """``get_leadership_zscore`` — Item 2 main signal."""
+
+    def test_self_anchor_returns_none(self):
+        """Self-comparison is degenerate — must return None, not 0.0."""
+        provider = MarketDataProvider("k", "s")
+        assert provider.get_leadership_zscore("SPY", "SPY") is None
+
+    def test_outperforming_yields_positive_z(self, monkeypatch):
+        """Differential equal to its own σ above mean → z = +1.0."""
+        provider = MarketDataProvider("k", "s")
+        # Build deterministic series where the LAST diff is exactly +1σ above
+        # the rolling mean.  Use diff series [0.0, 0.0, 0.0, +stdev_of_set].
+        # SPY ret series and QQQ ret series chosen so SPY-QQQ matches above.
+        spy_series = [0.001, 0.002, 0.001, 0.005]
+        qqq_series = [0.001, 0.002, 0.001, 0.001]
+        # Diffs = [0, 0, 0, 0.004], mean = 0.001, stdev (population) = ~0.001732
+        # zscore of last diff (0.004) = (0.004 - 0.001) / 0.001732 ≈ +1.732
+        provider._intraday_return_series_cache["SPY"] = (
+            spy_series, __import__("time").monotonic())
+        provider._intraday_return_series_cache["QQQ"] = (
+            qqq_series, __import__("time").monotonic())
+        result = provider.get_leadership_zscore("SPY", "QQQ")
+        assert result is not None
+        raw, z = result
+        assert raw == pytest.approx(0.004)
+        assert z == pytest.approx(1.732, abs=0.01)
+
+    def test_zero_variance_returns_none(self):
+        """If the rolling stdev collapses to ~0, the gate is meaningless."""
+        provider = MarketDataProvider("k", "s")
+        # Diffs all identical → stdev = 0
+        provider._intraday_return_series_cache["SPY"] = (
+            [0.001, 0.002, 0.003], __import__("time").monotonic())
+        provider._intraday_return_series_cache["QQQ"] = (
+            [0.001, 0.002, 0.003], __import__("time").monotonic())
+        assert provider.get_leadership_zscore("SPY", "QQQ") is None
+
+    def test_missing_series_returns_none(self, monkeypatch):
+        """If either side fails to fetch, return None (no signal)."""
+        provider = MarketDataProvider("k", "s")
+        # Neither cached → both will hit network → cause network to fail
+        import requests as _requests
+        monkeypatch.setattr(
+            "requests.get",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                _requests.RequestException("boom")),
+        )
+        assert provider.get_leadership_zscore("SPY", "QQQ") is None
+
+
+class TestVIXZScore:
+    """``get_vix_zscore`` — Item 3 inter-market gate signal."""
+
+    def _patch_yf(self, monkeypatch, closes):
+        from unittest.mock import MagicMock
+        import pandas as pd
+        idx = pd.date_range("2026-04-25 09:30", periods=len(closes),
+                            freq="5min")
+        df = pd.DataFrame({"Close": [float(c) for c in closes]}, index=idx)
+        fake_ticker = MagicMock()
+        fake_ticker.history = MagicMock(return_value=df)
+        monkeypatch.setattr("yfinance.Ticker", lambda *a, **kw: fake_ticker)
+
+    def test_high_zscore_when_last_change_is_outlier(self, monkeypatch):
+        """Final 5-min jump much larger than the rolling mean → high z."""
+        provider = MarketDataProvider("k", "s")
+        # 6 closes — drop first 2, leaves 4 closes → 3 diffs
+        # Diffs = [0.0, 0.0, +1.0]   (mean 0.333, std 0.4714)
+        # last z ≈ (1.0 - 0.333) / 0.4714 ≈ +1.414
+        self._patch_yf(monkeypatch, [12, 13, 15.0, 15.0, 15.0, 16.0])
+        result = provider.get_vix_zscore(window=21)
+        assert result is not None
+        raw, z = result
+        assert raw == pytest.approx(1.0)
+        assert z == pytest.approx(1.414, abs=0.01)
+
+    def test_too_few_bars_returns_none(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        # 3 closes — only 1 left after skipping 2 → cannot compute
+        self._patch_yf(monkeypatch, [12, 13, 14])
+        assert provider.get_vix_zscore() is None
+
+    def test_yf_failure_returns_none(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        from unittest.mock import MagicMock
+        fake_ticker = MagicMock()
+        fake_ticker.history = MagicMock(side_effect=RuntimeError("yf down"))
+        monkeypatch.setattr("yfinance.Ticker", lambda *a, **kw: fake_ticker)
+        assert provider.get_vix_zscore() is None
+
+    def test_cache_hit_within_ttl(self, monkeypatch):
+        import time
+        provider = MarketDataProvider("k", "s")
+        provider._vix_zscore_cache = (0.4, 1.8, time.monotonic() - 5)
+        # yfinance must NOT be called when cache is fresh
+        monkeypatch.setattr(
+            "yfinance.Ticker",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("yfinance must not be called on cache hit")),
+        )
+        result = provider.get_vix_zscore()
+        assert result == (0.4, 1.8)

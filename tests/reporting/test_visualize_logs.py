@@ -14,6 +14,7 @@ Coverage
 
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -720,10 +721,10 @@ class TestParseArgs:
 
 def _signals_from_records(records: list) -> pd.DataFrame:
     """Build a signals DataFrame directly from raw record dicts (no file I/O)."""
-    import io
     lines = "\n".join(json.dumps(r) for r in records)
-    tmp = Path("/tmp/_test_signals_tmp.jsonl")
-    tmp.write_text(lines)
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".jsonl", delete=False) as f:
+        f.write(lines)
+        tmp = Path(f.name)
     try:
         return vl.load_signals(str(tmp))
     finally:

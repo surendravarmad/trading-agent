@@ -1,6 +1,11 @@
 """
-Configuration module — loads environment variables and provides
+Configuration package — loads environment variables and provides
 typed, validated settings for the entire trading agent.
+
+Re-exports from submodules so all existing imports continue to work:
+    from trading_agent.config import AppConfig, load_config
+    from trading_agent.config import TradingRulesConfig, load_trading_rules
+    from trading_agent.config.loader import StrategyRules, RegimeRules, ...
 """
 
 import os
@@ -8,7 +13,19 @@ from dataclasses import dataclass, field
 from typing import List
 from dotenv import load_dotenv
 
-from trading_agent.market_profile import MarketProfile, US_MARKET_PROFILE
+from trading_agent.market.market_profile import MarketProfile, US_MARKET_PROFILE
+from trading_agent.config.loader import (
+    TradingRulesConfig,
+    StrategyRules,
+    RegimeRules,
+    PositionMonitorRules,
+    AgentRules,
+    ExecutionRules,
+    CacheRules,
+    SentimentRules,
+    BacktestRules,
+    load_trading_rules,
+)
 
 
 @dataclass(frozen=True)
@@ -116,6 +133,8 @@ class AppConfig:
     # vendor-agnostic seam — a future venue swap replaces this field
     # without touching core strategy / risk code.
     market_profile: MarketProfile = field(default_factory=lambda: US_MARKET_PROFILE)
+    # Trader-tunable algorithm parameters loaded from trading_rules.yaml
+    rules: TradingRulesConfig = field(default_factory=TradingRulesConfig)
 
 
 def load_config(env_path: str = None) -> AppConfig:
@@ -202,4 +221,13 @@ def load_config(env_path: str = None) -> AppConfig:
     )
 
     return AppConfig(alpaca=alpaca, trading=trading, logging=logging_cfg,
-                     intelligence=intelligence)
+                     intelligence=intelligence, rules=load_trading_rules())
+
+
+__all__ = [
+    "AppConfig", "AlpacaConfig", "TradingConfig", "LoggingConfig",
+    "IntelligenceConfig", "load_config",
+    "TradingRulesConfig", "StrategyRules", "RegimeRules",
+    "PositionMonitorRules", "AgentRules", "ExecutionRules",
+    "CacheRules", "SentimentRules", "BacktestRules", "load_trading_rules",
+]

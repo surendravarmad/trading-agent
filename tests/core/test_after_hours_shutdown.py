@@ -182,8 +182,8 @@ class TestAfterHoursShutdown:
         """After 16:06 ET on a weekday → graceful_exit(0)."""
         agent = self._make_agent(tmp_path)
         with (
-            patch("trading_agent.agent._is_within_market_hours", return_value=False),
-            patch("trading_agent.agent._shutdown.graceful_exit") as mock_exit,
+            patch("trading_agent.core.agent._is_within_market_hours", return_value=False),
+            patch("trading_agent.core.agent._shutdown.graceful_exit") as mock_exit,
         ):
             agent.run_cycle()
             assert mock_exit.called, "graceful_exit must be called after hours"
@@ -195,8 +195,8 @@ class TestAfterHoursShutdown:
         """After-hours shutdown must write a journal entry."""
         agent = self._make_agent(tmp_path)
         with (
-            patch("trading_agent.agent._is_within_market_hours", return_value=False),
-            patch("trading_agent.agent._shutdown.graceful_exit"),
+            patch("trading_agent.core.agent._is_within_market_hours", return_value=False),
+            patch("trading_agent.core.agent._shutdown.graceful_exit"),
         ):
             agent.run_cycle()
             # The after-hours entry must be the first log_cycle_error call.
@@ -222,8 +222,8 @@ class TestAfterHoursShutdown:
         agent.position_monitor.fetch_open_positions = MagicMock(return_value=[])
 
         with (
-            patch("trading_agent.agent._is_within_market_hours", return_value=True),
-            patch("trading_agent.agent._shutdown.graceful_exit") as mock_exit,
+            patch("trading_agent.core.agent._is_within_market_hours", return_value=True),
+            patch("trading_agent.core.agent._shutdown.graceful_exit") as mock_exit,
         ):
             agent.run_cycle()
             # graceful_exit(0) must not fire for after-hours.  It MAY fire
@@ -255,8 +255,8 @@ class TestAfterHoursShutdown:
         agent.position_monitor.fetch_open_positions = MagicMock(return_value=[])
 
         with (
-            patch("trading_agent.agent._is_within_market_hours", return_value=False),
-            patch("trading_agent.agent._shutdown.graceful_exit") as mock_exit,
+            patch("trading_agent.core.agent._is_within_market_hours", return_value=False),
+            patch("trading_agent.core.agent._shutdown.graceful_exit") as mock_exit,
         ):
             agent.run_cycle()
             for call in mock_exit.call_args_list:
@@ -274,8 +274,8 @@ class TestAfterHoursShutdown:
         with (
             patch("trading_agent.market_hours.datetime",
                   **{"now.return_value": sat}),
-            patch("trading_agent.agent.datetime", **{"now.return_value": sat}),
-            patch("trading_agent.agent._shutdown.graceful_exit") as mock_exit,
+            patch("trading_agent.core.agent.datetime", **{"now.return_value": sat}),
+            patch("trading_agent.core.agent._shutdown.graceful_exit") as mock_exit,
         ):
             agent.run_cycle()
             assert mock_exit.called, "graceful_exit must fire on weekends"
@@ -287,8 +287,8 @@ class TestAfterHoursShutdown:
         """After-hours exit must use code 0 (clean stop), not 1 (error)."""
         agent = self._make_agent(tmp_path)
         with (
-            patch("trading_agent.agent._is_within_market_hours", return_value=False),
-            patch("trading_agent.agent._shutdown.graceful_exit") as mock_exit,
+            patch("trading_agent.core.agent._is_within_market_hours", return_value=False),
+            patch("trading_agent.core.agent._shutdown.graceful_exit") as mock_exit,
         ):
             agent.run_cycle()
             code = mock_exit.call_args[0][0] if mock_exit.call_args[0] \

@@ -28,6 +28,19 @@ Residual drift (documented, not yet closed):
     Residual: bar timescale (live=5min, backtest=whatever timeframe
     selects); open-bar-skip not re-implemented per session day.
 
+Live Quote Refresh — gating contract
+------------------------------------
+The Phase VI ``_refresh_live_quotes`` stage is intentionally a no-op
+in two scenarios.  Both gates live in ``run()`` (search for
+``refresh_eligible``) — DO NOT bypass them without updating
+``tests/test_streamlit/test_backtest_ui.py::TestRefreshGating``:
+
+  1. ``use_alpaca_historical=True`` → the historical plan IS the
+     truthful quote for that bar; refreshing against today's snapshot
+     overwrites honest economics with a stale-vs-actual quote.
+  2. ``(today - entry_dt) > _SNAPSHOT_FRESH_DAYS`` → today's snapshot
+     is structurally meaningless as a proxy for an old entry's quote.
+
 Toggles are **opt-in** on the Backtester class (defaults = None/False so
 existing unit tests keep passing) and default-**on** in the Streamlit UI
 so interactive runs are apples-to-apples with the live agent.
@@ -51,17 +64,16 @@ import yfinance as yf
 from scipy.stats import percentileofscore
 
 from trading_agent.config import load_config
+from trading_agent.config.loader import TradingRulesConfig
 from trading_agent.streamlit.components import (
     drawdown_chart,
     equity_curve_chart,
     regime_bar_chart,
 )
 
-# --- Shared agent constants -------------------------------------------------
-# Import the live-agent defaults rather than re-declaring them so a future
-# change in strategy.py / risk_manager.py / position_monitor.py flows straight
-# into the backtester.  If any of these imports ever fail (e.g. the module
-# rename), we'd rather crash loudly than silently drift.
+# --- Shared agent constants — sourced from trading_rules.yaml ---------------
+# All agent-parity values read from TradingRulesConfig so a change in
+# trading_rules.yaml flows into both the live agent and the backtester.
 from trading_agent.strategy import StrategyPlanner as _Planner
 from trading_agent.regime import (
     LEADERSHIP_ANCHORS,
@@ -69,31 +81,31 @@ from trading_agent.regime import (
 )
 from trading_agent.market_data import MarketDataProvider as _MDP
 
-# Z-score thresholds + window — sourced from the live agent so changes in
-# strategy.py / market_data.py automatically flow through to the backtester.
-RS_ZSCORE_THRESHOLD = _Planner.RS_ZSCORE_THRESHOLD
+_rules = TradingRulesConfig()
+
+# Z-score thresholds + window
+RS_ZSCORE_THRESHOLD = _rules.strategy.rs_zscore_threshold
 LEADERSHIP_WINDOW_BARS = _MDP.LEADERSHIP_WINDOW_BARS
 VIX_WINDOW_BARS = _MDP.VIX_WINDOW_BARS
 
 logger = logging.getLogger(__name__)
 
-# Option chain cache TTL (seconds) - matches market_data.py
-OPTION_CHAIN_TTL = 180  # 3 minutes
+# Option chain cache TTL — reads from YAML via module-level constant
+from trading_agent.market_data import OPTION_CHAIN_TTL  # noqa: E402
 
-STARTING_EQUITY = 100_000.0
-SPREAD_WIDTH = _Planner.SPREAD_WIDTH                     # 5.0
-COMMISSION_ROUND_TRIP = 2.60  # 4 legs × $0.65
+STARTING_EQUITY = _rules.backtest.starting_equity
+SPREAD_WIDTH = _rules.strategy.spread_width_floor
+COMMISSION_ROUND_TRIP = _rules.backtest.commission_round_trip
 
-# Agent-parity defaults (read via _Planner / hand-coded where the agent uses
-# runtime config instead of a class constant):
-AGENT_MIN_CREDIT_RATIO = 0.33       # strategy.StrategyPlanner(__init__ default)
-AGENT_MAX_DELTA        = 0.20       # strategy.StrategyPlanner(__init__ default)
-AGENT_MAX_RISK_PCT     = 0.02       # risk_manager.RiskManager(__init__ default)
-AGENT_HARD_STOP_MULT   = 3.0        # position_monitor.ExitMonitor default
-AGENT_STOP_LOSS_PCT    = 0.50       # position_monitor.ExitMonitor default
-AGENT_PROFIT_TARGET    = 0.50       # position_monitor.ExitMonitor default
-AGENT_HIGH_IV_THRESH   = 95.0       # regime.RegimeClassifier._compute_iv_rank
-AGENT_EARNINGS_LOOKAHEAD = 7        # IntelligenceConfig default
+# Agent-parity defaults — all sourced from TradingRulesConfig
+AGENT_MIN_CREDIT_RATIO   = 0.33       # kept for test backward compat (TradingConfig default)
+AGENT_MAX_DELTA          = 0.20       # kept for test backward compat (TradingConfig default)
+AGENT_MAX_RISK_PCT       = 0.02       # kept for test backward compat (TradingConfig default)
+AGENT_HARD_STOP_MULT     = _rules.position_monitor.hard_stop_multiplier
+AGENT_STOP_LOSS_PCT      = _rules.position_monitor.profit_target_pct
+AGENT_PROFIT_TARGET      = _rules.position_monitor.profit_target_pct
+AGENT_HIGH_IV_THRESH     = 95.0       # structural algorithm threshold — stays in code
+AGENT_EARNINGS_LOOKAHEAD = 7          # IntelligenceConfig default
 
 DEFAULT_TICKERS = ["SPY", "QQQ", "IWM"]
 DEFAULT_START = date.today() - timedelta(days=365)   # needs 200+ bars for SMA warmup
@@ -109,8 +121,8 @@ INTRADAY_HOLD_BARS = 12         # 12 × 5-min bars = 1 hour hold per intraday tr
 # cannot be computed).
 # Daily: 3% is realistic over a 45-day hold (SPY moves ~1% per day)
 # Intraday: 3% in 60 minutes is nearly impossible → use 0.5% so losses actually occur
-DAILY_OTM_PCT   = 0.03
-INTRADAY_OTM_PCT = 0.005
+DAILY_OTM_PCT    = _rules.backtest.daily_otm_pct
+INTRADAY_OTM_PCT = _rules.backtest.intraday_otm_pct
 
 # --- Sigma-based (delta-proxy) strike placement ----------------------------
 # Sigma multiplier defaults approximate standard short-delta targets:
@@ -1230,7 +1242,24 @@ class Backtester:
         List active option contracts for ``underlying`` expiring on
         ``expiration_date``.  Returns ``[{symbol, strike, type,
         expiration}]``.  Empty list on error.
+
+        Cached
+        ------
+        Result is memoized in ``self._contracts_cache`` keyed by
+        ``(underlying, expiration_date, option_type)``.  The catalogue
+        for a (ticker, expiration, type) tuple does not change within
+        a backtest session, so re-fetching for every 5-min bar wastes
+        thousands of API calls.  Cache lives for the lifetime of the
+        Backtester instance — long-running sessions that span multiple
+        trading days should construct a new instance.
         """
+        cache_key = (underlying, expiration_date, option_type or "")
+        if not hasattr(self, "_contracts_cache"):
+            self._contracts_cache: Dict[Tuple[str, str, str], List[Dict]] = {}
+        cached = self._contracts_cache.get(cache_key)
+        if cached is not None:
+            return cached
+
         url = f"{self._alpaca_broker_url()}/options/contracts"
         params: Dict[str, object] = {
             "underlying_symbols": underlying,
@@ -1265,6 +1294,11 @@ class Backtester:
                 next_page_token = data.get("next_page_token")
                 if not next_page_token:
                     break
+            # Only cache non-empty results — an empty list usually
+            # indicates a transient API error and we want a fresh retry
+            # on the next call rather than memoizing the failure.
+            if out:
+                self._contracts_cache[cache_key] = out
             return out
         except requests.RequestException as exc:
             logger.warning(
@@ -1323,50 +1357,111 @@ class Backtester:
         return out
 
     def _pick_alpaca_expiration(
-        self, ticker: str, entry_date: date, target_dte: int,
+        self,
+        ticker: str,
+        entry_date: date,
+        target_dte: int,
+        exclude: Optional[Set[str]] = None,
     ) -> Optional[str]:
         """
         Pick the expiration date in Alpaca's contract catalogue closest
         to ``entry_date + target_dte``.  Returns an ISO-date string or
         ``None`` when the catalogue lookup fails.
-        """
-        # Alpaca's /options/contracts supports expiration_date_gte/_lte
-        # filters so we can pull just a small window around the target.
-        window_lo = entry_date + timedelta(days=max(1, target_dte - 10))
-        window_hi = entry_date + timedelta(days=target_dte + 20)
-        url = f"{self._alpaca_broker_url()}/options/contracts"
-        params = {
-            "underlying_symbols": ticker,
-            "expiration_date_gte": window_lo.isoformat(),
-            "expiration_date_lte": window_hi.isoformat(),
-            "status": "active",
-            "type": "put",  # only need the expiry set, one type is enough
-            "limit": 10000,
-        }
-        try:
-            resp = self._alpaca_request(url, params=params, timeout=15)
-            if resp is None:
-                return None
-            resp.raise_for_status()
-            data = resp.json() or {}
-        except requests.RequestException as exc:
-            logger.warning(
-                "[%s] Alpaca expiry lookup failed (%s..%s): %s",
-                ticker, window_lo, window_hi, exc,
-            )
-            return None
 
-        expiries: Set[str] = set()
-        for c in data.get("option_contracts", []) or []:
-            exp = c.get("expiration_date")
-            if exp:
-                expiries.add(exp)
+        ``exclude`` lets the caller exclude expirations that have
+        already been tried and failed (e.g. ``no_bars_on_entry_day``)
+        so the fallback loop in ``_alpaca_historical_plan`` can request
+        the next-best candidate without re-picking the dud.
+
+        Cached
+        ------
+        The full expiration *set* for ``(ticker, entry_date, target_dte)``
+        is memoized in ``self._expiration_set_cache`` so 5-min-bar runs
+        within the same session don't re-scan the catalogue 78 times
+        per day.  The cache stores the unfiltered set; ``exclude`` is
+        applied at lookup time.  Without this cache the new fallback
+        loop multiplied catalogue scans by 3-4×, pushing 30-day 5-min
+        runtimes from minutes into multi-hour territory.
+        """
+        if not hasattr(self, "_expiration_set_cache"):
+            self._expiration_set_cache: Dict[
+                Tuple[str, str, int], Set[str]
+            ] = {}
+        cache_key = (ticker, entry_date.isoformat(), int(target_dte))
+        expiries = self._expiration_set_cache.get(cache_key)
+        if expiries is None:
+            # Alpaca's /options/contracts supports expiration_date_gte/_lte
+            # filters so we can pull just a small window around the target.
+            window_lo = entry_date + timedelta(days=max(1, target_dte - 10))
+            window_hi = entry_date + timedelta(days=target_dte + 20)
+            url = f"{self._alpaca_broker_url()}/options/contracts"
+            params = {
+                "underlying_symbols": ticker,
+                "expiration_date_gte": window_lo.isoformat(),
+                "expiration_date_lte": window_hi.isoformat(),
+                "status": "active",
+                "type": "put",  # only need the expiry set, one type is enough
+                "limit": 10000,
+            }
+            try:
+                resp = self._alpaca_request(url, params=params, timeout=15)
+                if resp is None:
+                    return None
+                resp.raise_for_status()
+                data = resp.json() or {}
+            except requests.RequestException as exc:
+                logger.warning(
+                    "[%s] Alpaca expiry lookup failed (%s..%s): %s",
+                    ticker, window_lo, window_hi, exc,
+                )
+                return None
+
+            expiries = set()
+            for c in data.get("option_contracts", []) or []:
+                exp = c.get("expiration_date")
+                if exp:
+                    expiries.add(exp)
+            # Only cache populated sets — empty result usually means
+            # transient catalogue failure and we want a fresh retry.
+            if expiries:
+                self._expiration_set_cache[cache_key] = expiries
+
+        if exclude:
+            expiries = expiries - set(exclude)
         if not expiries:
             return None
 
         target_dt = entry_date + timedelta(days=target_dte)
+
+        # Friday-weekly preference
+        # ------------------------
+        # Catalogue contains Mon/Wed/Thu/Fri weeklies on QQQ/SPY/IWM.
+        # Friday weeklies are *materially* more liquid: they receive
+        # 5-10× the volume of Mon/Wed expiries, and the bars endpoint
+        # only returns bars where trades printed.  When the picker's
+        # nearest-DTE choice falls on a Mon/Wed weekly we routinely get
+        # ``no_bars_on_entry_day`` rejections at deep-OTM strikes even
+        # though the contract is "listed" — there were simply no trades.
+        #
+        # Resolution: add a non-Friday penalty to the diff metric.
+        # Penalty = 4 days means a Friday weekly within 4 days of the
+        # target wins over a non-Friday at exact target.  Math:
+        #
+        #   target = Mon (entry+35d)
+        #   Mon @ 35d → diff = 0 + 4 = 4
+        #   Wed @ 37d → diff = 2 + 4 = 6
+        #   Fri @ 32d → diff = 3 + 0 = 3 ← wins
+        #   Fri @ 39d → diff = 4 + 0 = 4 (ties with Mon)
+        #
+        # Tiebreaker on equal effective diff: prefer earlier expiry
+        # (less theta exposure on the long leg) and Friday over non-
+        # Friday (so the Mon vs Fri+39 tie above goes to Friday).
+        NON_FRIDAY_PENALTY = 4
+
         best: Optional[str] = None
-        best_diff = float("inf")
+        best_diff: float = float("inf")
+        best_is_friday: bool = False
+        best_date: Optional[date] = None
         for exp in expiries:
             try:
                 d = date.fromisoformat(exp)
@@ -1374,9 +1469,25 @@ class Backtester:
                 continue
             if d <= entry_date:
                 continue
-            diff = abs((d - target_dt).days)
-            if diff < best_diff:
-                best_diff = diff
+            is_friday = d.weekday() == 4
+            raw_diff = abs((d - target_dt).days)
+            eff_diff = raw_diff + (0 if is_friday else NON_FRIDAY_PENALTY)
+            # Strict improvement on effective diff, then prefer Friday
+            # on ties, then prefer the earlier expiration.
+            better = False
+            if eff_diff < best_diff:
+                better = True
+            elif eff_diff == best_diff:
+                if is_friday and not best_is_friday:
+                    better = True
+                elif is_friday == best_is_friday and (
+                    best_date is None or d < best_date
+                ):
+                    better = True
+            if better:
+                best_diff = eff_diff
+                best_is_friday = is_friday
+                best_date = d
                 best = exp
         return best
 
@@ -1389,30 +1500,167 @@ class Backtester:
         underlying_price: float,
         sigma_annual: float,
         effective_sigma_mult: float,
-    ) -> Optional[Dict]:
+        hold_bars: Optional[int] = None,
+        bars_per_year: Optional[int] = None,
+    ) -> Tuple[Optional[Dict], str]:
         """
         Build a real-data trade plan for (ticker, entry_date) using
         Alpaca's historical contracts + bars endpoints.
 
-        Returns a dict with keys:
-            short_symbol, long_symbol, short_strike, long_strike,
-            expiration, option_type, credit, strike_distance_pct,
-            approx_abs_delta
-        or ``None`` when the data needed to form a plan isn't available.
+        Returns
+        -------
+        (plan, reason) : Tuple[Optional[Dict], str]
+            On success ``plan`` is a dict with keys::
+
+                short_symbol, long_symbol, short_strike, long_strike,
+                expiration, option_type, credit, strike_distance_pct,
+                approx_abs_delta
+
+            and ``reason`` is the empty string ``""``.
+
+            On failure ``plan`` is ``None`` and ``reason`` is a
+            structured one-line token of the form ``"<gate>: <context>"``
+            naming the *specific* upstream failure (no_expiration_in_window,
+            no_bars_on_entry_day, long_leg_off_grid, …).  The token before
+            the first ``:`` is also used as the funnel-gate suffix so per-
+            cause counters appear separately in ``self.rejections`` instead
+            of collapsing into one generic bucket.
+
+        σ-horizon contract
+        ------------------
+        The short-leg distance target is computed as ``effective_sigma_mult ×
+        sigma_annual × √(hold_bars / bars_per_year)``.  This matches the
+        synthetic σ-path (``_sigma_strike_distance``) and the live agent's
+        per-hold-horizon thinking.
+
+        When ``hold_bars`` / ``bars_per_year`` are not provided (legacy
+        callers), we fall back to the original DTE-horizon projection
+        (``√(dte_days / 252)``).  For daily backtests both forms are
+        numerically identical because ``hold_bars == target_dte`` and
+        ``bars_per_year == 252``.
+
+        For **intraday** backtests they differ dramatically:
+          * legacy DTE-horizon — projects σ over ~30 days regardless of
+            actual hold (1 hour), pushing strikes ~13% OTM with |Δ|≈0.02.
+            Live agent never picks anything below the 0.15 MIN_DELTA floor
+            so the resulting trades are not apples-to-apples.
+          * hold-horizon (this path) — projects σ over the real 1-hour
+            hold, picking strikes ~1% OTM with |Δ|≈0.20-0.30, matching
+            what a 5-min live agent would actually trade.
         """
         if not self._alpaca_api_key or not self._alpaca_secret_key:
-            return None
+            return None, "missing_api_keys: ALPACA_API_KEY/SECRET not set"
         if underlying_price <= 0:
-            return None
+            return None, f"invalid_underlying_price: {underlying_price:.4f}"
 
-        expiration = self._pick_alpaca_expiration(ticker, entry_date, target_dte)
-        if not expiration:
-            logger.info(
-                "[%s] alpaca_historical: no expiration near %s+%dd",
+        # Expiration-fallback loop
+        # ------------------------
+        # Most ``no_bars_on_entry_day`` failures are not "the data is gone"
+        # but "the picker landed on a less-liquid weekly that didn't print
+        # any trades at the chosen strikes that day".  Retry with the
+        # next-best expiration — typically the next Friday weekly — before
+        # giving up.  Capped at MAX_FALLBACK_ATTEMPTS to bound API calls
+        # per candidate bar.
+        #
+        # Only data-availability failures (no_contracts_for_expiry,
+        # no_bars_on_entry_day, non_positive_credit) trigger a fallback.
+        # Contract-shape failures (no_otm_near_target, long_leg_off_grid,
+        # degenerate_bar_close) are deterministic given the expiration's
+        # strike grid — retrying a different expiration won't help.
+        #
+        # Cap is intentionally small: the Friday-weekly preference in
+        # ``_pick_alpaca_expiration`` lands on a liquid expiry on the
+        # first try ~95%+ of the time, so one retry catches the rare
+        # edge case where even the Friday weekly has no bars at the
+        # chosen strikes.  Keeping the cap low bounds API call volume
+        # under intraday backtests where we'd otherwise pay the
+        # catalogue-scan cost N× per candidate bar.
+        MAX_FALLBACK_ATTEMPTS = 2
+        excluded_expirations: Set[str] = set()
+        last_reason = ""
+
+        for attempt in range(MAX_FALLBACK_ATTEMPTS):
+            expiration = self._pick_alpaca_expiration(
                 ticker, entry_date, target_dte,
+                exclude=excluded_expirations or None,
             )
-            return None
+            if not expiration:
+                if attempt == 0:
+                    logger.info(
+                        "[%s] alpaca_historical: no expiration near %s+%dd",
+                        ticker, entry_date, target_dte,
+                    )
+                    return None, (
+                        f"no_expiration_in_window: {ticker} "
+                        f"target={entry_date}+{target_dte}d"
+                    )
+                # Exhausted all candidates after one+ retries.
+                return None, (
+                    f"no_bars_after_fallbacks: {ticker} {entry_date} "
+                    f"tried={sorted(excluded_expirations)} "
+                    f"last={last_reason or 'unknown'}"
+                )
 
+            plan, reason, retry = self._build_alpaca_plan_for_expiration(
+                ticker=ticker,
+                entry_date=entry_date,
+                regime=regime,
+                expiration=expiration,
+                underlying_price=underlying_price,
+                sigma_annual=sigma_annual,
+                effective_sigma_mult=effective_sigma_mult,
+                hold_bars=hold_bars,
+                bars_per_year=bars_per_year,
+            )
+            if plan is not None:
+                if attempt > 0:
+                    logger.info(
+                        "[%s] alpaca_historical: succeeded on fallback "
+                        "exp=%s after skipping %s",
+                        ticker, expiration, sorted(excluded_expirations),
+                    )
+                return plan, reason
+            if not retry:
+                # Non-fallbackable failure — return immediately.
+                return None, reason
+            # Fallbackable failure (no contracts / no bars / non-positive
+            # credit on this expiry) — exclude and try the next-best.
+            last_reason = reason
+            excluded_expirations.add(expiration)
+            logger.info(
+                "[%s] alpaca_historical: %s — falling back to next expiry",
+                ticker, reason.split(":", 1)[0],
+            )
+
+        # Exhausted MAX_FALLBACK_ATTEMPTS without success.
+        return None, (
+            f"no_bars_after_fallbacks: {ticker} {entry_date} "
+            f"tried={sorted(excluded_expirations)} "
+            f"last={last_reason or 'unknown'}"
+        )
+
+    def _build_alpaca_plan_for_expiration(
+        self,
+        *,
+        ticker: str,
+        entry_date: date,
+        regime: str,
+        expiration: str,
+        underlying_price: float,
+        sigma_annual: float,
+        effective_sigma_mult: float,
+        hold_bars: Optional[int],
+        bars_per_year: Optional[int],
+    ) -> Tuple[Optional[Dict], str, bool]:
+        """
+        Inner per-expiration builder used by ``_alpaca_historical_plan``.
+
+        Returns ``(plan, reason, retry)`` where ``retry`` is ``True``
+        when the failure mode is data-availability (caller should try
+        the next-best expiration) and ``False`` when the failure is
+        deterministic given the expiration's strike grid (caller should
+        return immediately).
+        """
         # Pull both sides for iron condor; for directional regimes we only
         # need one but fetching both is cheap and simplifies logic.
         contracts_p = self._fetch_alpaca_option_contracts(ticker, expiration, "put")
@@ -1422,16 +1670,30 @@ class Backtester:
                 "[%s] alpaca_historical: no contracts for exp %s",
                 ticker, expiration,
             )
-            return None
+            return None, f"no_contracts_for_expiry: {ticker} exp={expiration}", True
 
-        # σ-distance target for the short leg (same math as sigma_path).
+        # σ-distance target for the short leg.  See class docstring above
+        # for the hold-horizon vs DTE-horizon discussion.
         dte_days = max(1, (date.fromisoformat(expiration) - entry_date).days)
-        # Convert annualized σ to the expiry horizon, then scale by sigma_mult.
+        if hold_bars and bars_per_year and hold_bars > 0 and bars_per_year > 0:
+            horizon_frac = hold_bars / bars_per_year
+            horizon_label = f"hold={hold_bars}/{bars_per_year}"
+        else:
+            # Legacy DTE-horizon fallback (kept for backward compatibility
+            # with callers / tests that don't pass the new kwargs).
+            horizon_frac = dte_days / 252.0
+            horizon_label = f"dte={dte_days}/252"
         if sigma_annual > 0:
-            sigma_hold = sigma_annual * np.sqrt(dte_days / 252.0)
+            sigma_hold = sigma_annual * np.sqrt(horizon_frac)
         else:
             sigma_hold = 0.01
         target_distance = max(0.001, effective_sigma_mult * sigma_hold)
+        logger.debug(
+            "[%s] alpaca_historical horizon: %s σ_annual=%.4f → "
+            "σ_hold=%.4f, target_dist=%.2f%%",
+            ticker, horizon_label, sigma_annual, sigma_hold,
+            target_distance * 100,
+        )
         target_short_strike = (
             underlying_price * (1 - target_distance)
             if regime == "bullish"
@@ -1447,7 +1709,11 @@ class Backtester:
                 "[%s] alpaca_historical: no %ss for exp %s",
                 ticker, option_type, expiration,
             )
-            return None
+            # Different option type may exist on a different expiration —
+            # treat as fallbackable.
+            return None, (
+                f"no_contracts_for_type: {ticker} {option_type}s exp={expiration}"
+            ), True
 
         # Pick the strike closest to target on the OTM side.
         if option_type == "put":
@@ -1461,7 +1727,11 @@ class Backtester:
                 "[%s] alpaca_historical: no OTM %ss near target strike %.2f",
                 ticker, option_type, target_short_strike,
             )
-            return None
+            # Strike-grid issue — same grid likely on next expiry too.
+            return None, (
+                f"no_otm_near_target: {ticker} {option_type} "
+                f"target={target_short_strike:.2f} spot={underlying_price:.2f}"
+            ), False
         short_leg = otm[0]
         short_strike = float(short_leg["strike"])
 
@@ -1489,7 +1759,12 @@ class Backtester:
                 "[%s] alpaca_historical: no long %s strike near %.2f",
                 ticker, option_type, long_strike_target,
             )
-            return None
+            # Strike-grid issue — won't change on next expiry.
+            return None, (
+                f"long_leg_off_grid: {ticker} {option_type} "
+                f"target={long_strike_target:.2f} short={short_strike:.2f} "
+                f"width={self.spread_width}"
+            ), False
 
         # Fetch entry-day bars for both legs to price the credit.
         bars = self._fetch_alpaca_option_bars(
@@ -1504,7 +1779,13 @@ class Backtester:
                 "[%s] alpaca_historical: no bars on %s for %s / %s",
                 ticker, entry_date, short_leg["symbol"], long_leg["symbol"],
             )
-            return None
+            # Pure data-availability failure — different expiry may have
+            # bars where this one doesn't.  Mark as fallbackable.
+            return None, (
+                f"no_bars_on_entry_day: {ticker} {entry_date} "
+                f"short={short_leg['symbol']}({len(short_bars)}b) "
+                f"long={long_leg['symbol']}({len(long_bars)}b)"
+            ), True
 
         # Use the first bar on-or-after entry_date.  Alpaca returns UTC
         # timestamps so the entry-day bar is normally index 0.
@@ -1516,7 +1797,11 @@ class Backtester:
                 "(short=%.4f, long=%.4f)",
                 ticker, short_close, long_close,
             )
-            return None
+            # Bar exists but its close is broken — treat as fallbackable.
+            return None, (
+                f"degenerate_bar_close: {ticker} {entry_date} "
+                f"short={short_close:.4f} long={long_close:.4f}"
+            ), True
         credit = max(0.0, short_close - long_close)
         if credit <= 0.0:
             logger.info(
@@ -1524,7 +1809,11 @@ class Backtester:
                 "(short=%.4f, long=%.4f)",
                 ticker, credit, entry_date, short_close, long_close,
             )
-            return None
+            # Stale / illiquid quote on this expiry — try the next one.
+            return None, (
+                f"non_positive_credit: {ticker} {entry_date} "
+                f"credit={credit:.4f} short={short_close:.4f} long={long_close:.4f}"
+            ), True
 
         strike_distance_pct = abs(short_strike - underlying_price) / underlying_price
         # Estimate |Δ| from the chosen σ-distance (matches the σ-path).
@@ -1544,7 +1833,7 @@ class Backtester:
             "credit": credit,
             "strike_distance_pct": strike_distance_pct,
             "approx_abs_delta": approx_abs_delta,
-        }
+        }, "", False
 
     def _simulate_alpaca_historical(
         self,
@@ -2099,8 +2388,41 @@ class Backtester:
                     "(yfinance returned empty) — VIX gate disabled."
                 )
 
-        for ticker in tickers:
+        # ── Run-level startup banner ──────────────────────────────────────
+        # Single INFO line so the operator can confirm the run actually
+        # started (and with what configuration) the moment they hit
+        # "Run Backtest" — even before the first ticker download finishes.
+        # Pairs with the per-ticker startup line below to make a hung run
+        # visually distinct from a slow-but-healthy one.
+        mode_label = (
+            "alpaca-historical" if self.use_alpaca_historical
+            else ("snapshot+sigma" if use_sigma_path else "fixed-%-OTM")
+        )
+        logger.info(
+            "Backtest starting: %d ticker(s) %s, %s..%s, timeframe=%s, "
+            "mode=%s, macro_signals=%s, agent_parity=%s",
+            len(tickers), list(tickers), start, end, timeframe,
+            mode_label, self.use_macro_signals,
+            any([
+                self.min_credit_ratio is not None,
+                self.max_delta is not None,
+                self.max_risk_pct is not None,
+                self.use_iv_gate,
+                self.use_earnings_gate,
+            ]),
+        )
+
+        # Progress signpost cadence — emit every ``progress_every`` bars
+        # (per ticker).  Tuned so daily runs (~250 bars/yr) emit a few
+        # lines per ticker and 5-min runs (~1500 bars/30d) emit ~15.
+        progress_every = max(1, 100 if not is_intraday else 200)
+
+        for t_idx, ticker in enumerate(tickers, start=1):
             try:
+                logger.info(
+                    "[%s] (%d/%d) Downloading %s bars for %s..%s",
+                    ticker, t_idx, len(tickers), timeframe, start, end,
+                )
                 # auto_adjust=False mirrors market_data.MarketDataProvider
                 # (task #2) — the live agent reasons on raw closes, not
                 # dividend-/split-adjusted closes, so the backtester must
@@ -2122,6 +2444,9 @@ class Backtester:
                            else "check ticker symbol or try a wider date range")
                         + ")"
                     )
+                    logger.warning(
+                        "[%s] yfinance returned no rows — skipping ticker", ticker,
+                    )
                     continue
                 # Handle multi-level columns returned by recent yfinance versions
                 if isinstance(raw.columns, pd.MultiIndex):
@@ -2130,6 +2455,10 @@ class Backtester:
                 prices: pd.Series = raw["Close"].dropna()
             except Exception as exc:
                 skipped.append(f"{ticker} (download error: {exc})")
+                logger.warning(
+                    "[%s] yfinance download error: %s — skipping ticker",
+                    ticker, exc,
+                )
                 continue
 
             min_bars = warmup_bars + hold_bars + 1
@@ -2143,13 +2472,48 @@ class Backtester:
                        else "extend your date range to at least 1 year")
                     + ")"
                 )
+                logger.warning(
+                    "[%s] insufficient bars (%d < %d minimum) — skipping ticker",
+                    ticker, len(prices), min_bars,
+                )
                 continue
 
+            # Per-ticker startup signpost so the operator can see WHICH
+            # ticker is currently being processed.  Pairs with the
+            # periodic progress line below for stuck-vs-slow diagnosis.
+            ticker_entries_before = len(all_trades)
+            ticker_t0 = time.monotonic()
+            logger.info(
+                "[%s] Beginning simulation: %d bars (warmup=%d, hold=%d) "
+                "→ ~%d candidate windows",
+                ticker, len(prices), warmup_bars, hold_bars,
+                max(0, (len(prices) - warmup_bars) // max(1, hold_bars)),
+            )
+
             last_entry_idx = -hold_bars
+            last_progress_log_i = warmup_bars
             for i in range(warmup_bars, len(prices)):
+                # Periodic progress signpost (per-ticker, INFO level).
+                # Lets the operator confirm the loop is alive and see
+                # roughly how far through the bars we are.
+                if i - last_progress_log_i >= progress_every:
+                    logger.info(
+                        "[%s] Progress: bar %d/%d (%.0f%%), "
+                        "%d entries so far this ticker, elapsed %.1fs",
+                        ticker, i, len(prices),
+                        100.0 * i / max(1, len(prices)),
+                        len(all_trades) - ticker_entries_before,
+                        time.monotonic() - ticker_t0,
+                    )
+                    last_progress_log_i = i
+
                 if i - last_entry_idx < hold_bars:
                     continue
                 if equity <= 0:
+                    logger.info(
+                        "[%s] Equity exhausted ($%.2f) — halting at bar %d",
+                        ticker, equity, i,
+                    )
                     break
 
                 regime = self._classify_bars(prices, i, warmup_bars)
@@ -2216,33 +2580,57 @@ class Backtester:
                         prices, i, vol_window, bars_per_year,
                     )
                     underlying_px = float(prices.iloc[i])
-                    alpaca_historical_plan = self._alpaca_historical_plan(
-                        ticker=ticker,
-                        entry_date=entry_dt,
-                        regime=regime,
-                        target_dte=hold_bars if not is_intraday else self.target_dte,
-                        underlying_price=underlying_px,
-                        sigma_annual=sigma_annual,
-                        effective_sigma_mult=(
-                            effective_sigma_mult if effective_sigma_mult > 0 else 1.0
-                        ),
+                    alpaca_historical_plan, alpaca_reject_reason = (
+                        self._alpaca_historical_plan(
+                            ticker=ticker,
+                            entry_date=entry_dt,
+                            regime=regime,
+                            # ``target_dte`` controls EXPIRATION pick; for
+                            # intraday we still want a 30-40 DTE option to
+                            # collect theta over the position lifetime.
+                            target_dte=(
+                                hold_bars if not is_intraday else self.target_dte
+                            ),
+                            underlying_price=underlying_px,
+                            sigma_annual=sigma_annual,
+                            effective_sigma_mult=(
+                                effective_sigma_mult
+                                if effective_sigma_mult > 0
+                                else 1.0
+                            ),
+                            # ``hold_bars`` / ``bars_per_year`` control
+                            # σ-DISTANCE projection.  Decoupling DTE from
+                            # hold horizon is the core of the fix:
+                            # intraday trades hold for ~1 hour even though
+                            # the option lives for 30+ days, and σ should
+                            # be projected over the actual hold.
+                            hold_bars=hold_bars,
+                            bars_per_year=bars_per_year,
+                        )
                     )
                     if alpaca_historical_plan is None:
                         # Record the skip in the funnel so the UI shows
-                        # why this bar produced no trade.
+                        # why this bar produced no trade.  ``alpaca_reject_reason``
+                        # is a structured "<token>: <context>" string from
+                        # ``_alpaca_historical_plan``; we use the token before
+                        # the first ``:`` as a sub-gate so per-cause counters
+                        # show up separately in ``self.rejections`` instead of
+                        # collapsing into one generic bucket.
                         self._funnel.considered += 1
+                        sub_gate = (
+                            alpaca_reject_reason.split(":", 1)[0].strip()
+                            or "unspecified"
+                        )
                         self._record_rejection(
                             ticker=ticker, entry_date=entry_dt,
-                            gate="alpaca_historical_no_data",
+                            gate=f"alpaca_historical:{sub_gate}",
                             phase="1. Real-data availability",
                             price=underlying_px, regime=regime,
                             strategy=strategy,
                             measured=None, threshold=None,
                             reason=(
-                                "Alpaca has no historical option contracts "
-                                "or bars for this (ticker, date) — outside "
-                                "the ~30-day options retention window or "
-                                "illiquid expiry/strike."
+                                alpaca_reject_reason
+                                or "alpaca_historical: unspecified failure"
                             ),
                         )
                         continue
@@ -2424,26 +2812,40 @@ class Backtester:
                 # IMPORTANT parity caveat — this gate is designed to reject
                 # *bad real Alpaca quotes* (stale chains, wide spreads,
                 # missing data).  When the backtester is using its synthetic
-                # `_credit_from_sigma` model, the credit is a deterministic
+                # ``_credit_from_sigma`` model, the credit is a deterministic
                 # function of σ-distance and *cannot* exhibit the data-
                 # quality failures the gate exists to catch.  Worse, the
                 # model's calibration (0.45 − 0.15·σ) puts credits below the
                 # 0.33 agent floor for any σ ≳ 0.8 — so leaving the gate on
                 # silently rejects nearly every candidate.
                 #
-                # Resolution: skip the gate when credit is synthetic, but
-                # keep it active when the user opts into a fixed-credit
-                # backtest (use_sigma_model=False) where credit_pct *is* a
-                # quote-like input the user might mis-set.
+                # Resolution: skip the gate when credit is **synthetic σ
+                # only** (i.e. σ-path strike-picking AND no real Alpaca
+                # chain).  Keep it active when:
+                #   * the user opts into a fixed-credit backtest
+                #     (``use_sigma_model=False``) where credit_pct *is*
+                #     a quote-like input the user might mis-set; or
+                #   * Alpaca-historical mode is on and the credit is
+                #     derived from real bar closes (in which case the
+                #     gate's data-quality rationale fully applies and
+                #     the synthetic-calibration argument does not).
+                #
+                # Bug history (Apr 2026): this branch used to skip on
+                # ``not use_sigma_path`` alone, which silently disabled
+                # the gate in alpaca-historical+σ mode and let trades
+                # with C/W < 0.10 reach the trade journal even though
+                # ``min_credit_ratio=0.33`` was configured.  See
+                # ``TestCreditRatioGateAlpacaHistorical``.
+                credit_is_synthetic = use_sigma_path and not self.use_alpaca_historical
                 credit_to_width = credit / self.spread_width if self.spread_width else 0.0
-                if self.min_credit_ratio is not None and use_sigma_path:
+                if self.min_credit_ratio is not None and credit_is_synthetic:
                     # Record the skip exactly once per run so the funnel
                     # reflects that the gate is intentionally bypassed.
                     if "credit_ratio" not in self._funnel.skipped_phases:
                         self._funnel.skipped_phases.append("credit_ratio")
                 if (
                     self.min_credit_ratio is not None
-                    and not use_sigma_path           # synthetic credit ⇒ skip
+                    and not credit_is_synthetic      # only skip when σ-credit synthetic
                     and credit_to_width < self.min_credit_ratio
                 ):
                     self._record_rejection(
@@ -2485,14 +2887,41 @@ class Backtester:
                 self._funnel.after_max_risk += 1
 
                 otm_pct = INTRADAY_OTM_PCT if is_intraday else DAILY_OTM_PCT
-                
+
                 # ── Live Quote Refresh (Phase VI) ─────────────────────
                 # Mirror the live agent's executor._refresh_limit_price() pattern:
                 # fetch fresh option quotes immediately before execution and
                 # re-validate economics-bearing guardrails.  This prevents
                 # simulating trades on stale quotes that would be rejected
                 # in live trading.
-                if self._alpaca_api_key and self._alpaca_secret_key:
+                #
+                # Two gates govern when this stage actually runs:
+                #
+                #   1. NOT in alpaca_historical mode.  When historical mode
+                #      is on, the planning stage already fetched the REAL
+                #      option chain for entry_dt — there is no truer quote
+                #      we could refresh against.  Re-fetching today's
+                #      snapshot here would *replace* honest historical
+                #      economics with current-market quotes and produce
+                #      garbage drift warnings (e.g. $6 credits on $5-wide
+                #      spreads when the underlying has moved since entry).
+                #
+                #   2. Entry date within _SNAPSHOT_FRESH_DAYS.  Outside
+                #      that window, "today's quote" is structurally
+                #      meaningless as a proxy for "the quote at entry_dt"
+                #      — same reason the snapshot *planning* path is
+                #      disabled for stale dates (line ~2271 below).
+                #
+                # If you change either gate, update the corresponding
+                # tests in test_backtest_ui.py::TestRefreshGating.
+                refresh_age_days = (date.today() - entry_dt).days
+                refresh_eligible = (
+                    self._alpaca_api_key
+                    and self._alpaca_secret_key
+                    and not self.use_alpaca_historical
+                    and refresh_age_days <= self._SNAPSHOT_FRESH_DAYS
+                )
+                if refresh_eligible:
                     (
                         refreshed_strike_distance,
                         refreshed_credit,
@@ -2575,14 +3004,48 @@ class Backtester:
                 raw_date = prices.index[i]
                 entry_date = raw_date.date() if hasattr(raw_date, "date") else start
 
-                # For intraday, hold_days represents bars (each = 5 min), not calendar days
+                # For intraday, hold_days represents bars (each = 5 min), not calendar days.
+                #
+                # Trade-journal expiry_date contract
+                # ----------------------------------
+                # Bug history (Apr 2026): this column used to record
+                # ``entry_date + 1 day`` for every intraday trade,
+                # making it look like the agent was trading 0-DTE
+                # options when the planner actually picks ~30-DTE
+                # contracts (TARGET_DTE=35).  The value should reflect
+                # the OPTION's expiration, not the holding-period exit.
+                #
+                # Resolution:
+                #   * alpaca-historical mode → use the actual exp from
+                #     the plan dict (real OCC contract expiration).
+                #   * synthetic-σ daily mode → ``entry+hold_count`` is
+                #     a reasonable proxy because the synthetic model
+                #     has no notion of contract expiration distinct
+                #     from the hold horizon.
+                #   * synthetic-σ intraday mode → fall back to
+                #     ``entry + target_dte`` (the planner's intended
+                #     DTE), not entry+1, so the journal column reflects
+                #     the option being modeled, not the 1-hour hold.
+                if alpaca_historical_plan is not None:
+                    try:
+                        plan_expiry = date.fromisoformat(
+                            alpaca_historical_plan["expiration"]
+                        )
+                    except (KeyError, ValueError, TypeError):
+                        plan_expiry = entry_date + timedelta(days=self.target_dte)
+                    expiry_for_journal = plan_expiry
+                elif is_intraday:
+                    expiry_for_journal = entry_date + timedelta(days=self.target_dte)
+                else:
+                    expiry_for_journal = entry_date + timedelta(days=hold_count)
+
                 all_trades.append(
                     SimTrade(
                         ticker=ticker,
                         strategy=strategy,
                         regime=regime,
                         entry_date=entry_date,
-                        expiry_date=entry_date + timedelta(days=1 if is_intraday else hold_count),
+                        expiry_date=expiry_for_journal,
                         credit=credit,
                         max_loss=max_loss,
                         outcome=outcome,
@@ -2594,6 +3057,16 @@ class Backtester:
                     {"timestamp": pd.Timestamp(raw_date), "account_balance": equity}
                 )
                 self._funnel.simulated += 1
+
+            # Per-ticker completion signpost — counterpart to the per-ticker
+            # startup line above.  Lets the operator see the sweep finish
+            # ticker-by-ticker rather than waiting for the whole run.
+            ticker_entries = len(all_trades) - ticker_entries_before
+            logger.info(
+                "[%s] Done: %d entries, equity now $%.2f, ticker took %.1fs",
+                ticker, ticker_entries, equity,
+                time.monotonic() - ticker_t0,
+            )
 
         # Patch the funnel for gates that were intentionally skipped this
         # run (e.g. credit_ratio under σ-path).  Without this, the UI
@@ -3010,19 +3483,57 @@ def render_backtest_ui() -> None:
             if start_date >= end_date:
                 st.error("Start date must be before end date.")
                 return
-            result = _run_cached(
-                tuple(sorted(tickers)), start_date, end_date, timeframe, use_alpaca,
-                sigma_mult=sigma_mult_value,
-                loss_cut_multiplier=loss_cut_value,
-                min_credit_ratio=min_credit_ratio_val,
-                max_delta=max_delta_val,
-                max_risk_pct=max_risk_pct_val,
-                stop_loss_pct=stop_loss_pct_val,
-                use_iv_gate=use_iv_gate_val,
-                use_earnings_gate=use_earnings_gate_val,
-                earnings_lookahead_days=earnings_lookahead_val,
-                use_alpaca_historical=use_alpaca_historical,
-                use_macro_signals=use_macro_signals_val,
+            # ── User-visible run feedback ──────────────────────────────────
+            # Without the spinner the UI sits frozen for the entire run
+            # (often many minutes in alpaca_historical mode), making a
+            # healthy run indistinguishable from a hang.  The status
+            # caption echoes the run config so the operator can sanity-
+            # check what's actually executing.
+            mode_label = (
+                "alpaca-historical (real chains, ~30-day window)"
+                if use_alpaca_historical
+                else (
+                    "snapshot+sigma (synthetic credit)" if sigma_mult_value
+                    else "fixed-%-OTM (legacy)"
+                )
+            )
+            run_caption = (
+                f"Running backtest · {len(tickers)} ticker(s) · "
+                f"{start_date} → {end_date} · {timeframe} · "
+                f"mode={mode_label}"
+                + (" · macro-signals=ON" if use_macro_signals_val else "")
+                + (" · agent-parity=ON" if agent_parity else "")
+            )
+            run_status = st.empty()
+            run_status.info(
+                f"⏳ {run_caption}\n\n"
+                "Per-ticker progress is logged to the terminal Streamlit was "
+                "launched from (LOG_LEVEL=INFO by default). In `use_alpaca_"
+                "historical` mode this can take several minutes per ticker "
+                "due to the 180 req/min Alpaca rate limit — see the terminal "
+                "for live signposts."
+            )
+            run_t0 = time.monotonic()
+            with st.spinner(run_caption):
+                result = _run_cached(
+                    tuple(sorted(tickers)), start_date, end_date, timeframe, use_alpaca,
+                    sigma_mult=sigma_mult_value,
+                    loss_cut_multiplier=loss_cut_value,
+                    min_credit_ratio=min_credit_ratio_val,
+                    max_delta=max_delta_val,
+                    max_risk_pct=max_risk_pct_val,
+                    stop_loss_pct=stop_loss_pct_val,
+                    use_iv_gate=use_iv_gate_val,
+                    use_earnings_gate=use_earnings_gate_val,
+                    earnings_lookahead_days=earnings_lookahead_val,
+                    use_alpaca_historical=use_alpaca_historical,
+                    use_macro_signals=use_macro_signals_val,
+                )
+            elapsed_s = time.monotonic() - run_t0
+            n_trades = 0 if result is None or result.trades is None else len(result.trades)
+            run_status.success(
+                f"✅ Backtest complete in {elapsed_s:.1f}s — "
+                f"{n_trades} trade(s) simulated. See terminal log for details."
             )
             st.session_state["backtest_result"] = result
             st.session_state["backtest_timeframe"] = timeframe

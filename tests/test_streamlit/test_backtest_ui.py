@@ -604,3 +604,811 @@ class TestLoadAnchorVixSeries:
         assert Backtester._load_vix_series(
             date(2025, 1, 1), date(2025, 2, 1), "1d",
         ) is None
+
+
+# ---------------------------------------------------------------------------
+# Live Quote Refresh gating
+# ---------------------------------------------------------------------------
+#
+# Two gates govern whether the per-bar Live Quote Refresh stage actually
+# runs (see backtest_ui.py:run() ~line 2487):
+#
+#   1. NOT in use_alpaca_historical mode (the historical plan IS the
+#      truthful quote — refreshing against today's snapshot would
+#      overwrite honest economics with stale-vs-actual-entry quotes).
+#   2. Entry date age <= _SNAPSHOT_FRESH_DAYS (today's snapshot is a
+#      structurally meaningless proxy for the quote at an old entry).
+#
+# These tests guard against re-introducing the cross-mode pollution
+# that was emitting bogus "Credit drifted XXXX%" warnings in
+# historical-mode runs.
+
+class TestRefreshGating:
+    """Verify _refresh_live_quotes is bypassed in the right configurations."""
+
+    def _mock_yf_close_series(self, n: int = 260, drift: float = 0.0003):
+        return _make_prices(n, drift=drift)
+
+    def _mock_yf_dataframe(self, prices: pd.Series):
+        return pd.DataFrame({
+            "Close": prices, "Open": prices, "High": prices,
+            "Low": prices, "Volume": [1_000_000] * len(prices),
+        })
+
+    @patch("trading_agent.streamlit.backtest_ui.yf.download")
+    def test_historical_mode_never_calls_refresh(self, mock_dl):
+        """Part A: with use_alpaca_historical=True the refresh stage
+        must NOT fire — even when API keys are present and the entry
+        date is fresh."""
+        prices = self._mock_yf_close_series(260)
+        mock_dl.return_value = self._mock_yf_dataframe(prices)
+
+        bt = Backtester(
+            use_alpaca_historical=True,
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+        )
+        # Stub the historical plan to always return a usable plan dict
+        # so the per-bar loop reaches the refresh decision point.
+        # Returns (plan, reason) where reason is "" on success.
+        bt._alpaca_historical_plan = MagicMock(return_value=(
+            {
+                "strike_distance_pct": 0.03,
+                "credit": 1.5,
+                "approx_abs_delta": 0.18,
+                "option_type": "put",
+                "short_strike": 485.0,
+                "long_strike": 480.0,
+                "expiration": "2025-12-19",
+            },
+            "",
+        ))
+        # Spy on the refresh method — it MUST NOT be called
+        bt._refresh_live_quotes = MagicMock()
+        # Skip the actual exit simulation
+        bt._simulate_alpaca_historical = MagicMock(
+            return_value=("win", 75.0, 5),
+        )
+
+        bt.run(["SPY"], date(2025, 1, 2), date(2025, 12, 31))
+
+        bt._refresh_live_quotes.assert_not_called()
+
+    @patch("trading_agent.streamlit.backtest_ui.yf.download")
+    def test_stale_snapshot_mode_never_calls_refresh(self, mock_dl):
+        """Part B: outside snapshot mode + entry date older than
+        _SNAPSHOT_FRESH_DAYS, refresh must NOT fire (today's quote is
+        a meaningless proxy for that entry's true quote)."""
+        prices = self._mock_yf_close_series(260)
+        mock_dl.return_value = self._mock_yf_dataframe(prices)
+
+        bt = Backtester(
+            use_alpaca_historical=False,
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+        )
+        bt._refresh_live_quotes = MagicMock()
+        # Backtest dates are 2025 — many months older than _SNAPSHOT_FRESH_DAYS=3
+        bt.run(["SPY"], date(2025, 1, 2), date(2025, 12, 31))
+
+        bt._refresh_live_quotes.assert_not_called()
+
+    @patch("trading_agent.streamlit.backtest_ui.yf.download")
+    def test_fresh_snapshot_mode_calls_refresh(self, mock_dl):
+        """Positive control: entry date inside _SNAPSHOT_FRESH_DAYS and
+        snapshot mode → refresh SHOULD fire so we catch quote drift
+        between planning and execution (the original purpose of the
+        feature).
+
+        Notes on test setup:
+
+        * pd.bdate_range can return ``periods-1`` entries when ``end``
+          lands on a weekend (it rolls the boundary back), so we derive
+          n from the actual index length to keep ``closes`` aligned
+          regardless of when the test runs.
+        * The backtest loop spaces entries by ``hold_bars`` (= the
+          instance's ``target_dte``).  With the default ``target_dte=35``
+          on a 260-bar daily series, the latest possible entry lands
+          ~24 business days before the end of the series — well outside
+          the 3-day fresh-snapshot window, so refresh would never fire.
+          We pass ``target_dte=1`` so entries can fire on every bar and
+          the most recent one is guaranteed to be inside the fresh window.
+        * ``_get_option_chain_for_date`` is stubbed to return None so the
+          test doesn't make a real Alpaca API call with fake credentials.
+          The refresh-eligibility check happens AFTER that call regardless
+          of its outcome, so the stub is purely about avoiding network I/O.
+        """
+        end = date.today()
+        idx = pd.bdate_range(end=pd.Timestamp(end), periods=260)
+        n = len(idx)
+        np.random.seed(42)
+        rt = np.random.normal(0.0003, 0.01, n)
+        closes = 500.0 * np.exp(np.cumsum(rt))
+        prices = pd.Series(closes, index=idx, name="Close")
+        mock_dl.return_value = self._mock_yf_dataframe(prices)
+
+        bt = Backtester(
+            use_alpaca_historical=False,
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+            # Tight DTE so entries can land on the last bar (within the
+            # _SNAPSHOT_FRESH_DAYS window).  See docstring above.
+            target_dte=1,
+        )
+        # Avoid hitting the real Alpaca API with fake credentials
+        bt._get_option_chain_for_date = MagicMock(return_value=None)
+        # Stub refresh to a no-op success (returns the inputs unchanged)
+        bt._refresh_live_quotes = MagicMock(
+            side_effect=lambda **kw: (
+                kw.get("strike_distance_pct"),
+                kw.get("credit"),
+                kw.get("approx_abs_delta"),
+                "success",
+            ),
+        )
+        bt.run(["SPY"], date.today() - timedelta(days=400), end)
+        # At least one entry bar must fall inside the fresh-snapshot
+        # window → refresh fires at least once.
+        assert bt._refresh_live_quotes.call_count >= 1
+
+    @patch("trading_agent.streamlit.backtest_ui.yf.download")
+    def test_refresh_skipped_without_api_keys(self, mock_dl):
+        """Without Alpaca credentials the refresh stage cannot run —
+        regardless of mode or entry date."""
+        prices = self._mock_yf_close_series(260)
+        mock_dl.return_value = self._mock_yf_dataframe(prices)
+
+        bt = Backtester(
+            use_alpaca_historical=False,
+            alpaca_api_key="",       # explicitly empty
+            alpaca_secret_key="",
+        )
+        bt._refresh_live_quotes = MagicMock()
+        bt.run(["SPY"], date(2025, 1, 2), date(2025, 12, 31))
+        bt._refresh_live_quotes.assert_not_called()
+
+
+# ---------------------------------------------------------------------------
+# σ-horizon contract for _alpaca_historical_plan
+# ---------------------------------------------------------------------------
+#
+# The short-leg strike target is computed from σ-projection.  For intraday
+# backtests, projecting σ over the EXPIRATION horizon (e.g. 30+ days) puts
+# strikes ~13% OTM with |Δ|≈0.02 — well below the live agent's 0.15 MIN_DELTA
+# floor, so the resulting trades aren't apples-to-apples with live.  The
+# fix passes ``hold_bars`` + ``bars_per_year`` so σ is projected over the
+# real ~1-hour intraday hold horizon instead.  These tests guard against
+# regression to the legacy DTE-only behavior.
+
+class TestAlpacaHistoricalSigmaHorizon:
+    """Verify _alpaca_historical_plan projects σ over hold horizon."""
+
+    # Synthetic chain: $1 strike grid from $200 to $300 inclusive, both
+    # types.  Wide enough for any reasonable σ-target to land inside.
+    @staticmethod
+    def _build_chain(option_type: str) -> List[dict]:
+        chain = []
+        for k in range(200, 301):
+            chain.append({
+                "symbol": f"TEST260529{option_type[0].upper()}{k:08d}",
+                "strike": float(k),
+                "expiration": "2026-05-29",
+                "type": option_type,
+            })
+        return chain
+
+    @staticmethod
+    def _stub_bars(symbols, start, end, **kw):
+        """Synthetic bars priced as a monotonically-decreasing function of
+        ``|strike − spot|`` (spot = $250 in every test in this class).
+
+        Why this matters
+        ----------------
+        ``_alpaca_historical_plan`` rejects with ``non_positive_credit``
+        when ``short_close - long_close ≤ 0``.  A flat $0.50 stub close
+        on every leg makes that guard fire on every test, masking the
+        σ-horizon behavior we actually want to verify.
+
+        The ``5 / (1 + 0.1·|strike − spot|)`` decay is strictly positive
+        and strictly decreasing in distance from spot, so the leg closer
+        to spot (short) always trades richer than the leg further OTM
+        (long), yielding a positive credit regardless of which strikes
+        the picker chose.  No floor is needed — at the chain's worst
+        case (|strike − spot| = 50) the formula still returns $0.83.
+        """
+        SPOT = 250.0
+        out = {}
+        for sym in symbols:
+            # OCC-style symbol from ``_build_chain``:
+            # ``TEST260529<P|C><8-digit integer strike>``
+            try:
+                strike = float(int(sym[-8:]))
+            except (ValueError, IndexError):
+                strike = SPOT
+            close = 5.0 / (1.0 + 0.1 * abs(strike - SPOT))
+            out[sym] = [{"t": str(start), "o": close, "h": close,
+                         "l": close, "c": close, "v": 100}]
+        return out
+
+    def _make_bt(self) -> Backtester:
+        bt = Backtester(
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+        )
+        bt._pick_alpaca_expiration = MagicMock(return_value="2026-05-29")
+        bt._fetch_alpaca_option_contracts = MagicMock(
+            side_effect=lambda ticker, expiry, opt_type: self._build_chain(opt_type),
+        )
+        bt._fetch_alpaca_option_bars = MagicMock(side_effect=self._stub_bars)
+        return bt
+
+    def test_intraday_picks_strike_near_spot_not_far_otm(self):
+        """With hold_bars=12 (1-hour intraday) and bars_per_year=19656,
+        σ_hold ≈ σ_annual × 0.0247.  At spot=$250, σ_annual=0.25, the
+        short put should land within ~3-5% of spot — NOT the ~13% OTM
+        the legacy DTE-horizon math would produce."""
+        bt = self._make_bt()
+        plan, reason = bt._alpaca_historical_plan(
+            ticker="TEST",
+            entry_date=date(2026, 4, 24),
+            regime="bullish",            # → put
+            target_dte=35,
+            underlying_price=250.0,
+            sigma_annual=0.25,
+            effective_sigma_mult=1.5,
+            hold_bars=12,                # intraday: 12 × 5-min = 1 hour
+            bars_per_year=252 * 78,      # 19656
+        )
+        assert plan is not None, f"unexpected reject: {reason}"
+        assert reason == ""
+        distance_pct = (250.0 - plan["short_strike"]) / 250.0
+        # Hold-horizon σ × 1.5 ≈ 0.92% — strike should be a few % OTM,
+        # not 13% OTM.  Allow 5% upper bound for safety.
+        assert 0.0 <= distance_pct <= 0.05, (
+            f"Expected short strike within 5% of spot under hold-horizon "
+            f"σ-projection, got {distance_pct*100:.2f}% OTM "
+            f"(short=${plan['short_strike']}, spot=$250)"
+        )
+
+    def test_daily_mode_close_to_legacy(self):
+        """Daily mode: hold_bars==target_dte and bars_per_year==252.
+
+        The new hold-horizon math is numerically *very close* to the
+        legacy DTE-horizon math but not bit-identical because:
+          * legacy uses ``dte_days`` from the actual expiration string
+            (calendar days, e.g. 34 days from 2026-04-24 → 2026-05-29)
+          * the new path uses ``hold_bars`` (= ``target_dte`` = 35
+            business days)
+
+        The 1-day delta can shift the picked strike by at most 1 grid
+        step.  This test bounds the divergence so accidental mode swaps
+        in the daily path stay flagged."""
+        bt = self._make_bt()
+        plan_daily, reason_daily = bt._alpaca_historical_plan(
+            ticker="TEST",
+            entry_date=date(2026, 4, 24),
+            regime="bullish",
+            target_dte=35,
+            underlying_price=250.0,
+            sigma_annual=0.25,
+            effective_sigma_mult=1.5,
+            hold_bars=35,
+            bars_per_year=252,
+        )
+        plan_legacy, reason_legacy = bt._alpaca_historical_plan(
+            ticker="TEST",
+            entry_date=date(2026, 4, 24),
+            regime="bullish",
+            target_dte=35,
+            underlying_price=250.0,
+            sigma_annual=0.25,
+            effective_sigma_mult=1.5,
+            # No hold_bars/bars_per_year → legacy DTE fallback
+        )
+        assert plan_daily is not None, f"unexpected reject: {reason_daily}"
+        assert plan_legacy is not None, f"unexpected reject: {reason_legacy}"
+        # Both should pick a strike within 1 grid step ($1) of each
+        # other — they're using essentially the same horizon (35 vs 34
+        # days).  This bound catches accidental order-of-magnitude
+        # divergences without being brittle to the 1-day discrepancy.
+        delta = abs(plan_daily["short_strike"] - plan_legacy["short_strike"])
+        assert delta <= 1.0, (
+            f"Daily mode (hold_bars=35,bars/yr=252) and legacy DTE-horizon "
+            f"path should pick strikes within $1 of each other; got "
+            f"daily=${plan_daily['short_strike']}, "
+            f"legacy=${plan_legacy['short_strike']} (Δ=${delta})"
+        )
+
+    def test_legacy_caller_falls_back_to_dte_horizon(self):
+        """Backward-compat: callers that don't pass hold_bars/bars_per_year
+        still get the original DTE-horizon math.  At spot=$250, σ=0.25,
+        DTE=35d → σ_hold ≈ 9.3%, target_dist ≈ 14% OTM (sigma_mult=1.5)."""
+        bt = self._make_bt()
+        plan, reason = bt._alpaca_historical_plan(
+            ticker="TEST",
+            entry_date=date(2026, 4, 24),
+            regime="bullish",
+            target_dte=35,
+            underlying_price=250.0,
+            sigma_annual=0.25,
+            effective_sigma_mult=1.5,
+            # No hold_bars/bars_per_year
+        )
+        assert plan is not None, f"unexpected reject: {reason}"
+        distance_pct = (250.0 - plan["short_strike"]) / 250.0
+        # Legacy DTE-horizon math: σ × √(35/252) × 1.5 ≈ 13.8%
+        # Allow 10-20% as the DTE-horizon band (includes strike-grid snap).
+        assert 0.10 <= distance_pct <= 0.20, (
+            f"Legacy DTE-horizon path should pick strike ~14% OTM at these "
+            f"inputs, got {distance_pct*100:.2f}% OTM"
+        )
+
+    def test_intraday_picks_closer_strike_than_legacy(self):
+        """Direct comparison: same inputs except hold_bars/bars_per_year.
+        Intraday hold-horizon path MUST pick a strike strictly closer to
+        spot than the legacy DTE-horizon path.  This is the core of the
+        Option B fix and the most important regression to guard."""
+        bt = self._make_bt()
+        common = dict(
+            ticker="TEST",
+            entry_date=date(2026, 4, 24),
+            regime="bullish",
+            target_dte=35,
+            underlying_price=250.0,
+            sigma_annual=0.25,
+            effective_sigma_mult=1.5,
+        )
+        plan_intraday, reason_intraday = bt._alpaca_historical_plan(
+            **common, hold_bars=12, bars_per_year=252 * 78,
+        )
+        plan_legacy, reason_legacy = bt._alpaca_historical_plan(
+            **common,  # DTE fallback
+        )
+        assert plan_intraday is not None, f"unexpected reject: {reason_intraday}"
+        assert plan_legacy is not None, f"unexpected reject: {reason_legacy}"
+        intraday_dist = 250.0 - plan_intraday["short_strike"]
+        legacy_dist = 250.0 - plan_legacy["short_strike"]
+        assert intraday_dist < legacy_dist, (
+            f"Intraday hold-horizon path should pick strike closer to spot. "
+            f"intraday short=${plan_intraday['short_strike']} "
+            f"(dist={intraday_dist:.2f}), "
+            f"legacy short=${plan_legacy['short_strike']} "
+            f"(dist={legacy_dist:.2f})"
+        )
+
+    def test_bearish_regime_picks_call_otm_using_hold_horizon(self):
+        """Symmetric verification for the call side: bearish regime →
+        OTM call short, distance computed from hold-horizon σ."""
+        bt = self._make_bt()
+        plan, reason = bt._alpaca_historical_plan(
+            ticker="TEST",
+            entry_date=date(2026, 4, 24),
+            regime="bearish",            # → call
+            target_dte=35,
+            underlying_price=250.0,
+            sigma_annual=0.25,
+            effective_sigma_mult=1.5,
+            hold_bars=12,
+            bars_per_year=252 * 78,
+        )
+        assert plan is not None, f"unexpected reject: {reason}"
+        assert plan["option_type"] == "call"
+        distance_pct = (plan["short_strike"] - 250.0) / 250.0
+        assert 0.0 <= distance_pct <= 0.05, (
+            f"Bearish call short should be within 5% of spot under "
+            f"hold-horizon projection, got {distance_pct*100:.2f}% OTM"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Credit-ratio gate parity in alpaca-historical mode
+# ---------------------------------------------------------------------------
+#
+# Prior to Apr 2026 the credit-ratio gate skip-condition was
+# ``not use_sigma_path``.  Because ``use_sigma_path`` is true whenever
+# σ-strike-picking is on (regardless of whether the credit ultimately came
+# from real Alpaca bars or the synthetic σ-credit model), the gate was
+# silently disabled in alpaca-historical+σ runs and trades with C/W far
+# below ``min_credit_ratio=0.33`` reached the trade journal anyway.
+#
+# Fix: gate skip is now ``not credit_is_synthetic`` where
+# ``credit_is_synthetic = use_sigma_path and not use_alpaca_historical``.
+# These tests guard against re-introducing the broader skip condition.
+
+class TestCreditRatioGateAlpacaHistorical:
+    """min_credit_ratio must fire in alpaca-historical mode and stay
+    bypassed in pure synthetic-σ mode."""
+
+    @staticmethod
+    def _mock_yf_dataframe(prices: pd.Series) -> pd.DataFrame:
+        return pd.DataFrame({
+            "Close": prices, "Open": prices, "High": prices,
+            "Low": prices, "Volume": [1_000_000] * len(prices),
+        })
+
+    @staticmethod
+    def _low_credit_plan() -> dict:
+        # C/W = 0.50 / 5.00 = 0.10, well below the 0.33 floor.
+        return {
+            "short_symbol": "SPY260529P00485000",
+            "long_symbol": "SPY260529P00480000",
+            "short_strike": 485.0,
+            "long_strike": 480.0,
+            "expiration": "2026-05-29",
+            "option_type": "put",
+            "credit": 0.50,
+            "strike_distance_pct": 0.03,
+            "approx_abs_delta": 0.18,
+        }
+
+    @patch("trading_agent.streamlit.backtest_ui.yf.download")
+    def test_alpaca_historical_low_cw_trades_are_rejected_by_credit_ratio_gate(
+        self, mock_dl
+    ):
+        """In alpaca-historical mode the credit comes from REAL bar
+        closes, so the data-quality rationale of the gate fully applies.
+        A plan with C/W=0.10 must trip ``credit_ratio<floor`` and never
+        reach the trade journal."""
+        prices = _make_prices(260)
+        mock_dl.return_value = self._mock_yf_dataframe(prices)
+
+        bt = Backtester(
+            use_alpaca_historical=True,
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+            spread_width=5.0,
+            min_credit_ratio=0.33,
+            # Disable adjacent gates so the credit-ratio gate is what
+            # actually fires (not earnings, not IV-rank, not max-Δ,
+            # not max-risk).  Each one off for a *different* reason —
+            # we want the test to fail if the credit-ratio gate
+            # disappears, not if some other gate's default changes.
+            use_iv_gate=False,
+            use_earnings_gate=False,
+            max_delta=None,
+            max_risk_pct=None,
+        )
+        bt._alpaca_historical_plan = MagicMock(
+            return_value=(self._low_credit_plan(), ""),
+        )
+        # Trade-execution simulator must never be reached for a rejected
+        # plan — assert this explicitly via call_count below.
+        bt._simulate_alpaca_historical = MagicMock(
+            return_value=("win", 50.0, 5),
+        )
+
+        bt.run(["SPY"], date(2025, 1, 2), date(2025, 12, 31))
+
+        assert bt.rejections.get("credit_ratio<floor", 0) >= 1, (
+            f"Expected credit_ratio<floor rejections in alpaca-historical "
+            f"mode with C/W=0.10 vs floor=0.33; got rejections={dict(bt.rejections)}"
+        )
+        assert bt._simulate_alpaca_historical.call_count == 0, (
+            "Trades with C/W below min_credit_ratio must be rejected "
+            "before the simulator runs."
+        )
+        assert bt._funnel.simulated == 0, (
+            "No trades should reach the trade journal when every plan "
+            "is below the credit-ratio floor."
+        )
+        # The skip-marker must NOT be set in alpaca-historical mode —
+        # the gate is real, not bypassed.
+        assert "credit_ratio" not in bt._funnel.skipped_phases, (
+            "credit_ratio must not appear in skipped_phases when the "
+            "gate is actively firing in alpaca-historical mode."
+        )
+
+    @patch("trading_agent.streamlit.backtest_ui.yf.download")
+    def test_synthetic_sigma_mode_skips_credit_ratio_gate(self, mock_dl):
+        """In pure synthetic-σ mode (no alpaca-historical) the credit
+        is a deterministic function of σ-distance and the gate's data-
+        quality rationale does not apply.  The gate must be skipped and
+        the funnel must record the skip via ``skipped_phases``."""
+        prices = _make_prices(260)
+        mock_dl.return_value = self._mock_yf_dataframe(prices)
+
+        bt = Backtester(
+            use_alpaca_historical=False,
+            alpaca_api_key="",      # no API → no snapshot path
+            alpaca_secret_key="",
+            spread_width=5.0,
+            min_credit_ratio=0.33,
+            use_iv_gate=False,
+            use_earnings_gate=False,
+            max_delta=None,
+            max_risk_pct=None,
+        )
+        bt.run(["SPY"], date(2025, 1, 2), date(2025, 12, 31))
+
+        assert "credit_ratio" in bt._funnel.skipped_phases, (
+            f"Synthetic-σ mode must mark credit_ratio as a skipped phase; "
+            f"skipped_phases={bt._funnel.skipped_phases}"
+        )
+        assert bt.rejections.get("credit_ratio<floor", 0) == 0, (
+            "Credit-ratio rejections must NOT appear in synthetic-σ mode "
+            f"(gate is bypassed); got rejections={dict(bt.rejections)}"
+        )
+
+
+# ---------------------------------------------------------------------------
+# Friday-weekly preference + no-bars expiry fallback
+# ---------------------------------------------------------------------------
+#
+# Pre-Apr-2026 picker bug: ``_pick_alpaca_expiration`` chose the strict
+# nearest-DTE expiry, which on most weekday entry-dates lands on a
+# Mon/Wed/Thu weekly.  Mon/Wed weeklies on QQQ/SPY/IWM trade at a
+# fraction of Friday-weekly volume, so Alpaca's options bars endpoint
+# routinely returned empty results at deep-OTM strikes — burning ~80%
+# of intraday backtest candidates as ``no_bars_on_entry_day``.
+#
+# Two-pronged fix:
+#   1. ``_pick_alpaca_expiration`` now adds a +4-day penalty to non-
+#      Friday expiries so liquid Friday weeklies win ties.
+#   2. ``_alpaca_historical_plan`` retries with the next-best expiry
+#      (up to MAX_FALLBACK_ATTEMPTS=3) when the first-choice expiry
+#      yields ``no_bars_on_entry_day`` / ``no_contracts_for_expiry`` /
+#      ``non_positive_credit``.  Strike-grid failures
+#      (``long_leg_off_grid``, ``no_otm_near_target``) do NOT retry
+#      because they're deterministic given the catalogue.
+#
+# These tests guard against re-introducing either regression.
+
+class TestPickAlpacaExpirationFridayPreference:
+    """The expiration picker should prefer Friday weeklies even when a
+    Mon/Wed weekly is closer to target_dte."""
+
+    @staticmethod
+    def _stub_contracts(expirations: List[str]):
+        """Build a stub for ``_alpaca_request`` returning a synthetic
+        ``/options/contracts`` response with the given expiration set."""
+        def _request(url, params=None, timeout=None):
+            resp = MagicMock()
+            resp.raise_for_status = MagicMock()
+            resp.json = MagicMock(return_value={
+                "option_contracts": [
+                    {"expiration_date": exp, "symbol": f"X{i}"}
+                    for i, exp in enumerate(expirations)
+                ],
+            })
+            return resp
+        return _request
+
+    def _make_bt(self, expirations: List[str]) -> Backtester:
+        bt = Backtester(
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+        )
+        bt._alpaca_request = MagicMock(
+            side_effect=self._stub_contracts(expirations),
+        )
+        return bt
+
+    def test_friday_within_4d_beats_monday_at_exact_target(self):
+        """target = Mon (entry+35d).  Friday weekly 32d off (3 days
+        early) should win over Monday weekly at exact 35d."""
+        bt = self._make_bt([
+            "2026-05-01",  # Friday, 32d off-target by 3
+            "2026-05-04",  # Monday,  35d off-target by 0
+            "2026-05-06",  # Wednesday, 37d off-target by 2
+        ])
+        # Entry Mon 2026-03-30 → target = Mon 2026-05-04 (entry+35d)
+        chosen = bt._pick_alpaca_expiration(
+            "QQQ", date(2026, 3, 30), target_dte=35,
+        )
+        assert chosen == "2026-05-01", (
+            f"Friday-preference should pick May 1 (Friday, 3d early) over "
+            f"May 4 (Monday, exact); got {chosen}"
+        )
+
+    def test_friday_loses_when_too_far_from_target(self):
+        """A Friday >4d off-target loses to a Monday at exact target,
+        because the +4-day penalty is exactly that — 4 days, not infinite."""
+        bt = self._make_bt([
+            "2026-04-24",  # Friday, 30d off-target by 5  → eff 5+0=5
+            "2026-04-29",  # Wednesday, 35d off-target by 0 → eff 0+4=4
+            "2026-05-08",  # Friday, 44d off-target by 9  → eff 9+0=9
+        ])
+        # target = entry + 35 = Mon 2026-04-29
+        chosen = bt._pick_alpaca_expiration(
+            "QQQ", date(2026, 3, 25), target_dte=35,
+        )
+        assert chosen == "2026-04-29", (
+            f"When no Friday is within 4d of target, the closest non-Friday "
+            f"should win; got {chosen}"
+        )
+
+    def test_exclude_set_skips_failed_expirations(self):
+        """``exclude`` lets the fallback loop request the next-best
+        without re-picking the dud."""
+        bt = self._make_bt([
+            "2026-05-01",  # Friday — will be excluded
+            "2026-05-04",  # Monday — should win when May 1 excluded
+            "2026-05-08",  # Friday — also a candidate
+        ])
+        chosen = bt._pick_alpaca_expiration(
+            "QQQ", date(2026, 3, 30), target_dte=35,
+            exclude={"2026-05-01"},
+        )
+        # Both May 4 (Mon, eff 0+4=4) and May 8 (Fri, eff 4+0=4) tie;
+        # tiebreaker prefers Friday → May 8.
+        assert chosen == "2026-05-08", (
+            f"With May 1 excluded, picker should pick the Friday May 8 "
+            f"over the Monday May 4 (Friday tiebreaker); got {chosen}"
+        )
+
+
+class TestAlpacaHistoricalPlanFallback:
+    """When the first-choice expiry returns no bars, the plan builder
+    should fall back to the next-best expiration before giving up."""
+
+    @staticmethod
+    def _build_chain(expiration: str, option_type: str) -> List[dict]:
+        chain = []
+        for k in range(200, 301):
+            chain.append({
+                "symbol": (
+                    f"TEST{expiration.replace('-','')[2:]}"
+                    f"{option_type[0].upper()}{k:08d}"
+                ),
+                "strike": float(k),
+                "expiration": expiration,
+                "type": option_type,
+            })
+        return chain
+
+    @staticmethod
+    def _bars_with_holes(empty_for: List[str]):
+        """Return a bars-stub that returns empty bars for any symbol
+        belonging to an expiration in ``empty_for``, and synthetic
+        priced bars for everything else."""
+        SPOT = 250.0
+
+        def _stub(symbols, start, end, **kw):
+            out = {}
+            for sym in symbols:
+                # OCC-style: TEST<YYMMDD><P|C><strike>
+                yyyy = "20" + sym[4:6]
+                mm = sym[6:8]
+                dd = sym[8:10]
+                exp = f"{yyyy}-{mm}-{dd}"
+                if exp in empty_for:
+                    continue   # no bars for this expiry
+                try:
+                    strike = float(int(sym[-8:]))
+                except (ValueError, IndexError):
+                    strike = SPOT
+                close = 5.0 / (1.0 + 0.1 * abs(strike - SPOT))
+                out[sym] = [{"t": str(start), "o": close, "h": close,
+                             "l": close, "c": close, "v": 100}]
+            return out
+        return _stub
+
+    def _make_bt(
+        self,
+        expiration_order: List[str],
+        empty_bars_for: List[str],
+    ) -> Backtester:
+        bt = Backtester(
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+        )
+        # Stub picker to return expirations in order, respecting exclude.
+        def _pick(ticker, entry_date, target_dte, exclude=None):
+            for exp in expiration_order:
+                if not exclude or exp not in exclude:
+                    return exp
+            return None
+        bt._pick_alpaca_expiration = MagicMock(side_effect=_pick)
+        bt._fetch_alpaca_option_contracts = MagicMock(
+            side_effect=lambda ticker, exp, opt_type: self._build_chain(exp, opt_type),
+        )
+        bt._fetch_alpaca_option_bars = MagicMock(
+            side_effect=self._bars_with_holes(empty_bars_for),
+        )
+        return bt
+
+    def test_falls_back_when_first_expiry_has_no_bars(self):
+        """First-choice expiry returns empty bars; plan builder retries
+        with the next-best expiry (which has bars) and succeeds."""
+        bt = self._make_bt(
+            expiration_order=["2026-05-04", "2026-05-08"],   # Mon then Fri
+            empty_bars_for=["2026-05-04"],
+        )
+        plan, reason = bt._alpaca_historical_plan(
+            ticker="TEST",
+            entry_date=date(2026, 3, 30),
+            regime="bullish",
+            target_dte=35,
+            underlying_price=250.0,
+            sigma_annual=0.25,
+            effective_sigma_mult=1.5,
+            hold_bars=12,
+            bars_per_year=252 * 78,
+        )
+        assert plan is not None, f"unexpected reject: {reason}"
+        assert plan["expiration"] == "2026-05-08", (
+            f"Plan should have fallen back from May 4 (no bars) to "
+            f"May 8 (bars present); got expiration={plan['expiration']}"
+        )
+
+    def test_returns_no_bars_after_fallbacks_when_all_exhausted(self):
+        """All offered expirations return empty bars → builder reports
+        ``no_bars_after_fallbacks`` rather than masking the cause."""
+        bt = self._make_bt(
+            expiration_order=["2026-05-04", "2026-05-06", "2026-05-08"],
+            empty_bars_for=["2026-05-04", "2026-05-06", "2026-05-08"],
+        )
+        plan, reason = bt._alpaca_historical_plan(
+            ticker="TEST",
+            entry_date=date(2026, 3, 30),
+            regime="bullish",
+            target_dte=35,
+            underlying_price=250.0,
+            sigma_annual=0.25,
+            effective_sigma_mult=1.5,
+            hold_bars=12,
+            bars_per_year=252 * 78,
+        )
+        assert plan is None
+        assert reason.startswith("no_bars_after_fallbacks:"), (
+            f"After exhausting all candidates the builder must report "
+            f"no_bars_after_fallbacks; got {reason!r}"
+        )
+
+    def test_no_fallback_on_strike_grid_failure(self):
+        """``long_leg_off_grid`` is deterministic given the catalogue —
+        retrying a different expiry won't help.  The builder must
+        return immediately, not iterate.
+
+        Setup: the put chain contains a single strike at ATM ($250).
+        With spot=$250 and bullish regime the picker chooses
+        short_put=250 (the only OTM put available).  No strike
+        ``< 250`` exists for the long leg → ``long_leg_off_grid``
+        fires non-retryable, and the fallback loop must NOT iterate.
+        """
+        bt = Backtester(
+            alpaca_api_key="test-key",
+            alpaca_secret_key="test-secret",
+            spread_width=5.0,
+        )
+        bt._pick_alpaca_expiration = MagicMock(return_value="2026-05-04")
+
+        def _narrow_chain(ticker, expiration, option_type):
+            # Single ATM strike — no room below for the long leg.
+            return [{
+                "symbol": (
+                    f"TEST{expiration.replace('-','')[2:]}"
+                    f"{option_type[0].upper()}{250:08d}"
+                ),
+                "strike": 250.0,
+                "expiration": expiration,
+                "type": option_type,
+            }]
+        bt._fetch_alpaca_option_contracts = MagicMock(side_effect=_narrow_chain)
+        # Bars fetch must NOT be reached — long_leg_off_grid fires first.
+        bt._fetch_alpaca_option_bars = MagicMock(return_value={})
+
+        plan, reason = bt._alpaca_historical_plan(
+            ticker="TEST",
+            entry_date=date(2026, 3, 30),
+            regime="bullish",
+            target_dte=35,
+            underlying_price=250.0,
+            sigma_annual=0.25,
+            effective_sigma_mult=1.5,
+            hold_bars=12,
+            bars_per_year=252 * 78,
+        )
+        assert plan is None
+        assert reason.startswith("long_leg_off_grid:"), (
+            f"Strike-grid failures must NOT trigger fallback; got {reason!r}"
+        )
+        # Picker should have been called exactly once (no retry).
+        assert bt._pick_alpaca_expiration.call_count == 1, (
+            f"Picker should be called only once on strike-grid failure; "
+            f"got call_count={bt._pick_alpaca_expiration.call_count}"
+        )
+        # Bars fetch must not even have been attempted.
+        assert bt._fetch_alpaca_option_bars.call_count == 0, (
+            "Strike-grid failure must short-circuit BEFORE the bars fetch."
+        )

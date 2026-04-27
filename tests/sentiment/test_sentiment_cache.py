@@ -181,7 +181,7 @@ def test_ttl_expiry_discards_stale_entry(monkeypatch):
 
     fake_time = [1000.0]
     monkeypatch.setattr(
-        "trading_agent.sentiment_cache.time.monotonic",
+        "trading_agent.sentiment.sentiment_cache.time.monotonic",
         lambda: fake_time[0],
     )
 

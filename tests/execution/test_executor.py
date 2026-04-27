@@ -291,7 +291,7 @@ class TestPositionSizing:
         verdict = _make_verdict(approved=True, plan=plan)
         verdict.account_balance = 20_000  # tiny equity → no room for one contract
 
-        with patch("trading_agent.executor.requests.post") as mock_post:
+        with patch("trading_agent.execution.executor.requests.post") as mock_post:
             result = executor.execute(verdict)
             assert mock_post.called is False, (
                 "requests.post must NOT be called for an un-sizeable plan — "
@@ -369,7 +369,7 @@ class TestLiveCreditRecheck:
         plan.spread_width = 5.0
         plan.max_loss = 330.0
 
-        with patch("trading_agent.executor.requests.post") as mock_post:
+        with patch("trading_agent.execution.executor.requests.post") as mock_post:
             result = executor.execute(_make_verdict(approved=True, plan=plan))
             assert mock_post.called is False
 
@@ -400,7 +400,7 @@ class TestLiveCreditRecheck:
         verdict = _make_verdict(approved=True, plan=plan)
         verdict.account_balance = 25_000       # 2% × 25k = $500 budget
 
-        with patch("trading_agent.executor.requests.post") as mock_post:
+        with patch("trading_agent.execution.executor.requests.post") as mock_post:
             result = executor.execute(verdict)
             assert mock_post.called is False
 
@@ -424,7 +424,7 @@ class TestLiveCreditRecheck:
         plan.credit_to_width_ratio = 0.34
         plan.max_loss = 330.0
 
-        with patch("trading_agent.executor.requests.post") as mock_post:
+        with patch("trading_agent.execution.executor.requests.post") as mock_post:
             mock_post.return_value = MagicMock(
                 status_code=200,
                 json=lambda: {"id": "order-123", "status": "accepted"},
@@ -452,7 +452,7 @@ class TestLiveCreditRecheck:
         plan.credit_to_width_ratio = 0.34
         plan.max_loss = 330.0
 
-        with patch("trading_agent.executor.requests.post") as mock_post:
+        with patch("trading_agent.execution.executor.requests.post") as mock_post:
             mock_post.return_value = MagicMock(
                 status_code=200,
                 json=lambda: {"id": "x", "status": "accepted"},

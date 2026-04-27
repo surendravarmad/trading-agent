@@ -115,7 +115,7 @@ class TestPickExpiration:
         # prev_friday = May 1  (DTE=29) — VALID
         # All three in DTE_RANGE (28, 45) → pick max DTE = May 15
         fake_today = date(2026, 4, 2)
-        with patch("trading_agent.strategy.datetime") as mock_dt:
+        with patch("trading_agent.strategy.strategy.datetime") as mock_dt:
             mock_dt.now.return_value.date.return_value = fake_today
             exp = planner._pick_expiration()
 
@@ -134,7 +134,7 @@ class TestPickExpiration:
         # next_friday = May 22 (DTE=51 > 50) — INVALID (exceeds max)
         # prev_friday = May 15 (DTE=44)       — VALID
         fake_today = date(2026, 4, 1)
-        with patch("trading_agent.strategy.datetime") as mock_dt:
+        with patch("trading_agent.strategy.strategy.datetime") as mock_dt:
             mock_dt.now.return_value.date.return_value = fake_today
             exp = planner._pick_expiration()
 

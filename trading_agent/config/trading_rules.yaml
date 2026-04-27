@@ -1,0 +1,92 @@
+# =============================================================================
+# Trading Rules Configuration
+# =============================================================================
+# These are the "knobs" a trader tunes to adjust strategy behaviour.
+# All values here are the same as the hardcoded defaults — edit freely.
+#
+# Secrets, API keys, risk limits already in .env, and feature flags
+# (DRY_RUN, LLM_ENABLED) stay in .env and are NOT duplicated here.
+#
+# To use a custom file (e.g. per-environment override):
+#   export TRADING_RULES_YAML_PATH=/path/to/your_rules.yaml
+# =============================================================================
+
+strategy:
+  # Short-leg delta targeting window
+  min_delta: 0.15          # floor — below this is too far OTM (low credit)
+  target_dte: 35           # ideal days-to-expiry for new spreads
+  dte_range_min: 28        # minimum acceptable DTE
+  dte_range_max: 45        # maximum acceptable DTE
+  spread_width_floor: 5.0  # legacy floor ($); adaptive width takes over above this
+
+  # ETF relative-strength gate
+  # Bull Put bias fires when ticker leads its anchor by >= this many sigma
+  rs_zscore_threshold: 1.5
+
+regime:
+  # VIX inter-market gate: suppress bullish openings when VIX
+  # 5-min change z-score exceeds this threshold (~top 2.3%)
+  vix_inhibit_zscore: 2.0
+
+  # Bollinger Band width below which regime is classified as SIDEWAYS
+  bollinger_narrow_threshold: 0.04
+
+  # Per-ticker relative-strength anchor.
+  # Tickers absent from this map fall through to the default SPY benchmark.
+  leadership_anchors:
+    SPY: QQQ
+    QQQ: SPY
+    IWM: SPY
+    DIA: SPY
+    XLK: SPY
+    XLF: SPY
+    XLE: SPY
+    XLV: SPY
+    XLY: SPY
+    XLI: SPY
+    XLP: SPY
+    XLU: SPY
+    XLB: SPY
+    XLC: SPY
+    XLRE: SPY
+
+position_monitor:
+  profit_target_pct: 0.50      # close when 50% of initial credit is captured
+  hard_stop_multiplier: 3.0    # close immediately when spread = 3x initial credit
+  strike_proximity_pct: 0.01   # close immediately when underlying within 1% of short strike
+  dte_safety_hour: 15          # ET hour for DTE safety cutoff
+  dte_safety_minute: 30        # ET minute for DTE safety cutoff (15:30 ET)
+
+agent:
+  cycle_timeout_seconds: 270   # kill process if cycle exceeds this (4.5 min)
+  exit_debounce_required: 3    # consecutive cycles a non-immediate exit must persist
+
+execution:
+  max_history: 200             # max entries kept per-ticker in trade_plans/{TICKER}.json
+  price_drift_warn_pct: 0.10   # warn if live credit deviates >10% from plan
+
+cache:
+  price_history_ttl: 14400     # seconds — historical OHLCV (4 hours)
+  snapshot_ttl: 60             # seconds — real-time price snapshot (1 minute)
+  option_chain_ttl: 180        # seconds — option chain Greeks (3 minutes)
+  intraday_return_ttl: 60      # seconds — 5-min bar return (1 minute)
+  max_prefetch_workers: 5      # parallel threads for historical pre-fetch
+
+sentiment:
+  # Source authority weights (0.0–1.0).
+  # Higher weight = stronger influence on the aggregated sentiment score.
+  source_weights:
+    sec_edgar: 1.00
+    fed_rss: 0.95
+    yahoo: 0.70
+    twitter: 0.50
+    reddit_options: 0.45
+    reddit_stocks: 0.45
+    reddit_investing: 0.40
+    reddit_wsb: 0.35
+
+backtest:
+  starting_equity: 100000.0
+  commission_round_trip: 2.60   # 4 legs x $0.65 per contract
+  daily_otm_pct: 0.03           # fallback short-strike OTM % for daily bars
+  intraday_otm_pct: 0.005       # fallback short-strike OTM % for intraday bars

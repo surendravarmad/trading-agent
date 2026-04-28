@@ -681,6 +681,9 @@ def render_live_monitor() -> None:
     # ── Header row ────────────────────────────────────────────────────────
     st.subheader("Live Portfolio Monitor")
 
+    # ── Strategy profile panel (first — pick risk + bias BEFORE starting) ─
+    render_strategy_profile_panel()
+
     # ── Dry Run toggle (most prominent choice — pick BEFORE starting) ─────
     with st.expander(
         "Dry Run Mode — simulate after hours without real orders",
@@ -838,10 +841,6 @@ def render_live_monitor() -> None:
 
     # ── Metrics row ────────────────────────────────────────────────────────
     metric_row(equity, total_pnl, regime, cycle_secs)
-    st.divider()
-
-    # ── Strategy profile panel ─────────────────────────────────────────────
-    render_strategy_profile_panel()
     st.divider()
 
     # ── Open positions ─────────────────────────────────────────────────────

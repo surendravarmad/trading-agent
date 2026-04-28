@@ -60,6 +60,12 @@ class OrderExecutor:
     # Warn if the live credit deviates from the plan by more than this fraction
     PRICE_DRIFT_WARN_PCT = 0.10   # 10 %
 
+    # Standard option NBBO tick size for limit orders >= $0.05 ($0.01 for
+    # penny pilot below $3, but our credit spreads always price above that).
+    # Submitting at mid - 1 tick lets the order land aggressively enough to
+    # actually fill instead of camping at the un-fillable mid.
+    OPTION_TICK = 0.05
+
     def __init__(self, api_key: str, secret_key: str,
                  base_url: str = "https://paper-api.alpaca.markets/v2",
                  trade_plan_dir: str = "trade_plans",
@@ -281,20 +287,55 @@ class OrderExecutor:
             self._append_to_plan(plan_path, run_id, {"order_result": result})
             return result
 
-        # Alpaca sign convention: credit → negative limit_price
-        limit_price_value = -abs(live_credit)
+        # ------------------------------------------------------------------
+        # 1-tick "fill haircut": mid-quote credit limits almost never fill
+        # in practice — the market makers want a penny, and on a 7-DTE
+        # spread theta drains the mid past our static limit within hours.
+        # Try shaving one tick ($0.05) off the credit so the limit lands
+        # below mid; only do so if the haircut credit still passes the
+        # economics floors (C/W ratio + max-loss).  If the haircut breaks
+        # the floor, fall back to mid with a warning so we don't violate
+        # risk guardrails just to chase a fill.
+        # ------------------------------------------------------------------
+        haircut_credit = round(live_credit - self.OPTION_TICK, 2)
+        submit_credit = live_credit
+        if haircut_credit > 0:
+            ok_haircut, haircut_reason = self._recheck_live_economics(
+                plan, haircut_credit, account_balance)
+            if ok_haircut:
+                submit_credit = haircut_credit
+                logger.info(
+                    "[%s] Applying 1-tick fill haircut: limit credit "
+                    "$%.2f (live mid $%.2f − $%.2f tick)",
+                    plan.ticker, submit_credit, live_credit,
+                    self.OPTION_TICK)
+            else:
+                logger.warning(
+                    "[%s] 1-tick haircut would breach guardrails (%s) — "
+                    "submitting at live mid $%.2f instead. Order may not "
+                    "fill quickly.",
+                    plan.ticker, haircut_reason, live_credit)
+        else:
+            logger.warning(
+                "[%s] Live credit $%.2f too small to apply 1-tick "
+                "haircut without going non-positive — submitting at mid.",
+                plan.ticker, live_credit)
 
-        # Size off the LIVE credit so qty reflects the economics we're
-        # actually submitting, not the stale planning-time credit.
-        qty = self._calculate_qty(plan, account_balance, live_credit=live_credit)
+        # Alpaca sign convention: credit → negative limit_price
+        limit_price_value = -abs(submit_credit)
+
+        # Size off the credit we're ACTUALLY submitting (post-haircut).
+        # qty must reflect the economics on the wire, not the un-haircut
+        # mid, so risk sizing stays consistent with what fills.
+        qty = self._calculate_qty(plan, account_balance, live_credit=submit_credit)
         if qty < 1:
-            max_loss_per_contract = (plan.spread_width - live_credit) * 100
+            max_loss_per_contract = (plan.spread_width - submit_credit) * 100
             max_risk_dollars = account_balance * self.max_risk_pct
             reason = (
                 f"qty=0: max_loss_per_contract ${max_loss_per_contract:.2f} "
                 f"> sizing budget ${max_risk_dollars:.2f} "
                 f"({self.max_risk_pct*100:.0f}% × ${account_balance:,.2f}) "
-                f"(live_credit=${live_credit:.2f})"
+                f"(submit_credit=${submit_credit:.2f})"
             )
             logger.error(
                 "[%s] Position sizing produced qty=0 — %s. Aborting order "

@@ -9,3 +9,4 @@ dist/
 build/
 .venv/
 .vscode/launch.json
+AGENT_LOG

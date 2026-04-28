@@ -1,4 +1,15 @@
 {
-  "profile": "aggressive",
-  "directional_bias": "auto"
+  "profile": "custom",
+  "directional_bias": "auto",
+  "custom": {
+    "max_delta": 0.35,
+    "dte_vertical": 7,
+    "dte_iron_condor": 21,
+    "dte_mean_reversion": 7,
+    "dte_window_days": 7,
+    "width_mode": "pct_of_spot",
+    "width_value": 0.015,
+    "min_credit_ratio": 0.3,
+    "max_risk_pct": 0.02
+  }
 }

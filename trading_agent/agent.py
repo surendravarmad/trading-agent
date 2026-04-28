@@ -50,11 +50,12 @@ import glob
 import json
 import logging
 import os
+import re
 import threading
 import time
 from concurrent.futures import Future, ThreadPoolExecutor
-from datetime import datetime, timezone
-from typing import Dict, List, Optional
+from datetime import datetime, timedelta, timezone
+from typing import Dict, List, Optional, Set
 
 from trading_agent.config import AppConfig, load_config
 from trading_agent.journal_kb import JournalKB
@@ -110,6 +111,30 @@ CYCLE_TIMEOUT_SECONDS = 270   # 4 min 30 sec
 
 # Number of consecutive cycles an exit signal must repeat before acting.
 EXIT_DEBOUNCE_REQUIRED = 3
+
+# Stale-order policy.
+#
+# An open limit order whose age (since Alpaca's `created_at`) exceeds this
+# threshold is cancelled at the start of every cycle — the next planning
+# pass will re-price against fresh quotes.  Set high enough to give a
+# midday combo a fair shot at filling, low enough to recover before
+# theta has chewed through the original limit.
+STALE_ORDER_MAX_AGE_MIN = 15
+
+# OCC option symbol → underlying root.  Format ROOT(1-6) + YYMMDD(6) +
+# C/P(1) + STRIKE*1000(8).  Used both for stale-order cancel scoping
+# and open-order dedup, so identical to the dashboard helper in
+# streamlit/live_monitor.py.
+_OCC_RE = re.compile(r"^([A-Z]{1,6})(\d{6})([CP])(\d{8})$")
+
+
+def _root_from_occ(symbol: str) -> str:
+    """Return the OCC root (e.g. ``GOOG260508P00337500`` → ``GOOG``)
+    or the empty string if the symbol can't be parsed."""
+    if not symbol:
+        return ""
+    m = _OCC_RE.match(symbol)
+    return m.group(1) if m else ""
 
 
 class TradingAgent:
@@ -487,6 +512,33 @@ class TradingAgent:
                 tickers_with_positions.add(sr.get("underlying", ""))
 
         # ------------------------------------------------------------------
+        # Stage 1.5: Stale-order maintenance
+        # ------------------------------------------------------------------
+        # Cancel stuck limits that have been on the book longer than
+        # STALE_ORDER_MAX_AGE_MIN so the next planning pass can re-price
+        # against a fresh mid.  Then collect the tickers of every
+        # remaining open order and union them into tickers_with_positions
+        # — the original dedup only blocked tickers with FILLED spreads,
+        # which let the cycle stack identical limit orders on top of an
+        # unfilled one (root cause of the duplicate-GOOG issue).
+        try:
+            self._cancel_stale_orders(tickers)
+        except Exception as exc:
+            logger.warning("Stale-order maintenance failed: %s", exc)
+
+        try:
+            tickers_with_open_orders = self._tickers_with_open_orders()
+            if tickers_with_open_orders:
+                logger.info(
+                    "Open orders pending fill on: %s — these tickers will "
+                    "be skipped in Stage 2 to avoid duplicate submissions",
+                    sorted(tickers_with_open_orders),
+                )
+                tickers_with_positions |= tickers_with_open_orders
+        except Exception as exc:
+            logger.warning("Open-order dedup failed: %s", exc)
+
+        # ------------------------------------------------------------------
         # Stage 2: OPEN new positions
         # ------------------------------------------------------------------
         logger.info("=" * 70)
@@ -503,17 +555,24 @@ class TradingAgent:
                 break
 
             if ticker in tickers_with_positions:
-                logger.info("[%s] Already has an open spread — skipping", ticker)
+                # tickers_with_positions includes BOTH filled spreads
+                # (Stage 1) and pending limit orders (Stage 1.5 dedup),
+                # so this branch covers both.  The journal reason is
+                # kept generic to avoid log churn for a single string.
+                logger.info(
+                    "[%s] Already has an open spread or pending order — skipping",
+                    ticker,
+                )
                 self.journal_kb.log_signal(
                     ticker=ticker,
                     action="skipped_existing",
                     price=self._cached_price(ticker),
-                    raw_signal={"reason": "Existing open position"},
+                    raw_signal={"reason": "Existing open position or pending order"},
                 )
                 new_trade_results.append({
                     "ticker": ticker,
                     "status": "skipped",
-                    "reason": "Existing open position",
+                    "reason": "Existing open position or pending order",
                 })
                 continue
 
@@ -1042,6 +1101,123 @@ class TradingAgent:
             )
             return True
         return False
+
+    # ==================================================================
+    # Open-order dedup + stale-order maintenance
+    # ==================================================================
+
+    def _tickers_with_open_orders(self) -> Set[str]:
+        """
+        Return the set of underlying tickers that currently have at least
+        one open (pending-fill) order on Alpaca.
+
+        For multi-leg orders the broker's top-level ``symbol`` is empty,
+        so we recover the underlying by parsing the OCC root from each
+        leg.  Equity / single-leg orders carry the underlying directly.
+        """
+        out: Set[str] = set()
+        try:
+            open_orders = self.order_tracker.fetch_open_orders()
+        except Exception as exc:
+            logger.warning("Could not fetch open orders for dedup: %s", exc)
+            return out
+
+        for o in open_orders:
+            top = (o.symbol or "").upper().strip()
+            if top:
+                # Equity / single-leg: top-level symbol is the ticker
+                # (e.g. "SPY") — keep it as-is unless it's an OCC string.
+                root = _root_from_occ(top) or top
+                if root:
+                    out.add(root)
+            for leg in (o.legs or []):
+                root = _root_from_occ((leg.get("symbol") or "").upper())
+                if root:
+                    out.add(root)
+        return out
+
+    def _cancel_stale_orders(self, agent_tickers: List[str]) -> None:
+        """
+        Cancel limit orders that have been on the broker's book longer
+        than ``STALE_ORDER_MAX_AGE_MIN`` minutes.
+
+        Scoping
+        -------
+        Only orders whose underlying matches one of ``agent_tickers``
+        are cancelled — this keeps any manual trade you placed on a
+        ticker the agent doesn't manage off the chopping block.  Orders
+        younger than the threshold are also untouched, so a manual
+        order placed in the last 15 minutes is safe.
+
+        Why this matters
+        ----------------
+        The executor submits at the planning-time mid with
+        ``time_in_force="day"`` and never re-prices.  On a 7-DTE put
+        spread the achievable credit erodes minute by minute as theta
+        drains, so an unfilled limit becomes structurally un-fillable.
+        Cancelling and re-planning is the only way to keep the limit
+        anywhere near the live mid.
+        """
+        try:
+            open_orders = self.order_tracker.fetch_open_orders()
+        except Exception as exc:
+            logger.warning("Could not fetch open orders for stale check: %s", exc)
+            return
+
+        if not open_orders:
+            return
+
+        ticker_set = {t.upper() for t in (agent_tickers or [])}
+        cutoff = datetime.now(timezone.utc) - timedelta(minutes=STALE_ORDER_MAX_AGE_MIN)
+        cancelled = 0
+
+        for o in open_orders:
+            # Recover the underlying.  Multi-leg orders have empty
+            # top-level symbol; fall back to the first leg's OCC root.
+            roots = set()
+            top = (o.symbol or "").upper().strip()
+            if top:
+                roots.add(_root_from_occ(top) or top)
+            for leg in (o.legs or []):
+                r = _root_from_occ((leg.get("symbol") or "").upper())
+                if r:
+                    roots.add(r)
+            if not roots & ticker_set:
+                continue   # not on a ticker the agent manages
+
+            # Parse Alpaca's RFC3339 created_at.  It's already UTC.
+            created_raw = o.created_at or ""
+            if not created_raw:
+                continue
+            try:
+                created = datetime.fromisoformat(created_raw.replace("Z", "+00:00"))
+            except ValueError:
+                logger.debug("Order %s: unparseable created_at %r — skipping",
+                             o.order_id, created_raw)
+                continue
+            if created.tzinfo is None:
+                created = created.replace(tzinfo=timezone.utc)
+            if created > cutoff:
+                continue   # younger than the threshold
+
+            age_min = (datetime.now(timezone.utc) - created).total_seconds() / 60.0
+            logger.warning(
+                "[%s] Cancelling stale order %s (age %.1f min > %d min) — "
+                "next cycle will re-price",
+                next(iter(roots & ticker_set)), o.order_id, age_min,
+                STALE_ORDER_MAX_AGE_MIN,
+            )
+            if self.order_tracker.cancel_order(o.order_id):
+                cancelled += 1
+
+        if cancelled:
+            self.journal_kb.log_cycle_error(
+                "stale_orders_cancelled",
+                {
+                    "count": cancelled,
+                    "max_age_minutes": STALE_ORDER_MAX_AGE_MIN,
+                },
+            )
 
     # ==================================================================
     # Order status check

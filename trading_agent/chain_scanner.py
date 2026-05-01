@@ -32,13 +32,31 @@ that take more time to harvest.
 from __future__ import annotations
 
 import logging
+from collections import defaultdict
 from dataclasses import asdict, dataclass, field
 from datetime import date, datetime
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from trading_agent.calendar_utils import next_weekly_expiration
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Reject-reason taxonomy
+# ---------------------------------------------------------------------------
+# Stable string keys so the journal histogram is grep-able. Order roughly
+# matches the order checks fire inside ``_score_candidate_with_reason``.
+REJECT_NO_CHAIN              = "no_chain"
+REJECT_NO_SHORT_CONTRACT     = "no_short_contract"
+REJECT_NO_LONG_CONTRACT      = "no_long_contract"
+REJECT_NON_POSITIVE_WIDTH    = "non_positive_width"
+REJECT_DTE_NON_POSITIVE      = "dte_non_positive"
+REJECT_POP_BELOW_MIN         = "pop_below_min"
+REJECT_CREDIT_NON_POSITIVE   = "credit_non_positive"
+REJECT_CREDIT_GE_WIDTH       = "credit_ge_width"
+REJECT_CW_BELOW_FLOOR        = "cw_below_floor"
+REJECT_EV_NON_POSITIVE       = "ev_non_positive"
 
 
 # ---------------------------------------------------------------------------
@@ -141,6 +159,98 @@ def _score_candidate(credit: float, width: float, short_delta: float,
     return cw, pop, floor, ev, annualized
 
 
+def _score_candidate_with_reason(
+    credit: float, width: float, short_delta: float, dte: int,
+    edge_buffer: float, min_pop: float,
+) -> Dict[str, Any]:
+    """
+    Diagnostic sibling of ``_score_candidate``. Always returns a dict
+    describing the outcome — never None — so the scanner can build a
+    histogram of *why* candidates were rejected.
+
+    Result keys
+    -----------
+    status     : "accepted" | "rejected"
+    reason     : reject-reason key (when status == "rejected"); always
+                 one of the ``REJECT_*`` constants above
+    cw         : credit / width                (when computable)
+    pop        : 1 − |Δshort|                  (when computable)
+    cw_floor   : |Δ| × (1 + edge_buffer)       (when computable)
+    ev         : EV per $-risked               (when computable)
+    annualized : ev × (365/dte)                (only when accepted)
+
+    The check order intentionally mirrors ``_score_candidate`` so accept
+    decisions are bit-identical between the two functions.
+    """
+    if dte <= 0:
+        return {"status": "rejected", "reason": REJECT_DTE_NON_POSITIVE}
+    if width <= 0:
+        return {"status": "rejected", "reason": REJECT_NON_POSITIVE_WIDTH}
+    pop = _pop_from_delta(short_delta)
+    floor = _cw_floor(short_delta, edge_buffer)
+    if pop < min_pop:
+        return {"status": "rejected", "reason": REJECT_POP_BELOW_MIN,
+                "pop": pop, "cw_floor": floor}
+    if credit <= 0:
+        return {"status": "rejected", "reason": REJECT_CREDIT_NON_POSITIVE,
+                "pop": pop, "cw_floor": floor}
+    if credit >= width:
+        return {"status": "rejected", "reason": REJECT_CREDIT_GE_WIDTH,
+                "pop": pop, "cw_floor": floor, "cw": credit / width}
+    cw = credit / width
+    ev = _ev_per_dollar_risked(credit, width, short_delta)
+    if cw < floor:
+        return {"status": "rejected", "reason": REJECT_CW_BELOW_FLOOR,
+                "pop": pop, "cw_floor": floor, "cw": cw, "ev": ev}
+    if ev is None or ev <= 0:
+        return {"status": "rejected", "reason": REJECT_EV_NON_POSITIVE,
+                "pop": pop, "cw_floor": floor, "cw": cw, "ev": ev}
+    annualized = ev * (365.0 / dte)
+    return {"status": "accepted", "pop": pop, "cw_floor": floor,
+            "cw": cw, "ev": ev, "annualized": annualized}
+
+
+# ---------------------------------------------------------------------------
+# Diagnostics
+# ---------------------------------------------------------------------------
+
+@dataclass
+class ScanDiagnostics:
+    """
+    Per-scan summary attached to ``ChainScanner.last_diagnostics``. Fields
+    are journal-safe (no SpreadCandidate refs, all primitives).
+
+    Surfaced into ``signals.jsonl`` so a human reading the journal can
+    answer *why* zero candidates passed instead of just *that* zero passed.
+    """
+    grid_points_total:    int                 # |DTE| × |Δ| × |w|
+    expirations_resolved: int = 0             # weeklies actually picked
+    grid_points_priced:   int = 0             # tuples that reached scoring
+    rejects_by_reason:    Dict[str, int] = field(default_factory=dict)
+    # Best near-miss: highest-EV candidate that *only* failed the C/W floor
+    # gate. None when nothing came close enough to compute an EV. Stored as
+    # plain dict (not SpreadCandidate) to keep the diagnostic decoupled
+    # from the journal format.
+    best_near_miss:       Optional[Dict[str, Any]] = None
+
+    def record(self, reason: str, count: int = 1) -> None:
+        """Increment the histogram bucket for ``reason``."""
+        if count <= 0:
+            return
+        self.rejects_by_reason[reason] = (
+            self.rejects_by_reason.get(reason, 0) + count
+        )
+
+    def to_journal_dict(self) -> Dict[str, Any]:
+        return {
+            "grid_points_total":    self.grid_points_total,
+            "expirations_resolved": self.expirations_resolved,
+            "grid_points_priced":   self.grid_points_priced,
+            "rejects_by_reason":    dict(self.rejects_by_reason),
+            "best_near_miss":       self.best_near_miss,
+        }
+
+
 # ---------------------------------------------------------------------------
 # ChainScanner
 # ---------------------------------------------------------------------------
@@ -171,6 +281,10 @@ class ChainScanner:
         self.preset = preset
         self.dte_window_days = dte_window_days
         self.max_candidates = max_candidates
+        # Populated by every ``scan()`` call so callers (StrategyPlanner,
+        # the agent journal write path) can surface *why* zero candidates
+        # passed without inspecting log lines.
+        self.last_diagnostics: Optional[ScanDiagnostics] = None
 
     # ------------------------------------------------------------------
     # Public scan API
@@ -199,6 +313,17 @@ class ChainScanner:
         opt_type = "put" if side == "bull_put" else "call"
         candidates: List[SpreadCandidate] = []
 
+        # Diagnostics scaffolding — sized off the preset grid so the user
+        # can read "evaluated 12 of 16 grid points" right out of the journal.
+        n_dte = len(list(self.preset.dte_grid))
+        n_delta = len(list(self.preset.delta_grid))
+        n_width = len(list(self.preset.width_grid_pct))
+        diag = ScanDiagnostics(grid_points_total=n_dte * n_delta * n_width)
+        # Track the highest-EV candidate that *only* failed the C/W floor —
+        # the actionable near-miss the user wants to see when zero
+        # candidates pass.
+        best_near_miss_payload: Optional[Dict[str, Any]] = None
+
         # 1. Pick distinct expirations (grid items collapse onto the same
         #    weekly when DTEs are close together; dedup on the resolved
         #    expiration string so we don't fetch the same chain twice).
@@ -222,15 +347,19 @@ class ChainScanner:
             if exp_str not in seen_exps or dte < seen_exps[exp_str]:
                 seen_exps[exp_str] = dte
 
+        diag.expirations_resolved = len(seen_exps)
         if not seen_exps:
             logger.warning("[%s] Scanner found no expirations for grid %s",
                            ticker, list(self.preset.dte_grid))
+            self.last_diagnostics = diag
             return []
 
         # 2. For each (expiration, target_delta, width), score one candidate.
         for exp_str, dte in seen_exps.items():
             chain = self.data.fetch_option_chain(ticker, exp_str, opt_type)
             if not chain:
+                # All (Δ × width) tuples for this expiration are dead.
+                diag.record(REJECT_NO_CHAIN, n_delta * n_width)
                 logger.debug("[%s] No %s chain for %s — skipping",
                              ticker, opt_type, exp_str)
                 continue
@@ -241,6 +370,7 @@ class ChainScanner:
             for target_delta in self.preset.delta_grid:
                 short_contract = self._find_short(chain, target_delta)
                 if short_contract is None:
+                    diag.record(REJECT_NO_SHORT_CONTRACT, n_width)
                     continue
                 short_strike = float(short_contract["strike"])
 
@@ -248,38 +378,69 @@ class ChainScanner:
                     raw_width = width_pct * spot_proxy
                     width = self._snap_width_to_grid(raw_width, grid_step)
                     if width <= 0:
+                        diag.record(REJECT_NON_POSITIVE_WIDTH)
                         continue
                     long_strike = (short_strike - width if side == "bull_put"
                                    else short_strike + width)
                     long_contract = self._find_strike(chain, long_strike)
                     if long_contract is None:
+                        diag.record(REJECT_NO_LONG_CONTRACT)
                         continue
                     actual_width = abs(short_strike - float(long_contract["strike"]))
                     if actual_width <= 0:
+                        diag.record(REJECT_NON_POSITIVE_WIDTH)
                         continue
 
                     credit = round(
                         float(short_contract["bid"]) - float(long_contract["ask"]),
                         2,
                     )
-                    scored = _score_candidate(
+                    short_delta = float(short_contract["delta"])
+
+                    diag.grid_points_priced += 1
+                    result = _score_candidate_with_reason(
                         credit=credit,
                         width=actual_width,
-                        short_delta=float(short_contract["delta"]),
+                        short_delta=short_delta,
                         dte=dte,
                         edge_buffer=self.preset.edge_buffer,
                         min_pop=self.preset.min_pop,
                     )
-                    if scored is None:
+                    if result["status"] == "rejected":
+                        reason = result["reason"]
+                        diag.record(reason)
+                        # Surface the closest the chain came to passing —
+                        # only candidates that failed *only* the C/W floor
+                        # qualify (those have full pop/cw/ev populated and
+                        # are within reach of a tighter edge_buffer dial).
+                        if reason == REJECT_CW_BELOW_FLOOR:
+                            cand_payload = {
+                                "expiration":   exp_str,
+                                "dte":          dte,
+                                "short_strike": short_strike,
+                                "long_strike":  float(long_contract["strike"]),
+                                "short_delta":  round(short_delta, 4),
+                                "credit":       credit,
+                                "width":        round(actual_width, 4),
+                                "cw_ratio":     round(result.get("cw") or 0.0, 4),
+                                "cw_floor":     round(result.get("cw_floor") or 0.0, 4),
+                                "pop":          round(result.get("pop") or 0.0, 4),
+                                "ev":           round(result.get("ev") or 0.0, 4),
+                                "target_delta": float(target_delta),
+                                "width_pct":    float(width_pct),
+                            }
+                            cur_ev = (best_near_miss_payload or {}).get("ev", -1e9)
+                            if cand_payload["ev"] > cur_ev:
+                                best_near_miss_payload = cand_payload
                         continue
-                    cw, pop, floor, ev, annualized = scored
+
                     candidates.append(SpreadCandidate(
                         side=side,
                         expiration=exp_str,
                         dte=dte,
                         short_strike=short_strike,
                         long_strike=float(long_contract["strike"]),
-                        short_delta=float(short_contract["delta"]),
+                        short_delta=short_delta,
                         short_symbol=str(short_contract.get("symbol", "")),
                         long_symbol=str(long_contract.get("symbol", "")),
                         short_bid=float(short_contract["bid"]),
@@ -288,11 +449,11 @@ class ChainScanner:
                         long_ask=float(long_contract["ask"]),
                         credit=credit,
                         width=actual_width,
-                        cw_ratio=cw,
-                        pop=pop,
-                        cw_floor=floor,
-                        ev_per_dollar_risked=ev,
-                        annualized_score=annualized,
+                        cw_ratio=result["cw"],
+                        pop=result["pop"],
+                        cw_floor=result["cw_floor"],
+                        ev_per_dollar_risked=result["ev"],
+                        annualized_score=result["annualized"],
                         target_delta=float(target_delta),
                         width_pct=float(width_pct),
                     ))
@@ -303,12 +464,23 @@ class ChainScanner:
             reverse=True,
         )
 
+        diag.best_near_miss = best_near_miss_payload
+        self.last_diagnostics = diag
+
         if not candidates:
-            logger.info("[%s] Scanner found 0 positive-EV candidates "
-                        "(%d expirations, %d Δ × %d w grid points)",
-                        ticker, len(seen_exps),
-                        len(self.preset.delta_grid),
-                        len(self.preset.width_grid_pct))
+            # Promote the top reject reason into the log line so an operator
+            # tailing trading_agent.log doesn't have to open the journal.
+            top_reason = max(diag.rejects_by_reason.items(),
+                             key=lambda kv: kv[1], default=(None, 0))
+            logger.info(
+                "[%s] Scanner found 0 positive-EV candidates "
+                "(%d expirations, %d/%d grid points priced; "
+                "top reject=%s×%d; near-miss EV=%.4f)",
+                ticker, len(seen_exps),
+                diag.grid_points_priced, diag.grid_points_total,
+                top_reason[0], top_reason[1],
+                (best_near_miss_payload or {}).get("ev", 0.0),
+            )
         else:
             top = candidates[0]
             logger.info(
@@ -394,9 +566,22 @@ class ChainScanner:
 
 __all__ = [
     "SpreadCandidate",
+    "ScanDiagnostics",
     "ChainScanner",
     "_pop_from_delta",
     "_cw_floor",
     "_ev_per_dollar_risked",
     "_score_candidate",
+    "_score_candidate_with_reason",
+    # Reject-reason taxonomy (stable journal keys).
+    "REJECT_NO_CHAIN",
+    "REJECT_NO_SHORT_CONTRACT",
+    "REJECT_NO_LONG_CONTRACT",
+    "REJECT_NON_POSITIVE_WIDTH",
+    "REJECT_DTE_NON_POSITIVE",
+    "REJECT_POP_BELOW_MIN",
+    "REJECT_CREDIT_NON_POSITIVE",
+    "REJECT_CREDIT_GE_WIDTH",
+    "REJECT_CW_BELOW_FLOOR",
+    "REJECT_EV_NON_POSITIVE",
 ]

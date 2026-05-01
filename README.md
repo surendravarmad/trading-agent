@@ -914,3 +914,61 @@ Backtester(
 Every trade attempt is logged as a single JSON line including `fingpt_sentiment`, `fingpt_event_risk`, `fingpt_recommendation`, `fingpt_agreement`, `fingpt_hallucination_flags`, and `fingpt_verified_by` when the sentiment pipeline is active.
 
 Action values: `dry_run`, `submitted`, `rejected`, `skipped_by_llm`, `skipped_existing`, `skipped_liquidation_mode`, `skipped`, `error`, `cycle_timeout`, `daily_drawdown_circuit_breaker`.
+
+### `scan_results` block (adaptive scanner only)
+
+When the active preset is in adaptive mode, every plan() invocation that runs the chain scanner also writes a `raw_signal.scan_results` block. This is the single source of truth for *why* the scanner picked / rejected each ticker — populated even when zero candidates pass.
+
+```jsonc
+"scan_results": {
+  "scan_mode":        "adaptive",
+  "side":             "bull_put",
+  "edge_buffer":      0.10,
+  "min_pop":          0.55,
+  "candidates_total": 0,                  // # SpreadCandidates that passed all filters
+  "selected_index":   -1,                 // 0 if scanner picked one, -1 if nothing passed
+  "top_k":            [],                 // up to 10 SpreadCandidate.to_journal_dict() entries
+  "diagnostics": {
+    "grid_points_total":    16,           // |DTE_grid| × |Δ_grid| × |w_grid|
+    "grid_points_priced":   12,           // tuples that reached scoring (chain present, strikes found)
+    "expirations_resolved": 4,            // distinct weekly expirations selected from DTE_grid
+    "rejects_by_reason": {
+      "cw_below_floor":   11,             // most common reject — see taxonomy below
+      "no_long_contract":  1
+    },
+    "best_near_miss": {                   // highest-EV candidate that ONLY failed the C/W floor
+      "expiration":   "2026-05-15",
+      "dte":          14,
+      "short_strike": 590.0,
+      "long_strike":  585.0,
+      "short_delta":  -0.20,
+      "credit":       0.95,
+      "width":        5.0,
+      "cw_ratio":     0.19,
+      "cw_floor":     0.22,                // |Δ| × (1 + edge_buffer)
+      "pop":          0.80,
+      "ev":           -0.04
+    }
+  }
+}
+```
+
+**How to read it.** When `candidates_total == 0`, the answer to *"why didn't the scanner trade?"* is in two fields:
+
+1. `rejects_by_reason` — which filter is the agent hitting most? `cw_below_floor` dominating means premium is structurally too thin for the current `edge_buffer`. `no_long_contract` dominating means the strike grid is too sparse for the requested width. `pop_below_min` means the chain doesn't list strikes deep enough OTM.
+2. `best_near_miss` — the closest the chain came to passing. If `cw_ratio` is close to `cw_floor` (e.g. 0.19 vs 0.22), one click of `EDGE_BUFFER` toward zero would unblock the trade. If they're far apart, the chain simply isn't paying enough — wait or skip.
+
+**Reject-reason taxonomy** (stable string keys for grep / dashboards):
+
+| Key | Meaning |
+|---|---|
+| `no_chain` | `fetch_option_chain()` returned empty for that expiration; whole grid block skipped |
+| `no_short_contract` | No contract in the chain matches the target Δ |
+| `no_long_contract` | No contract found at the protective strike (grid too sparse for the requested width) |
+| `non_positive_width` | Snapped width came out as 0 or negative — should never fire on real chains |
+| `dte_non_positive` | Resolved expiration is today or earlier — guards against stale calendar data |
+| `pop_below_min` | `1 − \|Δshort\| < min_pop` — Δ-target grid is too aggressive (deep ITM) |
+| `credit_non_positive` | `bid_short − ask_long ≤ 0` — chain is wide enough that the limit-order math doesn't pay |
+| `credit_ge_width` | Credit ≥ width — would be a debit, not a credit; structurally invalid |
+| `cw_below_floor` | C/W < `\|Δ\| × (1 + edge_buffer)` — most common when premiums are thin |
+| `ev_non_positive` | Computed EV/$risked ≤ 0 (rare; mostly a rounding-edge guard) |

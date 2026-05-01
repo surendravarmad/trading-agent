@@ -166,6 +166,12 @@ class StrategyPlanner:
         # every plan() call.
         self.last_scan_candidates: List[SpreadCandidate] = []
         self.last_scan_side: Optional[str] = None
+        # Per-scan diagnostics (reject-reason histogram, best near-miss,
+        # grid coverage). Mirrors ChainScanner.last_diagnostics; ``None``
+        # in static mode or when no scan has run this cycle. Surfaced into
+        # signals.jsonl so the user can answer "why did the scanner pass?"
+        # straight from the journal.
+        self.last_scan_diagnostics: Optional[Dict] = None
 
         # Per-strategy DTE targets and search window.
         self._dte_vertical       = dte_vertical       if dte_vertical       is not None else self.TARGET_DTE
@@ -227,6 +233,7 @@ class StrategyPlanner:
         # one's journal.
         self.last_scan_candidates = []
         self.last_scan_side = None
+        self.last_scan_diagnostics = None
         # --- Priority 1: Mean Reversion (3-std BB touch) ---
         # Mean reversion intentionally bypasses the inter-market gate —
         # a 3-std band touch IS a fear-spike condition, and the side
@@ -482,9 +489,14 @@ class StrategyPlanner:
                                      fallback_expiration,
                                      f"Adaptive scan crashed: {exc}")
 
-        # Capture for the journal regardless of outcome.
+        # Capture for the journal regardless of outcome — both the picks
+        # AND the diagnostics so a zero-candidate cycle still tells a story.
         self.last_scan_candidates = list(candidates)
         self.last_scan_side = side
+        scanner_diag = getattr(self._scanner, "last_diagnostics", None)
+        self.last_scan_diagnostics = (
+            scanner_diag.to_journal_dict() if scanner_diag is not None else None
+        )
 
         if not candidates:
             reason = ("No positive-EV candidate found across DTE×Δ×width "

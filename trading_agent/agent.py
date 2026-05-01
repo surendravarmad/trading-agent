@@ -1021,32 +1021,51 @@ class TradingAgent:
               "side":           "bull_put" | "bear_call",
               "scan_mode":      "adaptive",
               "edge_buffer":    0.10,
+              "min_pop":        0.55,
               "candidates_total": 8,
               "selected_index":  0,             # index into the K below
-              "top_k": [ <SpreadCandidate.to_journal_dict()>, ... ]
+              "top_k": [ <SpreadCandidate.to_journal_dict()>, ... ],
+              "diagnostics": {
+                  "grid_points_total":    16,
+                  "grid_points_priced":   12,
+                  "expirations_resolved": 4,
+                  "rejects_by_reason":    {"cw_below_floor": 11, ...},
+                  "best_near_miss":       {<SpreadCandidate-like dict>}
+              }
             }
 
         ``selected_index`` is 0 when the scanner picked a candidate
         (top-of-list) and -1 when no candidate cleared the floor.
+
+        The ``diagnostics`` block is the actionable answer to *"why didn't
+        the scanner pass?"*. ``best_near_miss`` is the single highest-EV
+        candidate that failed only the C/W floor — quoting it lets the
+        user see "the closest we came was C/W=0.18, needed 0.22" without
+        digging through trading_agent.log.
         """
         planner = self.strategy_planner
         if not getattr(planner, "is_adaptive", False):
             return None
         candidates = list(getattr(planner, "last_scan_candidates", []) or [])
         side = getattr(planner, "last_scan_side", None)
+        diagnostics = getattr(planner, "last_scan_diagnostics", None)
         # No scan ran this ticker (e.g. iron condor or mean-reversion path
         # in adaptive preset — those still use the static builders today).
-        if not candidates and side is None:
+        if not candidates and side is None and diagnostics is None:
             return None
         top_k = candidates[: self._SCAN_JOURNAL_TOPK]
-        return {
+        block: Dict = {
             "scan_mode":        "adaptive",
             "side":             side,
             "edge_buffer":      float(getattr(self.preset, "edge_buffer", 0.10)),
+            "min_pop":          float(getattr(self.preset, "min_pop", 0.55)),
             "candidates_total": len(candidates),
             "selected_index":   0 if candidates else -1,
             "top_k":            [c.to_journal_dict() for c in top_k],
         }
+        if diagnostics is not None:
+            block["diagnostics"] = diagnostics
+        return block
 
     def _log_signal(
         self,

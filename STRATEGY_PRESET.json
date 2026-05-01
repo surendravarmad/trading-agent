@@ -2,7 +2,7 @@
   "profile": "custom",
   "directional_bias": "auto",
   "scan_mode": "adaptive",
-  "edge_buffer": 0.1,
+  "edge_buffer": 0.05,
   "custom": {
     "max_delta": 0.25,
     "dte_vertical": 7,

@@ -24,11 +24,13 @@ import pytest
 
 from trading_agent import chain_scanner as cs
 from trading_agent.chain_scanner import (
+    DEFAULT_FILL_HAIRCUT,
     ChainScanner,
     SpreadCandidate,
     _cw_floor,
     _ev_per_dollar_risked,
     _pop_from_delta,
+    _quote_credit,
     _score_candidate,
 )
 from trading_agent.strategy_presets import BALANCED
@@ -114,6 +116,76 @@ class TestEVPerDollarRisked:
     def test_arbitrage_credit_equals_width_returns_none(self):
         # CW = 1 → max-loss = 0 → division by zero would explode
         assert _ev_per_dollar_risked(5.0, 5.0, -0.30) is None
+
+
+class TestQuoteCredit:
+    """
+    NBBO-mid based credit estimator. Validates the four behaviours that
+    matter for live operation:
+
+      • Both legs quoted → mid-mid minus haircut (the common case).
+      • Missing/zero short bid → fall back to bid (conservative for sold leg).
+      • Missing/zero long ask → fall back to ask (conservative for bought leg).
+      • Tight market with no haircut tolerance → never produces negative credit.
+    """
+
+    def test_both_quotes_present_uses_mid_minus_haircut(self):
+        # short bid 1.00 / ask 1.10  → mid 1.05
+        # long  bid 0.40 / ask 0.50  → mid 0.45
+        # raw mid credit = 1.05 - 0.45 = 0.60; haircut $0.02 → 0.58
+        c = _quote_credit(short_bid=1.00, short_ask=1.10,
+                          long_bid =0.40, long_ask =0.50)
+        assert c == pytest.approx(0.58)
+
+    def test_zero_haircut_returns_pure_mid(self):
+        c = _quote_credit(short_bid=1.00, short_ask=1.10,
+                          long_bid =0.40, long_ask =0.50,
+                          fill_haircut=0.0)
+        assert c == pytest.approx(0.60)
+
+    def test_strictly_better_than_worst_case(self):
+        # mid pricing should never be worse than the legacy
+        # ``short_bid − long_ask`` estimate by more than the haircut
+        sb, sa, lb, la = 1.20, 1.30, 0.55, 0.65
+        worst_case = round(sb - la, 2)            # legacy
+        c = _quote_credit(sb, sa, lb, la, fill_haircut=0.0)
+        assert c >= worst_case                    # never worse at zero haircut
+        assert c == pytest.approx(((sb + sa) / 2) - ((lb + la) / 2))
+
+    def test_missing_short_bid_falls_back_to_bid(self):
+        # short_bid = 0 → can't form mid; fall back to bid (=0).
+        # Effective short side is 0, so credit can only be zero or negative
+        # → clipped to 0.
+        c = _quote_credit(short_bid=0.0,  short_ask=1.10,
+                          long_bid =0.40, long_ask =0.50)
+        assert c == 0.0
+
+    def test_missing_long_ask_falls_back_to_ask(self):
+        # long_ask = 0 → fall back to ask (=0). Cheap long leg lifts credit
+        # past the haircut.
+        # short mid = 1.05, long ask = 0 → credit = 1.05 - 0.02 = 1.03
+        c = _quote_credit(short_bid=1.00, short_ask=1.10,
+                          long_bid =0.40, long_ask =0.0)
+        assert c == pytest.approx(1.03)
+
+    def test_negative_credit_clipped_to_zero(self):
+        # short bid/ask both 0, long bid/ask both 1.00 → credit hugely
+        # negative; helper must not propagate that as a "credit" — caller
+        # rejects credit_non_positive on its own, but the contract is a
+        # non-negative dollar amount.
+        c = _quote_credit(short_bid=0.0, short_ask=0.0,
+                          long_bid =1.0, long_ask =1.0)
+        assert c == 0.0
+
+    def test_default_haircut_constant_used(self):
+        # Sanity: the helper's default haircut equals the public constant,
+        # so callers (and tests) don't drift.
+        c_default  = _quote_credit(short_bid=1.00, short_ask=1.10,
+                                   long_bid =0.40, long_ask =0.50)
+        c_explicit = _quote_credit(short_bid=1.00, short_ask=1.10,
+                                   long_bid =0.40, long_ask =0.50,
+                                   fill_haircut=DEFAULT_FILL_HAIRCUT)
+        assert c_default == c_explicit
 
 
 class TestScoreCandidate:

@@ -258,7 +258,7 @@ def _load_journal_df() -> pd.DataFrame:
     empty = pd.DataFrame(
         columns=["timestamp", "account_balance", "ticker", "action",
                  "regime", "checks_passed", "checks_failed", "notes",
-                 "rsi_14", "sma_50", "sma_200"]
+                 "rsi_14", "sma_50", "sma_200", "scan_results"]
     )
     if not JOURNAL_PATH.exists():
         return empty
@@ -284,6 +284,10 @@ def _load_journal_df() -> pd.DataFrame:
                     "rsi_14":          rs.get("rsi_14", 0) or 0,
                     "sma_50":          rs.get("sma_50", 0) or 0,
                     "sma_200":         rs.get("sma_200", 0) or 0,
+                    # Adaptive-scanner block. Empty dict on legacy records
+                    # so downstream rendering can do truthiness checks
+                    # without KeyError; populated dict on new records.
+                    "scan_results":    rs.get("scan_results") or {},
                 })
             except (json.JSONDecodeError, KeyError):
                 continue
@@ -294,6 +298,158 @@ def _load_journal_df() -> pd.DataFrame:
     df.sort_values("timestamp", inplace=True)
     df.reset_index(drop=True, inplace=True)
     return df
+
+
+def _scanner_diagnostics_from_journal(
+    df: pd.DataFrame, lookback_rows: int = 200,
+) -> Tuple[pd.DataFrame, Dict[str, int], Dict[str, int]]:
+    """
+    Project scanner output from ``signals.jsonl`` into three render-ready
+    pieces: per-ticker latest verdict, aggregate reject-reason histogram,
+    and per-side candidate counts.
+
+    The latest-per-ticker frame answers *"what did the scanner find on the
+    most recent cycle for SPY/QQQ/...?"* — one row per ticker with the
+    near-miss credit/EV gap. The histogram answers *"across the last N
+    cycles, which filter is rejecting most candidates?"* — telling you
+    whether to lower edge_buffer (cw_below_floor dominates) or widen the
+    Δ grid (pop_below_min dominates).
+    """
+    cols = ["ticker", "side", "candidates", "selected", "edge_buffer",
+            "min_pop", "grid_total", "grid_priced", "top_reject",
+            "top_reject_count", "near_miss_credit", "near_miss_cw",
+            "near_miss_floor", "near_miss_ev", "timestamp"]
+    empty = pd.DataFrame(columns=cols)
+    if df.empty or "scan_results" not in df.columns:
+        return empty, {}, {}
+
+    # Restrict to records that actually carry scan_results — older
+    # legacy records will silently fall out.
+    has_scan = df[df["scan_results"].apply(lambda x: isinstance(x, dict) and bool(x))]
+    if has_scan.empty:
+        return empty, {}, {}
+    has_scan = has_scan.tail(lookback_rows)
+
+    latest_rows: Dict[str, Dict] = {}        # ticker → latest row dict
+    reject_hist: Dict[str, int] = {}         # reason → count across window
+    side_counts: Dict[str, int] = {}         # side  → candidates_total sum
+
+    for _, rec in has_scan.iterrows():
+        sr = rec["scan_results"] or {}
+        diag = sr.get("diagnostics") or {}
+        side = sr.get("side") or "—"
+        side_counts[side] = side_counts.get(side, 0) + int(sr.get("candidates_total") or 0)
+
+        for reason, count in (diag.get("rejects_by_reason") or {}).items():
+            reject_hist[reason] = reject_hist.get(reason, 0) + int(count)
+
+        nm = diag.get("best_near_miss") or {}
+        rejects = diag.get("rejects_by_reason") or {}
+        if rejects:
+            top_r, top_c = max(rejects.items(), key=lambda kv: kv[1])
+        else:
+            top_r, top_c = "—", 0
+        latest_rows[rec["ticker"]] = {
+            "ticker":           rec["ticker"],
+            "side":             side,
+            "candidates":       int(sr.get("candidates_total") or 0),
+            "selected":         int(sr.get("selected_index") or -1),
+            "edge_buffer":      float(sr.get("edge_buffer") or 0.0),
+            "min_pop":          float(sr.get("min_pop") or 0.0),
+            "grid_total":       int(diag.get("grid_points_total") or 0),
+            "grid_priced":      int(diag.get("grid_points_priced") or 0),
+            "top_reject":       top_r,
+            "top_reject_count": top_c,
+            "near_miss_credit": float(nm.get("credit") or 0.0) if nm else 0.0,
+            "near_miss_cw":     float(nm.get("cw_ratio") or 0.0) if nm else 0.0,
+            "near_miss_floor":  float(nm.get("cw_floor") or 0.0) if nm else 0.0,
+            "near_miss_ev":     float(nm.get("ev") or 0.0) if nm else 0.0,
+            "timestamp":        rec["timestamp"],
+        }
+
+    latest_df = pd.DataFrame(list(latest_rows.values()), columns=cols)
+    if not latest_df.empty:
+        latest_df.sort_values("timestamp", ascending=False, inplace=True)
+        latest_df.reset_index(drop=True, inplace=True)
+    return latest_df, reject_hist, side_counts
+
+
+def _render_scanner_diagnostics_panel(journal_df: pd.DataFrame) -> None:
+    """
+    Render the "Adaptive Scanner Diagnostics" expander. No-op-friendly:
+    when no records carry ``scan_results`` the panel renders an info
+    message instead of disappearing — so users running an older agent
+    binary aren't left wondering why the panel is empty.
+    """
+    with st.expander("🔬 Adaptive Scanner Diagnostics", expanded=False):
+        if journal_df.empty:
+            st.info("No journal entries yet.")
+            return
+
+        latest_df, reject_hist, side_counts = _scanner_diagnostics_from_journal(
+            journal_df, lookback_rows=200,
+        )
+        if latest_df.empty:
+            st.info(
+                "No `scan_results` in the recent journal. The agent may be "
+                "running in static-mode (set `SCAN_MODE=adaptive` in the "
+                "Strategy Profile to enable the scanner) or you haven't "
+                "completed a cycle since upgrading to the diagnostics build."
+            )
+            return
+
+        # ── Top: per-ticker latest verdict ─────────────────────────────
+        st.caption(
+            "Latest scanner verdict per ticker (most recent cycle). "
+            "**Near-miss** = the highest-EV candidate that *only* failed "
+            "the C/W floor — closing the gap between **near_miss_cw** and "
+            "**near_miss_floor** is the lever (lower `EDGE_BUFFER`, or wait)."
+        )
+        # Format floats compactly without copying the full df.
+        display = latest_df.copy()
+        for col, fmt in (
+            ("edge_buffer",      "{:.2%}"),
+            ("min_pop",          "{:.2%}"),
+            ("near_miss_cw",     "{:.4f}"),
+            ("near_miss_floor",  "{:.4f}"),
+            ("near_miss_ev",     "{:+.4f}"),
+            ("near_miss_credit", "${:.2f}"),
+        ):
+            display[col] = display[col].apply(
+                lambda v, f=fmt: (f.format(v) if v else "—")
+            )
+        # Drop the timestamp column from the visible table (keeps the row
+        # narrow); we display recency implicitly via sort order.
+        visible_cols = [c for c in latest_df.columns if c != "timestamp"]
+        st.dataframe(
+            display[visible_cols],
+            width='stretch',
+            hide_index=True,
+        )
+
+        # ── Bottom: aggregate reject histogram + side counts ──────────
+        col_h, col_s = st.columns([3, 1])
+        with col_h:
+            st.caption("Reject reasons across the last 200 cycles "
+                       "(higher = more candidates rejected by that filter).")
+            if reject_hist:
+                hist_df = pd.DataFrame(
+                    sorted(reject_hist.items(), key=lambda kv: -kv[1]),
+                    columns=["reason", "count"],
+                )
+                st.bar_chart(hist_df.set_index("reason"))
+            else:
+                st.caption("(No rejects recorded — every cycle passed.)")
+        with col_s:
+            st.caption("Total candidates by side (last 200 cycles).")
+            if side_counts:
+                side_df = pd.DataFrame(
+                    sorted(side_counts.items(), key=lambda kv: -kv[1]),
+                    columns=["side", "candidates"],
+                )
+                st.dataframe(side_df, width='stretch', hide_index=True)
+            else:
+                st.caption("—")
 
 
 def _guardrail_status_from_journal(df: pd.DataFrame) -> List[Dict]:
@@ -1020,6 +1176,12 @@ def render_live_monitor() -> None:
             st.code(log_text, language="text")
         else:
             st.caption("No log yet — start the agent to see output here.")
+
+    # ── Adaptive scanner diagnostics ───────────────────────────────────────
+    # Surfaces the per-ticker scan_results block written by the agent so
+    # users can see why candidates are being rejected even when zero
+    # trades fire (e.g. cw_below_floor with edge_buffer too tight).
+    _render_scanner_diagnostics_panel(journal_df)
 
     # ── Journal expander ───────────────────────────────────────────────────
     with st.expander("Recent Journal Entries", expanded=False):

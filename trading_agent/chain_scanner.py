@@ -9,7 +9,10 @@ a configurable grid. For every (DTE, target Δ-short, width) tuple we:
   3. find the contract whose |Δ| is closest to target Δ-short,
   4. find a protective leg ``width_value × spot`` strikes away (snapped
      to the strike grid),
-  5. price the spread off bid (sold) − ask (bought),
+  5. price the spread off the **NBBO mid** of each leg (sold − bought)
+     minus a small fill-haircut, falling back to the conservative
+     bid/ask side when a leg has a missing or zero quote — see
+     ``_quote_credit`` for the exact formula,
   6. score the spread by per-dollar-risked expected value, where
 
          POP        ≈ 1 − |Δshort|     (vertical credit spread approx)
@@ -107,6 +110,51 @@ class SpreadCandidate:
 def _pop_from_delta(short_delta: float) -> float:
     """POP ≈ 1 − |Δshort| for a vertical credit spread."""
     return max(0.0, 1.0 - abs(short_delta))
+
+
+# Default fill-price haircut applied when scoring at "fillable mid" rather
+# than worst-case bid/ask. Two NBBO ticks ($0.02) keeps us conservative on
+# pennies-pilot symbols (SPY/QQQ/IWM) — typical limit orders cross within
+# this margin, and the executor's own 1-tick haircut composes safely with
+# this one (i.e. we don't double-pay slippage in scoring).
+DEFAULT_FILL_HAIRCUT: float = 0.02
+
+
+def _quote_credit(short_bid: float, short_ask: float,
+                  long_bid:  float, long_ask:  float,
+                  *,
+                  fill_haircut: float = DEFAULT_FILL_HAIRCUT) -> float:
+    """
+    Estimate the credit a vertical spread would fill at, in dollars.
+
+    Prefers the **NBBO mid** for each leg (sell-side mid minus buy-side
+    mid), which more closely matches realistic limit-order fills than the
+    legacy ``short_bid − long_ask`` worst-case used by older revisions of
+    this scanner. Falls back to the conservative bid/ask side when a leg
+    has a zero or missing quote — the scanner never wants to manufacture
+    credit out of thin air.
+
+    A small ``fill_haircut`` is subtracted to model the fact that limit
+    orders rarely fill at theoretical mid; markets jitter and the
+    aggressive side of the cross usually requires giving up a tick or two.
+    The default (``$0.02``) matches the executor's per-leg slippage budget,
+    so what the scanner *estimates* and what the executor *targets* match.
+
+    Returns a ``round(credit, 2)`` value — credits below zero are clipped
+    to zero (scanner's caller still rejects them as ``credit_non_positive``,
+    but no point letting them go negative).
+    """
+    # Pick the midpoint when both quotes are present and positive; fall
+    # back to the conservative side otherwise so a stale quote can't
+    # accidentally inflate credit.
+    short_mid = ((short_bid + short_ask) / 2.0
+                 if short_bid > 0 and short_ask > 0
+                 else short_bid)
+    long_mid  = ((long_bid + long_ask) / 2.0
+                 if long_bid > 0 and long_ask > 0
+                 else long_ask)
+    credit = short_mid - long_mid - max(0.0, fill_haircut)
+    return round(max(0.0, credit), 2)
 
 
 def _cw_floor(short_delta: float, edge_buffer: float) -> float:
@@ -391,9 +439,16 @@ class ChainScanner:
                         diag.record(REJECT_NON_POSITIVE_WIDTH)
                         continue
 
-                    credit = round(
-                        float(short_contract["bid"]) - float(long_contract["ask"]),
-                        2,
+                    # Score off "fillable mid" — see ``_quote_credit`` for
+                    # the rationale and fallback rules. Raw bid/ask still
+                    # land on the SpreadCandidate below for journal
+                    # transparency, so post-hoc fill analysis can compare
+                    # mid-target to worst-case ``short_bid − long_ask``.
+                    credit = _quote_credit(
+                        short_bid=float(short_contract["bid"]),
+                        short_ask=float(short_contract["ask"]),
+                        long_bid =float(long_contract["bid"]),
+                        long_ask =float(long_contract["ask"]),
                     )
                     short_delta = float(short_contract["delta"])
 
@@ -573,6 +628,8 @@ __all__ = [
     "_ev_per_dollar_risked",
     "_score_candidate",
     "_score_candidate_with_reason",
+    "_quote_credit",
+    "DEFAULT_FILL_HAIRCUT",
     # Reject-reason taxonomy (stable journal keys).
     "REJECT_NO_CHAIN",
     "REJECT_NO_SHORT_CONTRACT",

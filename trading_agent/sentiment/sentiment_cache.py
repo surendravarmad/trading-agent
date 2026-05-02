@@ -54,8 +54,8 @@ from collections import OrderedDict
 from typing import TYPE_CHECKING, Iterable, Optional, Tuple
 
 if TYPE_CHECKING:
-    from trading_agent.news_aggregator import NewsItem
-    from trading_agent.sentiment_verifier import VerifiedSentimentReport
+    from trading_agent.sentiment.news_aggregator import NewsItem
+    from trading_agent.sentiment.sentiment_verifier import VerifiedSentimentReport
 
 logger = logging.getLogger(__name__)
 

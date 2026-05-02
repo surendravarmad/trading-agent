@@ -33,7 +33,7 @@ if str(_repo_root) not in sys.path:
 # ``logging.getLogger(__name__)``; if the root logger isn't configured yet
 # those loggers inherit Python's default WARNING level and INFO calls
 # from the backtester are silently dropped.
-from trading_agent.logger_setup import setup_logging  # noqa: E402
+from trading_agent.utils.logger_setup import setup_logging  # noqa: E402
 
 setup_logging(log_level=os.environ.get("LOG_LEVEL", "INFO"))
 

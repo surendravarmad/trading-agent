@@ -20,22 +20,22 @@ PROJECT_ROOT = Path(__file__).parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
 from trading_agent.config import load_config, AppConfig, AlpacaConfig, TradingConfig, LoggingConfig, IntelligenceConfig
-from trading_agent.market_data import MarketDataProvider
-from trading_agent.regime import RegimeClassifier, Regime, RegimeAnalysis
-from trading_agent.strategy import StrategyPlanner, SpreadPlan, SpreadLeg
-from trading_agent.risk_manager import RiskManager, RiskVerdict
-from trading_agent.executor import OrderExecutor
-from trading_agent.agent import TradingAgent
-from trading_agent.position_monitor import (
+from trading_agent.market.market_data import MarketDataProvider
+from trading_agent.strategy.regime import RegimeClassifier, Regime, RegimeAnalysis
+from trading_agent.strategy.strategy import StrategyPlanner, SpreadPlan, SpreadLeg
+from trading_agent.strategy.risk_manager import RiskManager, RiskVerdict
+from trading_agent.execution.executor import OrderExecutor
+from trading_agent.core.agent import TradingAgent
+from trading_agent.execution.position_monitor import (
     PositionMonitor, PositionSnapshot, SpreadPosition, ExitSignal,
     STRATEGY_REGIME_MAP,
 )
-from trading_agent.order_tracker import OrderTracker, OrderRecord, OrderStatus
-from trading_agent.llm_client import LLMClient, LLMConfig
-from trading_agent.trade_journal import TradeJournal, TradeEntry
-from trading_agent.knowledge_base import KnowledgeBase, KBDocument
-from trading_agent.llm_analyst import LLMAnalyst, AnalystDecision
-from trading_agent.fine_tuning import FineTuningExporter
+from trading_agent.execution.order_tracker import OrderTracker, OrderRecord, OrderStatus
+from trading_agent.intelligence.llm_client import LLMClient, LLMConfig
+from trading_agent.intelligence.trade_journal import TradeJournal, TradeEntry
+from trading_agent.intelligence.knowledge_base import KnowledgeBase, KBDocument
+from trading_agent.intelligence.llm_analyst import LLMAnalyst, AnalystDecision
+from trading_agent.intelligence.fine_tuning import FineTuningExporter
 
 import tempfile
 import json

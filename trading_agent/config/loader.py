@@ -7,8 +7,13 @@ Priority order for the YAML file:
   1. yaml_path argument passed to load_trading_rules()
   2. TRADING_RULES_YAML_PATH environment variable
   3. trading_agent/config/trading_rules.yaml  (package default)
-  4. Silent fallback to all-default values if pyyaml is not installed
-     or the file does not exist.
+
+The YAML file is **required**.  Missing file, missing pyyaml, or a
+parse error all raise immediately so misconfigured environments fail
+loudly rather than silently running on stale defaults.
+
+Partial YAML is fine — any key absent from the file falls back to the
+dataclass field default for that specific field.
 
 Secrets and environment-specific values (API keys, risk limits already
 in .env, feature flags) live in .env — not here.  This file is for
@@ -153,26 +158,32 @@ class TradingRulesConfig:
 
 def load_trading_rules(yaml_path: str | None = None) -> TradingRulesConfig:
     """
-    Load trading rules from YAML, falling back to all-default values if:
-      - pyyaml is not installed
-      - the file does not exist
-      - the file is empty or malformed
+    Load trading rules from YAML.
+
+    Raises
+    ------
+    ImportError       if pyyaml is not installed
+    FileNotFoundError if the YAML file does not exist
+    ValueError        if the YAML file cannot be parsed
     """
     if _yaml is None:
-        logger.debug("pyyaml not installed — using default trading rules")
-        return TradingRulesConfig()
+        raise ImportError(
+            "pyyaml is required to load trading rules. "
+            "Run: pip install pyyaml"
+        )
 
     path = Path(yaml_path or os.getenv("TRADING_RULES_YAML_PATH", str(_DEFAULT_YAML)))
     if not path.exists():
-        logger.debug("trading_rules.yaml not found at %s — using defaults", path)
-        return TradingRulesConfig()
+        raise FileNotFoundError(
+            f"trading_rules.yaml not found at {path}. "
+            "Ensure the file exists or set TRADING_RULES_YAML_PATH to its location."
+        )
 
     try:
         with path.open() as f:
             data = _yaml.safe_load(f) or {}
     except Exception as exc:
-        logger.warning("Failed to parse %s: %s — using defaults", path, exc)
-        return TradingRulesConfig()
+        raise ValueError(f"Failed to parse {path}: {exc}") from exc
 
     s = data.get("strategy", {})
     r = data.get("regime", {})
@@ -183,51 +194,65 @@ def load_trading_rules(yaml_path: str | None = None) -> TradingRulesConfig:
     se = data.get("sentiment", {})
     bk = data.get("backtest", {})
 
-    defaults = TradingRulesConfig()
-
     return TradingRulesConfig(
         strategy=StrategyRules(
-            min_delta=s.get("min_delta", defaults.strategy.min_delta),
-            target_dte=s.get("target_dte", defaults.strategy.target_dte),
-            dte_range_min=s.get("dte_range_min", defaults.strategy.dte_range_min),
-            dte_range_max=s.get("dte_range_max", defaults.strategy.dte_range_max),
-            spread_width_floor=s.get("spread_width_floor", defaults.strategy.spread_width_floor),
-            rs_zscore_threshold=s.get("rs_zscore_threshold", defaults.strategy.rs_zscore_threshold),
+            **{k: v for k, v in {
+                "min_delta": s.get("min_delta"),
+                "target_dte": s.get("target_dte"),
+                "dte_range_min": s.get("dte_range_min"),
+                "dte_range_max": s.get("dte_range_max"),
+                "spread_width_floor": s.get("spread_width_floor"),
+                "rs_zscore_threshold": s.get("rs_zscore_threshold"),
+            }.items() if v is not None}
         ),
         regime=RegimeRules(
-            vix_inhibit_zscore=r.get("vix_inhibit_zscore", defaults.regime.vix_inhibit_zscore),
-            bollinger_narrow_threshold=r.get("bollinger_narrow_threshold", defaults.regime.bollinger_narrow_threshold),
-            leadership_anchors=r.get("leadership_anchors", defaults.regime.leadership_anchors),
+            **{k: v for k, v in {
+                "vix_inhibit_zscore": r.get("vix_inhibit_zscore"),
+                "bollinger_narrow_threshold": r.get("bollinger_narrow_threshold"),
+                "leadership_anchors": r.get("leadership_anchors"),
+            }.items() if v is not None}
         ),
         position_monitor=PositionMonitorRules(
-            profit_target_pct=pm.get("profit_target_pct", defaults.position_monitor.profit_target_pct),
-            hard_stop_multiplier=pm.get("hard_stop_multiplier", defaults.position_monitor.hard_stop_multiplier),
-            strike_proximity_pct=pm.get("strike_proximity_pct", defaults.position_monitor.strike_proximity_pct),
-            dte_safety_hour=pm.get("dte_safety_hour", defaults.position_monitor.dte_safety_hour),
-            dte_safety_minute=pm.get("dte_safety_minute", defaults.position_monitor.dte_safety_minute),
+            **{k: v for k, v in {
+                "profit_target_pct": pm.get("profit_target_pct"),
+                "hard_stop_multiplier": pm.get("hard_stop_multiplier"),
+                "strike_proximity_pct": pm.get("strike_proximity_pct"),
+                "dte_safety_hour": pm.get("dte_safety_hour"),
+                "dte_safety_minute": pm.get("dte_safety_minute"),
+            }.items() if v is not None}
         ),
         agent=AgentRules(
-            cycle_timeout_seconds=ag.get("cycle_timeout_seconds", defaults.agent.cycle_timeout_seconds),
-            exit_debounce_required=ag.get("exit_debounce_required", defaults.agent.exit_debounce_required),
+            **{k: v for k, v in {
+                "cycle_timeout_seconds": ag.get("cycle_timeout_seconds"),
+                "exit_debounce_required": ag.get("exit_debounce_required"),
+            }.items() if v is not None}
         ),
         execution=ExecutionRules(
-            max_history=ex.get("max_history", defaults.execution.max_history),
-            price_drift_warn_pct=ex.get("price_drift_warn_pct", defaults.execution.price_drift_warn_pct),
+            **{k: v for k, v in {
+                "max_history": ex.get("max_history"),
+                "price_drift_warn_pct": ex.get("price_drift_warn_pct"),
+            }.items() if v is not None}
         ),
         cache=CacheRules(
-            price_history_ttl=ca.get("price_history_ttl", defaults.cache.price_history_ttl),
-            snapshot_ttl=ca.get("snapshot_ttl", defaults.cache.snapshot_ttl),
-            option_chain_ttl=ca.get("option_chain_ttl", defaults.cache.option_chain_ttl),
-            intraday_return_ttl=ca.get("intraday_return_ttl", defaults.cache.intraday_return_ttl),
-            max_prefetch_workers=ca.get("max_prefetch_workers", defaults.cache.max_prefetch_workers),
+            **{k: v for k, v in {
+                "price_history_ttl": ca.get("price_history_ttl"),
+                "snapshot_ttl": ca.get("snapshot_ttl"),
+                "option_chain_ttl": ca.get("option_chain_ttl"),
+                "intraday_return_ttl": ca.get("intraday_return_ttl"),
+                "max_prefetch_workers": ca.get("max_prefetch_workers"),
+            }.items() if v is not None}
         ),
         sentiment=SentimentRules(
-            source_weights=se.get("source_weights", defaults.sentiment.source_weights),
+            **{k: v for k, v in {
+                "source_weights": se.get("source_weights"),
+            }.items() if v is not None}
         ),
         backtest=BacktestRules(
-            starting_equity=bk.get("starting_equity", defaults.backtest.starting_equity),
-            commission_round_trip=bk.get("commission_round_trip", defaults.backtest.commission_round_trip),
-            daily_otm_pct=bk.get("daily_otm_pct", defaults.backtest.daily_otm_pct),
-            intraday_otm_pct=bk.get("intraday_otm_pct", defaults.backtest.intraday_otm_pct),
+            **{k: v for k, v in {
+                "starting_equity": bk.get("starting_equity"),
+                "commission_round_trip": bk.get("commission_round_trip"),
+                "daily_otm_pct": bk.get("daily_otm_pct"),
+                "intraday_otm_pct": bk.get("intraday_otm_pct"),
+            }.items() if v is not None}
         ),
     )

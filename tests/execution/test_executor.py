@@ -5,9 +5,9 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-from trading_agent.executor import OrderExecutor, MAX_HISTORY
-from trading_agent.risk_manager import RiskVerdict
-from trading_agent.strategy import SpreadPlan, SpreadLeg
+from trading_agent.execution.executor import OrderExecutor, MAX_HISTORY
+from trading_agent.strategy.risk_manager import RiskVerdict
+from trading_agent.strategy.strategy import SpreadPlan, SpreadLeg
 
 
 # ------------------------------------------------------------------

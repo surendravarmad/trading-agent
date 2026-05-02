@@ -8,7 +8,7 @@ import os
 import pytest
 from unittest.mock import MagicMock, patch
 
-from trading_agent.agent import TradingAgent
+from trading_agent.core.agent import TradingAgent
 from trading_agent.config import (AppConfig, AlpacaConfig, TradingConfig,
                                    LoggingConfig, IntelligenceConfig)
 

@@ -92,7 +92,7 @@ When price reaches a **3-standard-deviation Bollinger Band** (statistically extr
 
 The legacy "5-min return ticker vs SPY+QQQ, threshold 0.1%" was useless on an ETF-only deployment: SPY-vs-SPY is degenerately zero and a flat threshold ignores per-ticker volatility. The new path:
 
-1. **Per-ticker leadership anchor** — `LEADERSHIP_ANCHORS` in `regime.py` maps each ticker to a sibling benchmark (e.g. `SPY → QQQ`, `QQQ → SPY`, sector ETFs → SPY, `IWM → SPY`). To extend coverage, add a row to that dict.
+1. **Per-ticker leadership anchor** — `leadership_anchors` in `trading_rules.yaml` (under the `regime:` section) maps each ticker to a sibling benchmark (e.g. `SPY → QQQ`, `QQQ → SPY`, sector ETFs → SPY, `IWM → SPY`). To extend coverage, add a row there; no code change required.
 2. **Z-scored differential** — `MarketDataProvider.get_leadership_zscore(ticker, anchor)` returns `(raw_diff, z)` where `z` is the latest 5-min return differential normalised against its own rolling intraday distribution (population stdev over the last ~20 bars, with the first 2 open bars dropped to suppress the open-print spike).
 3. **Bias trigger** — `StrategyPlanner.RS_ZSCORE_THRESHOLD = 1.5`. When `leadership_zscore > 1.5σ` and the regime is Bullish or Sideways, the planner picks a **Bull Put Spread** instead of the default mapping. 1.5σ ≈ 13th-percentile two-tailed move — strong enough to filter noise, loose enough to actually fire.
 
@@ -388,42 +388,82 @@ trading-agent/
 ├── README.md
 ├── setup_intelligence.sh             # Ollama setup helper
 ├── run_tests.py
+├── visualize_logs.py                 # Root-level entry point (delegates to reporting/)
 ├── architecture_diagram.html
 │
 ├── trading_agent/
-│   ├── agent.py                      # Orchestrator: two-stage cycle, timeout guard, sentiment pipeline
-│   ├── config.py                     # AppConfig + IntelligenceConfig (LLM + FinGPT + verifier + cache + calendar)
-│   ├── ports.py                      # Hexagonal protocols: MarketDataPort, BrokerPort, SentimentReadout
-│   ├── market_profile.py             # MarketProfile (timezone, session bounds, trading-day oracle)
-│   ├── logger_setup.py
+│   ├── __main__.py                   # python -m trading_agent entry point
 │   │
-│   │   # ── Core Phases ──
-│   ├── market_data.py                # Phase I   — yfinance + Alpaca (TTL cache, parallel)
-│   ├── regime.py                     # Phase II  — SMA / RSI / Bollinger regime classifier
-│   ├── strategy.py                   # Phase III — strike selection, nearest-Friday DTE
-│   ├── risk_manager.py               # Phase IV  — 8-guardrail validator
-│   ├── executor.py                   # Phase VI  — mleg order execution + HTML report
-│   ├── trade_plan_report.py
+│   │   # ── Configuration ──
+│   ├── config/
+│   │   ├── __init__.py               # AppConfig + IntelligenceConfig (load_config)
+│   │   ├── loader.py                 # TradingRulesConfig dataclasses + load_trading_rules()
+│   │   └── trading_rules.yaml        # Trader-tunable algorithm parameters (single source of truth)
 │   │
-│   │   # ── Position Management ──
-│   ├── position_monitor.py           # Stage 1 — monitor & close open spreads
-│   ├── order_tracker.py              # Stage 1 — fill tracking
+│   │   # ── Orchestrator ──
+│   ├── core/
+│   │   ├── agent.py                  # TradingAgent: two-stage cycle, timeout guard, sentiment pipeline
+│   │   ├── ports.py                  # Hexagonal protocols: MarketDataPort, BrokerPort, SentimentReadout
+│   │   ├── stage_monitor.py          # Stage 1 helpers (position exit orchestration)
+│   │   └── stage_plan.py             # Stage 2 helpers (per-ticker plan/risk/execute flow)
 │   │
-│   │   # ── Core Intelligence Layer ──
-│   ├── journal_kb.py                 # Always-on signal logger (JSONL + Markdown)
-│   ├── trade_journal.py              # Full-lifecycle trade logging (TradeEntry)
-│   ├── knowledge_base.py             # File-based RAG vector store
-│   ├── llm_client.py                 # OpenAI-compatible LLM client + make_llm_client(role) factory
-│   ├── llm_analyst.py                # Pre/post trade LLM analysis — consumes SentimentReadout
-│   ├── fine_tuning.py                # Training data export (JSONL / Alpaca / DPO)
+│   │   # ── Market Data (Phase I) ──
+│   ├── market/
+│   │   ├── market_data.py            # yfinance + Alpaca (TTL cache, parallel fetch, leadership z-score)
+│   │   ├── market_profile.py         # MarketProfile (timezone, session bounds, trading-day oracle)
+│   │   ├── market_hours.py           # Market session gating (open/closed/after-hours)
+│   │   └── calendar_utils.py         # Trading-calendar helpers
 │   │
-│   │   # ── Multi-Source Sentiment Pipeline ──
-│   ├── sentiment_pipeline.py         # SentimentPipeline facade — Tier-0/1/2 gating, cycle-scoped pool
-│   ├── earnings_calendar.py          # Tier-0 — yfinance-backed authoritative event_risk short-circuit
-│   ├── sentiment_cache.py            # Tier-1 — SHA-1 content-hash gate (TTL + LRU)
-│   ├── news_aggregator.py            # Tier-2 — NewsItem + NewsAggregator (Yahoo/SEC/Fed/Reddit/Twitter)
-│   ├── fingpt_analyser.py            # Tier-2 — FinGPT specialist (SentimentReport)
-│   └── sentiment_verifier.py         # Tier-2 — Reasoning verifier (VerifiedSentimentReport)
+│   │   # ── Strategy Pipeline ──
+│   ├── strategy/
+│   │   ├── regime.py                 # Phase II  — SMA / RSI / Bollinger / VIX / leadership regime classifier
+│   │   ├── strategy.py               # Phase III — strike selection, adaptive spread width, nearest-Friday DTE
+│   │   └── risk_manager.py           # Phase IV  — 8-guardrail validator
+│   │
+│   │   # ── Execution ──
+│   ├── execution/
+│   │   ├── executor.py               # Phase VI  — mleg order execution + HTML report
+│   │   ├── position_monitor.py       # Stage 1   — monitor & close open spreads
+│   │   └── order_tracker.py          # Stage 1   — fill tracking
+│   │
+│   │   # ── Intelligence Layer ──
+│   ├── intelligence/
+│   │   ├── journal_kb.py             # Always-on signal logger (JSONL + Markdown)
+│   │   ├── trade_journal.py          # Full-lifecycle trade logging (TradeEntry)
+│   │   ├── knowledge_base.py         # File-based RAG vector store
+│   │   ├── llm_client.py             # OpenAI-compatible LLM client + make_llm_client(role) factory
+│   │   ├── llm_analyst.py            # Pre/post trade LLM analysis — consumes SentimentReadout
+│   │   └── fine_tuning.py            # Training data export (JSONL / Alpaca / DPO)
+│   │
+│   │   # ── Sentiment Pipeline ──
+│   ├── sentiment/
+│   │   ├── sentiment_pipeline.py     # SentimentPipeline facade — Tier-0/1/2 gating, cycle-scoped pool
+│   │   ├── earnings_calendar.py      # Tier-0 — yfinance-backed authoritative event_risk short-circuit
+│   │   ├── sentiment_cache.py        # Tier-1 — SHA-1 content-hash gate (TTL + LRU)
+│   │   ├── news_aggregator.py        # Tier-2 — NewsItem + NewsAggregator (Yahoo/SEC/Fed/Reddit/Twitter)
+│   │   ├── fingpt_analyser.py        # Tier-2 — FinGPT specialist (SentimentReport)
+│   │   └── sentiment_verifier.py     # Tier-2 — Reasoning verifier (VerifiedSentimentReport)
+│   │
+│   │   # ── Reporting ──
+│   ├── reporting/
+│   │   ├── visualize_logs.py         # Agent Performance Dashboard generator (HTML report)
+│   │   └── trade_plan_report.py      # Per-ticker HTML trade plan report
+│   │
+│   │   # ── Utilities ──
+│   ├── utils/
+│   │   ├── logger_setup.py           # Structured logging setup
+│   │   ├── daily_state.py            # Daily equity / drawdown state persistence
+│   │   ├── file_locks.py             # Cross-process file locking
+│   │   ├── shutdown.py               # Graceful shutdown signal handling
+│   │   └── thesis_builder.py         # LLM prompt context builder
+│   │
+│   │   # ── Streamlit Dashboard ──
+│   └── streamlit/
+│       ├── app.py                    # Dashboard entry point (tab router + logging setup)
+│       ├── live_monitor.py           # Live Monitoring tab
+│       ├── backtest_ui.py            # Backtesting tab + Backtester engine
+│       ├── llm_extension.py          # LLM Extension tab (RAG chat + strategy optimizer)
+│       └── components.py             # Shared Plotly charts and Streamlit UI primitives
 │
 ├── trade_journal/                    # Trade lifecycle logs + signal journal (auto-created)
 │   ├── trades/
@@ -540,20 +580,20 @@ SENTIMENT_HASH_CACHE_SIZE=32
 
 ```bash
 # Paper trading
-python -m trading_agent.agent
+python -m trading_agent
 
 # Dry-run (no orders sent)
-python -m trading_agent.agent --dry-run
+python -m trading_agent --dry-run
 
 # Custom .env
-python -m trading_agent.agent --env /path/to/.env
+python -m trading_agent --env /path/to/.env
 ```
 
 ### 4. Schedule (5-minute interval)
 
 ```bash
 # crontab -e
-*/5 9-16 * * 1-5 cd /path/to/trading-agent && python -m trading_agent.agent >> logs/cron.log 2>&1
+*/5 9-16 * * 1-5 cd /path/to/trading-agent && python -m trading_agent >> logs/cron.log 2>&1
 ```
 
 #### After-hours automatic shutdown
@@ -566,7 +606,7 @@ python -m trading_agent.agent --env /path/to/.env
 
 Override for after-hours paper testing:
 ```bash
-FORCE_MARKET_OPEN=true python -m trading_agent.agent
+FORCE_MARKET_OPEN=true python -m trading_agent
 ```
 
 ### 5. Run tests
@@ -579,6 +619,43 @@ pytest tests/ -v
 ---
 
 ## Configuration Reference
+
+### Algorithm Parameters (`trading_rules.yaml`)
+
+Trader-tunable algorithm constants live in `trading_agent/config/trading_rules.yaml` — separate from `.env` so they can be version-controlled and reviewed without touching secrets. The file is **required**; `load_trading_rules()` raises `FileNotFoundError` if it is missing. Any key absent from the file falls back to the dataclass default for that field (partial YAML is fine; missing file is not).
+
+Override the path via the `TRADING_RULES_YAML_PATH` environment variable.
+
+| Section | Key | Default | Description |
+|---------|-----|---------|-------------|
+| `strategy` | `min_delta` | `0.15` | Minimum absolute delta for short strike |
+| `strategy` | `target_dte` | `35` | Target days-to-expiry |
+| `strategy` | `dte_range_min` | `28` | Minimum acceptable DTE |
+| `strategy` | `dte_range_max` | `45` | Maximum acceptable DTE |
+| `strategy` | `spread_width_floor` | `5.0` | Minimum spread width ($) — adaptive width can exceed this |
+| `strategy` | `rs_zscore_threshold` | `1.5` | Leadership z-score needed to trigger Bull Put bias |
+| `regime` | `vix_inhibit_zscore` | `2.0` | VIX z-score threshold to demote bullish strategies |
+| `regime` | `bollinger_narrow_threshold` | `0.04` | Bollinger Band width below which regime is Sideways |
+| `regime` | `leadership_anchors` | _(ETF map)_ | Dict mapping each ticker to its benchmark anchor |
+| `position_monitor` | `profit_target_pct` | `0.50` | Close when credit decays to this fraction of max profit |
+| `position_monitor` | `hard_stop_multiplier` | `3.0` | Close when loss reaches N× initial credit |
+| `position_monitor` | `strike_proximity_pct` | `0.01` | Close when underlying is within N% of short strike |
+| `position_monitor` | `dte_safety_hour` | `15` | DTE safety check hour (24h ET) |
+| `position_monitor` | `dte_safety_minute` | `30` | DTE safety check minute |
+| `agent` | `cycle_timeout_seconds` | `270` | Hard timeout before `os._exit(1)` |
+| `agent` | `exit_debounce_required` | `3` | Consecutive exit signals before closing |
+| `execution` | `max_history` | `200` | Max order history records to keep |
+| `execution` | `price_drift_warn_pct` | `0.10` | Warn when credit drifts >N% from planning values |
+| `cache` | `price_history_ttl` | `14400` | Historical OHLCV cache TTL (s) |
+| `cache` | `snapshot_ttl` | `60` | Stock snapshot cache TTL (s) |
+| `cache` | `option_chain_ttl` | `180` | Option chain cache TTL (s) |
+| `cache` | `intraday_return_ttl` | `60` | 5-min return series cache TTL (s) |
+| `cache` | `max_prefetch_workers` | `5` | Thread-pool size for parallel history prefetch |
+| `sentiment` | `source_weights` | _(dict)_ | Authority weight overrides per news source |
+| `backtest` | `starting_equity` | `100000.0` | Backtester initial equity ($) |
+| `backtest` | `commission_round_trip` | `2.60` | Round-trip commission per spread ($) |
+| `backtest` | `daily_otm_pct` | `0.03` | Daily-bar OTM % for synthetic strike placement |
+| `backtest` | `intraday_otm_pct` | `0.005` | Intraday-bar OTM % for synthetic strike placement |
 
 ### Core Trading
 
@@ -672,7 +749,7 @@ All three LLM callers (analyst, FinGPT, verifier) share the same `make_llm_clien
 
 ## Agent Performance Dashboard
 
-`visualize_logs.py` parses the signal journal and per-ticker trade-plan files to generate a self-contained interactive HTML report.
+`trading_agent/reporting/visualize_logs.py` parses the signal journal and per-ticker trade-plan files to generate a self-contained interactive HTML report. A convenience entry point at the repo root delegates to it.
 
 ```bash
 python visualize_logs.py
@@ -738,11 +815,11 @@ The backtester now applies the **same z-scored leadership and VIX inter-market g
 
 **Enabling**: pass `use_macro_signals=True` to `Backtester(...)`. Default is `False` to keep the existing test suite green; the Streamlit UI default-enables for interactive runs.
 
-**Constants reused** (single source of truth — change once in `regime.py` / `market_data.py` / `strategy.py` and the backtester picks it up):
+**Constants reused** (single source of truth — tunable via `trading_rules.yaml`, consumed by both the live agent and the backtester):
 
-- `LEADERSHIP_ANCHORS` (anchor map)
-- `VIX_INHIBIT_ZSCORE = 2.0`
-- `RS_ZSCORE_THRESHOLD = 1.5`
+- `leadership_anchors` (anchor map) — `trading_rules.yaml` → `regime.leadership_anchors`
+- `VIX_INHIBIT_ZSCORE = 2.0` — `trading_rules.yaml` → `regime.vix_inhibit_zscore`
+- `RS_ZSCORE_THRESHOLD = 1.5` — `trading_rules.yaml` → `strategy.rs_zscore_threshold`
 - `LEADERSHIP_WINDOW_BARS = 21`
 - `VIX_WINDOW_BARS = 21`
 

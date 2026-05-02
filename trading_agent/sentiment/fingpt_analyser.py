@@ -29,8 +29,8 @@ from typing import TYPE_CHECKING, Dict, List, Optional, Tuple
 
 if TYPE_CHECKING:
     from trading_agent.config import IntelligenceConfig
-    from trading_agent.llm_client import LLMClient
-    from trading_agent.news_aggregator import NewsItem
+    from trading_agent.intelligence.llm_client import LLMClient
+    from trading_agent.sentiment.news_aggregator import NewsItem
 
 logger = logging.getLogger(__name__)
 
@@ -176,7 +176,7 @@ class FinGPTAnalyser:
         # the primary analyst's in-flight requests.  Preferred path:
         # pass a pre-built client (from ``make_llm_client("fingpt", cfg)``).
         # Fallback path: legacy ad-hoc construction from explicit kwargs.
-        from trading_agent.llm_client import LLMClient, LLMConfig, make_llm_client
+        from trading_agent.intelligence.llm_client import LLMClient, LLMConfig, make_llm_client
 
         if client is not None:
             self._client = client

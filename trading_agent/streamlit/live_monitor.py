@@ -284,7 +284,7 @@ def _guardrail_status_from_journal(df: pd.DataFrame) -> List[Dict]:
 
 def _fetch_account(config) -> Dict:
     try:
-        from trading_agent.market_data import MarketDataProvider
+        from trading_agent.market.market_data import MarketDataProvider
         provider = MarketDataProvider(
             alpaca_api_key=config.alpaca.api_key,
             alpaca_secret_key=config.alpaca.secret_key,
@@ -299,7 +299,7 @@ def _fetch_account(config) -> Dict:
 
 def _fetch_spreads(config) -> List[Dict]:
     try:
-        from trading_agent.position_monitor import PositionMonitor
+        from trading_agent.execution.position_monitor import PositionMonitor
         monitor = PositionMonitor(
             api_key=config.alpaca.api_key,
             secret_key=config.alpaca.secret_key,
@@ -336,7 +336,7 @@ def _fetch_spreads(config) -> List[Dict]:
 
 def _is_market_open(config) -> Optional[bool]:
     try:
-        from trading_agent.market_data import MarketDataProvider
+        from trading_agent.market.market_data import MarketDataProvider
         provider = MarketDataProvider(
             alpaca_api_key=config.alpaca.api_key,
             alpaca_secret_key=config.alpaca.secret_key,

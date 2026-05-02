@@ -8,12 +8,16 @@ Re-exports from submodules so all existing imports continue to work:
     from trading_agent.config.loader import StrategyRules, RegimeRules, ...
 """
 
+from __future__ import annotations
+
 import os
 from dataclasses import dataclass, field
-from typing import List
+from typing import TYPE_CHECKING, List
 from dotenv import load_dotenv
 
-from trading_agent.market.market_profile import MarketProfile, US_MARKET_PROFILE
+if TYPE_CHECKING:
+    from trading_agent.market.market_profile import MarketProfile
+
 from trading_agent.config.loader import (
     TradingRulesConfig,
     StrategyRules,
@@ -121,6 +125,11 @@ class IntelligenceConfig:
     news_source_weights_json: str = ""
 
 
+def _default_market_profile():
+    from trading_agent.market.market_profile import US_MARKET_PROFILE  # lazy — breaks config↔market cycle
+    return US_MARKET_PROFILE
+
+
 @dataclass
 class AppConfig:
     alpaca: AlpacaConfig
@@ -132,7 +141,7 @@ class AppConfig:
     # NYSE profile.  Moving these out of module scope is the week 5-6
     # vendor-agnostic seam — a future venue swap replaces this field
     # without touching core strategy / risk code.
-    market_profile: MarketProfile = field(default_factory=lambda: US_MARKET_PROFILE)
+    market_profile: "MarketProfile" = field(default_factory=_default_market_profile)
     # Trader-tunable algorithm parameters loaded from trading_rules.yaml
     rules: TradingRulesConfig = field(default_factory=TradingRulesConfig)
 

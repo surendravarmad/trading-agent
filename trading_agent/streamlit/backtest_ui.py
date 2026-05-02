@@ -64,7 +64,7 @@ import yfinance as yf
 from scipy.stats import percentileofscore
 
 from trading_agent.config import load_config
-from trading_agent.config.loader import TradingRulesConfig
+from trading_agent.config.loader import TradingRulesConfig, load_trading_rules
 from trading_agent.streamlit.components import (
     drawdown_chart,
     equity_curve_chart,
@@ -74,14 +74,14 @@ from trading_agent.streamlit.components import (
 # --- Shared agent constants — sourced from trading_rules.yaml ---------------
 # All agent-parity values read from TradingRulesConfig so a change in
 # trading_rules.yaml flows into both the live agent and the backtester.
-from trading_agent.strategy import StrategyPlanner as _Planner
-from trading_agent.regime import (
+from trading_agent.strategy.strategy import StrategyPlanner as _Planner
+from trading_agent.strategy.regime import (
     LEADERSHIP_ANCHORS,
     VIX_INHIBIT_ZSCORE,
 )
-from trading_agent.market_data import MarketDataProvider as _MDP
+from trading_agent.market.market_data import MarketDataProvider as _MDP
 
-_rules = TradingRulesConfig()
+_rules = load_trading_rules()
 
 # Z-score thresholds + window
 RS_ZSCORE_THRESHOLD = _rules.strategy.rs_zscore_threshold
@@ -91,7 +91,7 @@ VIX_WINDOW_BARS = _MDP.VIX_WINDOW_BARS
 logger = logging.getLogger(__name__)
 
 # Option chain cache TTL — reads from YAML via module-level constant
-from trading_agent.market_data import OPTION_CHAIN_TTL  # noqa: E402
+from trading_agent.market.market_data import OPTION_CHAIN_TTL  # noqa: E402
 
 STARTING_EQUITY = _rules.backtest.starting_equity
 SPREAD_WIDTH = _rules.strategy.spread_width_floor
@@ -561,7 +561,7 @@ class Backtester:
             return False
         if self._earnings_calendar is None:
             try:
-                from trading_agent.earnings_calendar import EarningsCalendar
+                from trading_agent.sentiment.earnings_calendar import EarningsCalendar
                 self._earnings_calendar = EarningsCalendar(
                     enabled=True,
                     lookahead_days=self.earnings_lookahead_days,
@@ -3241,7 +3241,7 @@ def _run_cached(
 
 def _export_to_journal(result: BacktestResult) -> None:
     try:
-        from trading_agent.journal_kb import JournalKB
+        from trading_agent.intelligence.journal_kb import JournalKB
         journal = JournalKB(journal_dir="trade_journal")
         m = result.metrics
         journal.log_signal(

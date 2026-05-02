@@ -21,7 +21,7 @@ Usage
   python -m trading_agent.trade_plan_report trade_plans/
 
   # Programmatically (called from OrderExecutor after each save):
-  from trading_agent.trade_plan_report import generate_report
+  from trading_agent.reporting.trade_plan_report import generate_report
   generate_report("trade_plans/trade_plan_IWM.json")
 """
 

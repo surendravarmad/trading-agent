@@ -25,7 +25,7 @@ from trading_agent.strategy.regime import Regime, RegimeAnalysis
 from trading_agent.strategy.strategy import SpreadPlan
 from trading_agent.strategy.risk_manager import RiskVerdict
 from trading_agent.sentiment.fingpt_analyser import SentimentReport
-from trading_agent.ports import SentimentReadout
+from trading_agent.core.ports import SentimentReadout
 
 logger = logging.getLogger(__name__)
 

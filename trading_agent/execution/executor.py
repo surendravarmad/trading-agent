@@ -538,7 +538,7 @@ class OrderExecutor:
 
         # Auto-generate companion HTML report
         try:
-            from trading_agent.trade_plan_report import generate_report
+            from trading_agent.reporting.trade_plan_report import generate_report
             html_path = generate_report(filepath)
             logger.debug("HTML report updated: %s", html_path)
         except Exception as exc:

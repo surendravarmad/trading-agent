@@ -11,8 +11,8 @@ from datetime import datetime, timedelta
 from unittest.mock import MagicMock
 
 from trading_agent.config import AppConfig, AlpacaConfig, TradingConfig, LoggingConfig
-from trading_agent.market_data import MarketDataProvider
-from trading_agent.strategy import SpreadLeg, SpreadPlan
+from trading_agent.market.market_data import MarketDataProvider
+from trading_agent.strategy.strategy import SpreadLeg, SpreadPlan
 
 
 # ------------------------------------------------------------------

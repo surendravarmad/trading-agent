@@ -4,7 +4,7 @@ import json
 import os
 import pytest
 
-from trading_agent.journal_kb import JournalKB
+from trading_agent.intelligence.journal_kb import JournalKB
 
 
 @pytest.fixture

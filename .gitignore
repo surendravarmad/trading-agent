@@ -1,12 +1,27 @@
+# Secrets
 .env
+
+# Python build artefacts
 __pycache__/
 *.pyc
-logs/
-trade_plans/
-trade_journal/
 *.egg-info/
 dist/
 build/
 .venv/
+
+# IDE
 .vscode/launch.json
+.idea/
+
+# Runtime data (auto-created at agent / Streamlit startup)
+logs/
+trade_plans/
+trade_journal/
+knowledge_base/
+
+# Streamlit / agent runtime state — written by the dashboard, consumed
+# by the agent subprocess; per-checkout, never committed.
 AGENT_LOG
+AGENT_RUNNING
+STRATEGY_PRESET.json
+

@@ -98,7 +98,12 @@ AGENT_PID      = Path("AGENT_PID")       # PID of the running cycle process
 AGENT_LOG      = Path("AGENT_LOG")       # rolling log tail
 DRY_RUN_FLAG   = Path("DRY_RUN_MODE")   # sentinel: inject DRY_RUN + FORCE_MARKET_OPEN
 
-REFRESH_INTERVAL   = 30   # seconds between dashboard auto-refreshes
+# Auto-refresh cadence for the live-monitor fragment. Was 30s before the
+# watchdog-backed cache landed; now each rerun is O(1) on quiet ticks
+# (cache hit → zero disk I/O), so we can poll aggressively for
+# near-real-time UX. Override with LIVE_MONITOR_REFRESH_SECS env var if
+# you're on a slow filesystem and want to back off.
+REFRESH_INTERVAL   = int(os.environ.get("LIVE_MONITOR_REFRESH_SECS", "3"))
 CYCLE_INTERVAL_SEC = 300  # 5-minute trading cycle
 
 # Keyword fragments for mapping journal check strings → guardrail slots
@@ -260,12 +265,77 @@ def _get_config():
         return None
 
 
-def _load_journal_df() -> pd.DataFrame:
-    empty = pd.DataFrame(
+def _empty_journal_df() -> pd.DataFrame:
+    return pd.DataFrame(
         columns=["timestamp", "account_balance", "ticker", "action",
                  "regime", "checks_passed", "checks_failed", "notes",
                  "rsi_14", "sma_50", "sma_200", "scan_results"]
     )
+
+
+@st.cache_data(show_spinner=False)
+def _parse_journal_df(path: str, version: int, mtime: float, size: int) -> pd.DataFrame:
+    """
+    Parse *path* into the dashboard's canonical DataFrame shape.
+
+    The cache key is ``(path, version, mtime, size)``:
+      • ``version`` is bumped by the watchdog observer on each modify/create,
+        so unrelated Streamlit reruns hit the cache (zero I/O).
+      • ``mtime`` + ``size`` are belt-and-suspenders for environments where
+        watchdog isn't running (WATCHDOG_DISABLE=1, NFS without polling, etc.)
+        — they still detect changes, just lazily on next call.
+    The ``version`` arg is unused inside the function but is part of the
+    cache signature; do not remove.
+    """
+    del version  # marker only — see docstring
+    rows = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    rec = json.loads(line)
+                    rs = rec.get("raw_signal", {})
+                    rows.append({
+                        "timestamp":       pd.to_datetime(rec.get("timestamp")),
+                        "account_balance": rs.get("account_balance", 0) or 0,
+                        "ticker":          rec.get("ticker", ""),
+                        "action":          rec.get("action", ""),
+                        "regime":          rs.get("regime", "unknown"),
+                        "checks_passed":   rs.get("checks_passed") or [],
+                        "checks_failed":   rs.get("checks_failed") or [],
+                        "notes":           rec.get("notes", ""),
+                        "rsi_14":          rs.get("rsi_14", 0) or 0,
+                        "sma_50":          rs.get("sma_50", 0) or 0,
+                        "sma_200":         rs.get("sma_200", 0) or 0,
+                        # Adaptive-scanner block. Empty dict on legacy
+                        # records so downstream rendering can do truthiness
+                        # checks without KeyError; populated dict on new
+                        # records.
+                        "scan_results":    rs.get("scan_results") or {},
+                    })
+                except (json.JSONDecodeError, KeyError):
+                    continue
+    except FileNotFoundError:
+        return _empty_journal_df()
+    del mtime, size  # silence linters — already captured in cache key
+
+    if not rows:
+        return _empty_journal_df()
+    df = pd.DataFrame(rows)
+    df.sort_values("timestamp", inplace=True)
+    df.reset_index(drop=True, inplace=True)
+    return df
+
+
+def _load_journal_df() -> pd.DataFrame:
+    """
+    Resolve the active journal path (live → legacy fallback), register
+    it with the watchdog observer, and return the parsed DataFrame from
+    the version-keyed cache.
+    """
     # Prefer the new live-only file, fall back to legacy ``signals.jsonl``
     # so the dashboard keeps surfacing pre-rename history. Once the agent
     # has written one cycle to the new path, this naturally converges.
@@ -274,43 +344,23 @@ def _load_journal_df() -> pd.DataFrame:
     elif LEGACY_JOURNAL_PATH.exists():
         path = LEGACY_JOURNAL_PATH
     else:
-        return empty
+        return _empty_journal_df()
 
-    rows = []
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                rec = json.loads(line)
-                rs = rec.get("raw_signal", {})
-                rows.append({
-                    "timestamp":       pd.to_datetime(rec.get("timestamp")),
-                    "account_balance": rs.get("account_balance", 0) or 0,
-                    "ticker":          rec.get("ticker", ""),
-                    "action":          rec.get("action", ""),
-                    "regime":          rs.get("regime", "unknown"),
-                    "checks_passed":   rs.get("checks_passed") or [],
-                    "checks_failed":   rs.get("checks_failed") or [],
-                    "notes":           rec.get("notes", ""),
-                    "rsi_14":          rs.get("rsi_14", 0) or 0,
-                    "sma_50":          rs.get("sma_50", 0) or 0,
-                    "sma_200":         rs.get("sma_200", 0) or 0,
-                    # Adaptive-scanner block. Empty dict on legacy records
-                    # so downstream rendering can do truthiness checks
-                    # without KeyError; populated dict on new records.
-                    "scan_results":    rs.get("scan_results") or {},
-                })
-            except (json.JSONDecodeError, KeyError):
-                continue
+    # Lazy watchdog import — module-level import would force watchdog
+    # to be installed even for non-Streamlit users of this file.
+    try:
+        from trading_agent.streamlit import file_watcher
+        version = file_watcher.watch(path)
+    except Exception:
+        version = 0   # graceful degrade: cache key falls back to mtime+size
 
-    if not rows:
-        return empty
-    df = pd.DataFrame(rows)
-    df.sort_values("timestamp", inplace=True)
-    df.reset_index(drop=True, inplace=True)
-    return df
+    try:
+        stat = os.stat(path)
+        mtime, size = stat.st_mtime, stat.st_size
+    except FileNotFoundError:
+        return _empty_journal_df()
+
+    return _parse_journal_df(str(path), version, mtime, size)
 
 
 def _scanner_diagnostics_from_journal(
@@ -492,16 +542,42 @@ def _guardrail_status_from_journal(df: pd.DataFrame) -> List[Dict]:
     return results
 
 
-def _fetch_account(config) -> Dict:
+# TTL for broker-state caching. Account + position data only changes when
+# orders fill, which is bounded by the agent's 5-min cycle — so 30 s is
+# fresh enough for the dashboard while cutting Alpaca API calls and the
+# associated "Fetched N positions" log spam by ~10× (vs the 3 s fragment
+# refresh interval). Override with BROKER_STATE_TTL_SECS env var.
+BROKER_STATE_TTL_SECS = int(os.environ.get("BROKER_STATE_TTL_SECS", "30"))
+
+
+@st.cache_data(ttl=BROKER_STATE_TTL_SECS, show_spinner=False)
+def _fetch_account_cached(api_key: str, secret_key: str,
+                          data_url: str, base_url: str) -> Dict:
+    """Cached Alpaca account fetch. Cache key is the credential tuple so
+    multiple environments (paper / live) cache independently."""
     try:
         from trading_agent.market_data import MarketDataProvider
         provider = MarketDataProvider(
-            alpaca_api_key=config.alpaca.api_key,
-            alpaca_secret_key=config.alpaca.secret_key,
-            alpaca_data_url=config.alpaca.data_url,
-            alpaca_base_url=config.alpaca.base_url,
+            alpaca_api_key=api_key,
+            alpaca_secret_key=secret_key,
+            alpaca_data_url=data_url,
+            alpaca_base_url=base_url,
         )
         return provider.get_account_info() or {}
+    except Exception as exc:
+        # Re-raise so the wrapper can surface it via st.warning — caching
+        # an exception would silently hide the warning for TTL seconds.
+        raise RuntimeError(str(exc))
+
+
+def _fetch_account(config) -> Dict:
+    try:
+        return _fetch_account_cached(
+            config.alpaca.api_key,
+            config.alpaca.secret_key,
+            config.alpaca.data_url,
+            config.alpaca.base_url,
+        )
     except Exception as exc:
         st.warning(f"Account fetch failed: {exc}")
         return {}
@@ -521,79 +597,110 @@ def _fetch_spreads(config) -> Tuple[List[Dict], List[Dict]]:
     dropping them.
     """
     try:
-        from trading_agent.position_monitor import PositionMonitor
-        monitor = PositionMonitor(
-            api_key=config.alpaca.api_key,
-            secret_key=config.alpaca.secret_key,
-            base_url=config.alpaca.base_url,
+        return _fetch_spreads_cached(
+            config.alpaca.api_key,
+            config.alpaca.secret_key,
+            config.alpaca.base_url,
+            str(config.logging.trade_plan_dir),
         )
-        positions = monitor.fetch_open_positions()
-
-        trade_plans: List[Dict] = []
-        plan_dir = Path(config.logging.trade_plan_dir)
-        if plan_dir.exists():
-            for fp in plan_dir.glob("trade_plan_*.json"):
-                try:
-                    data = json.loads(fp.read_text())
-                    for entry in data.get("state_history", []):
-                        tp = entry.get("trade_plan")
-                        if tp:
-                            trade_plans.append(tp)
-                except Exception:
-                    pass
-
-        spread_objs = monitor.group_into_spreads(positions, trade_plans)
-
-        spreads = [
-            {
-                "underlying":        s.underlying,
-                "strategy_name":     s.strategy_name,
-                "original_credit":   s.original_credit,
-                "net_unrealized_pl": s.net_unrealized_pl,
-                "expiration":        s.expiration,
-                "exit_signal":       s.exit_signal.value,
-            }
-            for s in spread_objs
-        ]
-
-        # Any leg whose symbol didn't end up in a matched spread is "ungrouped".
-        matched_symbols = {leg.symbol for s in spread_objs for leg in s.legs}
-        ungrouped_legs = []
-        for p in positions:
-            if p.symbol in matched_symbols:
-                continue
-            occ = _parse_occ(p.symbol)
-            ungrouped_legs.append(
-                {
-                    "symbol":          p.symbol,
-                    "underlying":      occ["underlying"],
-                    "expiration":      occ["expiration"],
-                    "type":            occ["type"],
-                    "strike":          occ["strike"],
-                    "qty":             p.qty,
-                    "side":            p.side,
-                    "avg_entry_price": p.avg_entry_price,
-                    "current_price":   p.current_price,
-                    "unrealized_pl":   p.unrealized_pl,
-                }
-            )
-
-        return spreads, ungrouped_legs
     except Exception as exc:
         st.warning(f"Position fetch failed: {exc}")
         return [], []
 
 
+@st.cache_data(ttl=BROKER_STATE_TTL_SECS, show_spinner=False)
+def _fetch_spreads_cached(
+    api_key: str, secret_key: str, base_url: str, trade_plan_dir: str,
+) -> Tuple[List[Dict], List[Dict]]:
+    """
+    Cached Alpaca position fetch + spread grouping. Cache key is the
+    credential tuple + trade_plan_dir, so different paper/live envs and
+    different plan directories cache independently. TTL bounds Alpaca
+    API calls to ``BROKER_STATE_TTL_SECS`` (default 30 s) regardless of
+    how often the dashboard fragment reruns — kills the 'Fetched N
+    positions' log spam without sacrificing freshness.
+    """
+    from trading_agent.position_monitor import PositionMonitor
+    monitor = PositionMonitor(
+        api_key=api_key,
+        secret_key=secret_key,
+        base_url=base_url,
+    )
+    positions = monitor.fetch_open_positions()
+
+    trade_plans: List[Dict] = []
+    plan_dir = Path(trade_plan_dir)
+    if plan_dir.exists():
+        for fp in plan_dir.glob("trade_plan_*.json"):
+            try:
+                data = json.loads(fp.read_text())
+                for entry in data.get("state_history", []):
+                    tp = entry.get("trade_plan")
+                    if tp:
+                        trade_plans.append(tp)
+            except Exception:
+                pass
+
+    spread_objs = monitor.group_into_spreads(positions, trade_plans)
+
+    spreads = [
+        {
+            "underlying":        s.underlying,
+            "strategy_name":     s.strategy_name,
+            "original_credit":   s.original_credit,
+            "net_unrealized_pl": s.net_unrealized_pl,
+            "expiration":        s.expiration,
+            "exit_signal":       s.exit_signal.value,
+        }
+        for s in spread_objs
+    ]
+
+    # Any leg whose symbol didn't end up in a matched spread is "ungrouped".
+    matched_symbols = {leg.symbol for s in spread_objs for leg in s.legs}
+    ungrouped_legs = []
+    for p in positions:
+        if p.symbol in matched_symbols:
+            continue
+        occ = _parse_occ(p.symbol)
+        ungrouped_legs.append(
+            {
+                "symbol":          p.symbol,
+                "underlying":      occ["underlying"],
+                "expiration":      occ["expiration"],
+                "type":            occ["type"],
+                "strike":          occ["strike"],
+                "qty":             p.qty,
+                "side":            p.side,
+                "avg_entry_price": p.avg_entry_price,
+                "current_price":   p.current_price,
+                "unrealized_pl":   p.unrealized_pl,
+            }
+        )
+
+    return spreads, ungrouped_legs
+
+
+@st.cache_data(ttl=BROKER_STATE_TTL_SECS, show_spinner=False)
+def _is_market_open_cached(api_key: str, secret_key: str,
+                           data_url: str, base_url: str) -> Optional[bool]:
+    from trading_agent.market_data import MarketDataProvider
+    provider = MarketDataProvider(
+        alpaca_api_key=api_key,
+        alpaca_secret_key=secret_key,
+        alpaca_data_url=data_url,
+        alpaca_base_url=base_url,
+    )
+    return provider.is_market_open()
+
+
 def _is_market_open(config) -> Optional[bool]:
     try:
-        from trading_agent.market_data import MarketDataProvider
-        provider = MarketDataProvider(
-            alpaca_api_key=config.alpaca.api_key,
-            alpaca_secret_key=config.alpaca.secret_key,
-            alpaca_data_url=config.alpaca.data_url,
-            alpaca_base_url=config.alpaca.base_url,
+        return _is_market_open_cached(
+            config.alpaca.api_key,
+            config.alpaca.secret_key,
+            config.alpaca.data_url,
+            config.alpaca.base_url,
         )
-        return provider.is_market_open()
     except Exception:
         return None
 
@@ -1109,7 +1216,17 @@ def render_live_monitor() -> None:
     spreads: List[Dict] = []
     ungrouped_legs: List[Dict] = []
 
-    if config:
+    # ── Broker-state fetch gating ─────────────────────────────────────────
+    # Only hit Alpaca (positions + account + market-open) when the agent
+    # loop is actually running, OR when the user explicitly clicks the
+    # one-off "Refresh broker state" button below. With the agent stopped
+    # there's no fresh signal to monitor — equity falls back to the last
+    # journal entry's account_balance, which is what the operator cares
+    # about anyway. Eliminates the "Fetched N positions" log spam every
+    # 3 s while the dashboard sits idle.
+    fetch_broker_now = st.session_state.pop("_bm_force_refresh", False)
+    should_fetch_broker = bool(config) and (loop_running or fetch_broker_now)
+    if should_fetch_broker:
         account = _fetch_account(config)
         equity = float(account.get("equity") or 0)
         total_pnl = float(account.get("unrealized_pl") or 0)
@@ -1135,7 +1252,37 @@ def render_live_monitor() -> None:
     st.divider()
 
     # ── Open positions ─────────────────────────────────────────────────────
-    st.subheader("Open Positions")
+    op_hdr_col, op_btn_col = st.columns([4, 1])
+    with op_hdr_col:
+        st.subheader("Open Positions")
+    with op_btn_col:
+        # Manual one-off broker pull — useful when the agent is stopped
+        # but the operator wants to peek at live broker state. Sets a
+        # session-state flag that the next fragment-tick consumes.
+        if not loop_running and st.button(
+            "↻ Refresh broker state",
+            key="bm_force_refresh_btn",
+            help=(
+                "Hit Alpaca once for the latest positions + account "
+                "equity. While the agent is stopped, broker state is "
+                "not auto-polled (no signal to monitor)."
+            ),
+        ):
+            st.session_state["_bm_force_refresh"] = True
+            # Clear the cached fetches so the manual click definitely
+            # round-trips to Alpaca rather than serving the TTL cache.
+            try:
+                _fetch_account_cached.clear()
+                _fetch_spreads_cached.clear()
+            except Exception:
+                pass
+            st.rerun()
+    if not should_fetch_broker:
+        st.caption(
+            "ℹ️ Agent stopped — broker positions not auto-polled. "
+            "Click **↻ Refresh broker state** above for a one-off "
+            "snapshot, or **Start Agent** to resume polling."
+        )
     positions_table(spreads)
 
     if ungrouped_legs:

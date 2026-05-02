@@ -31,7 +31,7 @@ import ast
 import sys
 from pathlib import Path
 
-ROOT = Path(__file__).parent / "trading_agent"
+ROOT = Path(__file__).resolve().parents[2] / "trading_agent"
 
 EXPECTED_FILES = {
     "chain_scanner.py": "_cw_floor",          # helper function

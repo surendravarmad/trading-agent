@@ -21,7 +21,7 @@ import os
 import sys
 from datetime import date
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 # Stub pandas_market_calendars before importing the scanner — the sandbox
 # can't pip install the real package and we don't need its calendar.

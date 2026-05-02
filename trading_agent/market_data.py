@@ -150,7 +150,10 @@ class MarketDataProvider:
                          ticker, now - cached_ts)
             return self._price_cache[ticker]
 
-        logger.info("Fetching %d days of price history for %s", period_days, ticker)
+        # Per-ticker per-cycle on cache miss — DEBUG. Cache-hit path is
+        # already DEBUG above; agent.py logs the cycle-level pre-fetch
+        # summary at INFO so the operator still sees aggregate progress.
+        logger.debug("Fetching %d days of price history for %s", period_days, ticker)
         cal_days = int(period_days * 1.6)
         end = datetime.now()
         start = end - timedelta(days=cal_days)
@@ -186,7 +189,7 @@ class MarketDataProvider:
 
         self._price_cache[ticker] = df
         self._price_cache_ts[ticker] = time.monotonic()
-        logger.info("Received %d rows for %s (cached)", len(df), ticker)
+        logger.debug("Received %d rows for %s (cached)", len(df), ticker)
         return df
 
     def prefetch_historical_parallel(self, tickers: List[str],
@@ -275,8 +278,10 @@ class MarketDataProvider:
                 prices[ticker] = price
                 self._snapshot_cache[ticker] = (price, now)
 
-        logger.info("Batch snapshot: fetched prices for %d/%d tickers",
-                    len(prices), len(tickers))
+        # Per-cycle batch fetch — agent.py logs the cycle start at INFO
+        # which already implies "we're about to fetch prices". DEBUG.
+        logger.debug("Batch snapshot: fetched prices for %d/%d tickers",
+                     len(prices), len(tickers))
         return prices
 
     def _fetch_alpaca_snapshot_price(self, ticker: str) -> Optional[float]:
@@ -303,15 +308,18 @@ class MarketDataProvider:
             latest_trade = snap.get("latestTrade", {})
             if latest_trade and latest_trade.get("p"):
                 price = float(latest_trade["p"])
-                logger.info("[%s] Alpaca real-time price: $%.2f (latest trade)",
-                            ticker, price)
+                # Per-ticker per-cycle quote — DEBUG. Phase I/III logs in
+                # agent.py + strategy.py already report the price actually
+                # used for planning and execution.
+                logger.debug("[%s] Alpaca real-time price: $%.2f (latest trade)",
+                             ticker, price)
                 self._snapshot_cache[ticker] = (price, time.monotonic())
                 return price
             daily_bar = snap.get("dailyBar", {})
             if daily_bar and daily_bar.get("c"):
                 price = float(daily_bar["c"])
-                logger.info("[%s] Alpaca real-time price: $%.2f (daily bar close)",
-                            ticker, price)
+                logger.debug("[%s] Alpaca real-time price: $%.2f (daily bar close)",
+                             ticker, price)
                 self._snapshot_cache[ticker] = (price, time.monotonic())
                 return price
             logger.warning("[%s] Snapshot returned but no price data found", ticker)
@@ -460,7 +468,11 @@ class MarketDataProvider:
             "feed": feed,
             "limit": 1000,
         }
-        logger.info("Fetching %s option chain for %s exp %s (feed=%s)",
+        # Per-(ticker, expiration) chain fetch — chain scanner's grid
+        # sweep alone produces |DTE_grid| chain fetches per ticker per
+        # cycle. DEBUG. The "Received N contracts" summary below stays
+        # at DEBUG too; failures are still WARNING / ERROR.
+        logger.debug("Fetching %s option chain for %s exp %s (feed=%s)",
                      option_type, underlying, expiration_date, feed)
 
         def _parse_snapshots(snapshots: Dict) -> List[Dict]:
@@ -582,8 +594,11 @@ class MarketDataProvider:
         if contracts is None:
             return None
 
-        logger.info("Received %d %s contracts for %s",
-                    len(contracts), option_type, underlying)
+        # Per-chain summary; same volume as the "Fetching chain" log
+        # above. DEBUG. Recovery / fallback paths above stay at INFO /
+        # WARNING because they're actionable signals.
+        logger.debug("Received %d %s contracts for %s",
+                     len(contracts), option_type, underlying)
 
         if not contracts and effective_url:
             logger.warning(

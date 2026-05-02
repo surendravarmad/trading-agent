@@ -157,8 +157,11 @@ class PositionMonitor:
                 positions.append(snap)
 
             option_positions = [p for p in positions if p.asset_class == "us_option"]
-            logger.info("Fetched %d total positions, %d are options",
-                        len(positions), len(option_positions))
+            # Hot-path: fires every Stage-1 tick AND every Streamlit
+            # broker-state refresh (BROKER_STATE_TTL_SECS=30s default).
+            # DEBUG so the default INFO log focuses on actionable events.
+            logger.debug("Fetched %d total positions, %d are options",
+                         len(positions), len(option_positions))
             return option_positions
 
         except requests.RequestException as exc:
@@ -209,7 +212,8 @@ class PositionMonitor:
             )
             spreads.append(spread)
 
-        logger.info("Grouped positions into %d spread(s)", len(spreads))
+        # Same hot-path: per-tick + per-Streamlit-refresh. DEBUG.
+        logger.debug("Grouped positions into %d spread(s)", len(spreads))
         return spreads
 
     # ------------------------------------------------------------------

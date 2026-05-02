@@ -29,7 +29,7 @@ import sys
 import types
 from datetime import date, timedelta
 
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "..")))
 
 
 # Stub pandas_market_calendars (sandbox can't pip install it).

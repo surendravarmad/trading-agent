@@ -89,11 +89,39 @@ OPTIMIZE_PROMPT = (
 # Helpers
 # ---------------------------------------------------------------------------
 
+@st.cache_data(show_spinner=False)
+def _parse_recent_signals(path: str, version: int, mtime: float, size: int) -> List[Dict]:
+    """
+    Parse all records from *path*. Cache key includes ``version`` (bumped
+    by watchdog on each modify/create) and (mtime, size) as a fallback
+    when watchdog isn't running. Slicing to the last n is done by the
+    caller so a different ``n`` doesn't cause a fresh parse.
+    """
+    del version  # marker only — part of cache signature
+    records: List[Dict] = []
+    try:
+        with open(path) as fh:
+            for line in fh:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    records.append(json.loads(line))
+                except json.JSONDecodeError:
+                    pass
+    except FileNotFoundError:
+        return []
+    del mtime, size
+    return records
+
+
 def _load_recent_signals(n: int = 10) -> List[Dict]:
     """Return the last n records from the live-agent journal.
 
     Falls back to the legacy ``signals.jsonl`` filename so users who
-    have a pre-Phase-3 journal still get history surfaced.
+    have a pre-Phase-3 journal still get history surfaced. Reads go
+    through a watchdog-keyed cache so unrelated Streamlit reruns don't
+    re-parse the file.
     """
     if JOURNAL_PATH.exists():
         path = JOURNAL_PATH
@@ -101,16 +129,18 @@ def _load_recent_signals(n: int = 10) -> List[Dict]:
         path = LEGACY_JOURNAL_PATH
     else:
         return []
-    records: List[Dict] = []
-    with open(path) as fh:
-        for line in fh:
-            line = line.strip()
-            if not line:
-                continue
-            try:
-                records.append(json.loads(line))
-            except json.JSONDecodeError:
-                pass
+    try:
+        from trading_agent.streamlit import file_watcher
+        version = file_watcher.watch(path)
+    except Exception:
+        version = 0
+    try:
+        import os as _os
+        stat = _os.stat(path)
+        mtime, size = stat.st_mtime, stat.st_size
+    except FileNotFoundError:
+        return []
+    records = _parse_recent_signals(str(path), version, mtime, size)
     return records[-n:]
 
 

@@ -10,6 +10,10 @@ pytest>=7.4.0
 pytest-mock>=3.12.0
 streamlit>=1.42.0
 plotly>=6.0.0
+# watchdog drives event-based dashboard refresh + cache invalidation
+# (trading_agent/streamlit/file_watcher.py). Set WATCHDOG_DISABLE=1 to
+# fall back to mtime+size-based polling.
+watchdog>=3.0,<5
 
 # --- Optional: FinGPT multi-source pipeline ---
 # Install the sources you want; each degrades gracefully if absent.

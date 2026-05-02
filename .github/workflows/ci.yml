@@ -1,0 +1,67 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+    branches: [main, master]
+
+# Cancel in-progress runs of the same workflow on the same branch when a
+# new push lands — keeps the queue short on rapid iteration.
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  invariants:
+    # AST checks are <1s and require no third-party deps. Failing here
+    # prevents the rest of CI from spending minutes only to surface a
+    # drift-prevention violation. Block the rest on this job.
+    name: Drift-prevention invariants (AST)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - run: python3 scripts/checks/scan_invariant_check.py
+
+  tests:
+    name: Unit tests + smoke checks
+    needs: invariants
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Pytest (full repo suite)
+        run: pytest tests/ -v --maxfail=10
+
+      # Smoke checks run after pytest so unit-test regressions surface
+      # first (they're cheaper to bisect). Each check is self-contained
+      # and fast (<5s); failing any of them blocks the merge because they
+      # guard the live ↔ backtest unification.
+      - name: Smoke check — scan diagnostics
+        run: python3 scripts/checks/run_scan_diagnostics_check.py
+
+      - name: Smoke check — unified backtest
+        run: python3 scripts/checks/run_unified_backtest_check.py
+
+      - name: Smoke check — journal split
+        run: python3 scripts/checks/run_journal_split_check.py
+
+      - name: Smoke check — live ↔ backtest parity
+        run: python3 scripts/checks/run_live_vs_backtest_parity_check.py

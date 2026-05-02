@@ -3535,7 +3535,8 @@ def render_backtest_ui() -> None:
                 icon="⚠️",
             )
 
-        # Reset defaults when timeframe changes
+        # Reset defaults when timeframe changes (also seeds session state
+        # on first render, since prev_tf is None ≠ timeframe).
         prev_tf = st.session_state.get("_bt_prev_timeframe")
         if prev_tf != timeframe:
             st.session_state["_bt_prev_timeframe"] = timeframe
@@ -3546,13 +3547,13 @@ def render_backtest_ui() -> None:
                 if is_intraday else DEFAULT_START
             )
 
-        default_start = (
-            date.today() - timedelta(days=INTRADAY_MAX_DAYS)
-            if is_intraday else DEFAULT_START
-        )
+        # NOTE: do NOT pass ``value=`` here — the widget's key is bound to
+        # ``st.session_state["bt_start_date"]``, which the branch above
+        # populates. Passing both ``value=`` and a populated session-state
+        # key triggers Streamlit's "default value but also set via Session
+        # State API" warning.
         start_date = st.date_input(
             "Start Date",
-            value=st.session_state.get("bt_start_date", default_start),
             key="bt_start_date",
         )
         end_date = st.date_input("End Date", value=DEFAULT_END, key="bt_end_date")
@@ -3807,6 +3808,8 @@ def render_backtest_ui() -> None:
                 f"mode={mode_label}"
                 + (" · macro-signals=ON" if use_macro_signals_val else "")
                 + (" · agent-parity=ON" if agent_parity else "")
+                + (f" · unified-engine=ON (preset={preset_name_val})"
+                   if (use_unified_engine_val and preset_name_val) else "")
             )
             run_status = st.empty()
             run_status.info(
@@ -3832,6 +3835,8 @@ def render_backtest_ui() -> None:
                     earnings_lookahead_days=earnings_lookahead_val,
                     use_alpaca_historical=use_alpaca_historical,
                     use_macro_signals=use_macro_signals_val,
+                    preset_name=preset_name_val,
+                    use_unified_engine=use_unified_engine_val,
                 )
             elapsed_s = time.monotonic() - run_t0
             n_trades = 0 if result is None or result.trades is None else len(result.trades)

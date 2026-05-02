@@ -25,3 +25,7 @@ AGENT_LOG
 AGENT_RUNNING
 STRATEGY_PRESET.json
 
+# Generated reports (visualize_logs.py default output + ad-hoc runs)
+daily_report.html
+reports/
+

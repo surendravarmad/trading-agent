@@ -284,6 +284,53 @@ class TestLoadSignals:
 
 
 # ---------------------------------------------------------------------------
+# _resolve_journal_path — May-2026 journal-split fallback
+# ---------------------------------------------------------------------------
+
+
+class TestResolveJournalPath:
+    """
+    Pins the back-compat fallback so an old archive that still has
+    ``signals.jsonl`` (pre-split) keeps rendering with the new default.
+    Explicit user-supplied paths must NEVER be silently rewritten.
+    """
+
+    def test_returns_signals_live_when_present(self, tmp_path):
+        live = tmp_path / "signals_live.jsonl"
+        live.write_text("{}\n")
+        resolved = vl._resolve_journal_path(str(live))
+        assert resolved == live
+
+    def test_falls_back_to_legacy_when_default_missing(self, tmp_path):
+        # No signals_live.jsonl, only the pre-split signals.jsonl
+        legacy = tmp_path / "signals.jsonl"
+        legacy.write_text("{}\n")
+        resolved = vl._resolve_journal_path(str(tmp_path / "signals_live.jsonl"))
+        assert resolved == legacy
+
+    def test_does_not_rewrite_explicit_backtest_path(self, tmp_path):
+        # User asked for signals_backtest.jsonl explicitly — never fall
+        # back to the live legacy; that would silently render the wrong
+        # data set.
+        bt = tmp_path / "signals_backtest.jsonl"
+        # Even with a sibling signals.jsonl present, the explicit path
+        # must come back unchanged so load_signals' missing-file branch
+        # produces an empty DataFrame instead of legacy data.
+        (tmp_path / "signals.jsonl").write_text("{}\n")
+        resolved = vl._resolve_journal_path(str(bt))
+        assert resolved == bt
+        assert not resolved.exists()
+
+    def test_returns_missing_default_when_nothing_present(self, tmp_path):
+        # Neither file exists → return the requested default unchanged
+        # so load_signals' .exists() check fires its empty-DataFrame path.
+        requested = tmp_path / "signals_live.jsonl"
+        resolved = vl._resolve_journal_path(str(requested))
+        assert resolved == requested
+        assert not resolved.exists()
+
+
+# ---------------------------------------------------------------------------
 # load_trade_plans
 # ---------------------------------------------------------------------------
 
@@ -687,7 +734,11 @@ class TestParseArgs:
 
     def test_defaults(self):
         args = vl._parse_args([])
-        assert args.journal == "trade_journal/signals.jsonl"
+        # Post-May-2026 journal split: live-mode is the default; legacy
+        # signals.jsonl is auto-detected as a fallback inside load_signals
+        # (see _resolve_journal_path).
+        assert args.journal == "trade_journal/signals_live.jsonl"
+        assert args.journal == vl.DEFAULT_JOURNAL
         assert args.plans_dir == "trade_plans"
         assert args.tickers is None
         assert args.date is None

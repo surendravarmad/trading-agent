@@ -2,18 +2,28 @@
 """
 visualize_logs.py
 =================
-Parses trade_journal/signals.jsonl and trade_plans/{TICKER}.json files
-to generate a daily "Agent Performance Dashboard" as a single interactive
-HTML file.
+Parses ``trade_journal/signals_live.jsonl`` (or ``signals_backtest.jsonl``,
+or the pre-May-2026 ``signals.jsonl`` — auto-detected as a fallback) and
+``trade_plans/trade_plan_{TICKER}.json`` files to generate a daily "Agent
+Performance Dashboard" as a single interactive HTML file.
+
+Journal resolution
+------------------
+The default journal is ``trade_journal/signals_live.jsonl`` (post-May-2026
+live-mode output). If the default doesn't exist, the script transparently
+falls back to the legacy ``trade_journal/signals.jsonl`` so existing
+archives still render. Pass ``--journal`` explicitly to render a backtest
+run (``trade_journal/signals_backtest.jsonl``) or any other source.
 
 Usage
 -----
-    python visualize_logs.py                       # today's data, defaults
-    python visualize_logs.py --date 2026-04-02     # specific date
-    python visualize_logs.py --tickers SPY QQQ     # specific tickers only
-    python visualize_logs.py --all-dates           # no date filter
-    python visualize_logs.py --output report.html  # custom output path
-    python visualize_logs.py --help                # full option list
+    python visualize_logs.py                                 # today's live data
+    python visualize_logs.py --date 2026-04-02               # specific date
+    python visualize_logs.py --tickers SPY QQQ               # specific tickers
+    python visualize_logs.py --all-dates                     # no date filter
+    python visualize_logs.py --output report.html            # custom output
+    python visualize_logs.py --journal trade_journal/signals_backtest.jsonl
+    python visualize_logs.py --help                          # full option list
 """
 
 import argparse
@@ -115,6 +125,35 @@ _LOGIC_BUCKETS: List[tuple] = [
 # Data loading
 # ---------------------------------------------------------------------------
 
+# Default journal — the May-2026 split moved live-mode output to
+# ``signals_live.jsonl``. ``LEGACY_JOURNAL`` is the pre-split filename;
+# ``_resolve_journal_path`` falls back to it transparently so old archives
+# (and any third-party tooling that still drops files at the old path)
+# keep rendering without code changes.
+DEFAULT_JOURNAL = "trade_journal/signals_live.jsonl"
+LEGACY_JOURNAL  = "trade_journal/signals.jsonl"
+
+
+def _resolve_journal_path(journal_path: str) -> Path:
+    """
+    Resolve *journal_path* with one back-compat fallback.
+
+    If the requested file exists, return it as-is. If it doesn't and the
+    caller asked for the post-split default ``signals_live.jsonl``, try
+    the legacy ``signals.jsonl`` next to it before giving up. Explicit
+    user-supplied paths (e.g. ``signals_backtest.jsonl``) are never
+    second-guessed — caller's "missing file → empty DataFrame" semantics
+    still apply.
+    """
+    p = Path(journal_path)
+    if p.exists():
+        return p
+    if p.name == "signals_live.jsonl":
+        legacy = p.with_name("signals.jsonl")
+        if legacy.exists():
+            return legacy
+    return p
+
 
 def load_signals(
     journal_path: str,
@@ -122,12 +161,16 @@ def load_signals(
     tickers: Optional[List[str]] = None,
 ) -> pd.DataFrame:
     """
-    Load ``signals.jsonl`` into a tidy DataFrame.
+    Load a signal-journal JSONL file into a tidy DataFrame.
+
+    Accepts ``signals_live.jsonl``, ``signals_backtest.jsonl``, or the
+    pre-May-2026 ``signals.jsonl`` interchangeably — the schema is
+    identical across all three.
 
     Parameters
     ----------
     journal_path :
-        Path to the signals.jsonl file.
+        Path to the signal-journal file.
     filter_date :
         ISO date string ``"YYYY-MM-DD"`` — keep only rows from that day.
         ``None`` keeps every row.
@@ -141,7 +184,7 @@ def load_signals(
     ``raw_signal.*`` field flattened with a ``raw_signal_`` prefix.
     Returns an **empty** DataFrame when the file is missing or empty.
     """
-    path = Path(journal_path)
+    path = _resolve_journal_path(journal_path)
     if not path.exists():
         return pd.DataFrame()
 
@@ -361,7 +404,7 @@ def build_safety_buffer_chart(
     Line chart — underlying price over the session with short-strike
     "danger zone" annotation.
 
-    - Solid coloured line = underlying price (from ``signals.jsonl``)
+    - Solid coloured line = underlying price (from the signal journal)
     - Red dashed horizontal line = short strike of the most-recent
       approved trade for that ticker
     """
@@ -659,7 +702,7 @@ footer {
 
 
 def generate_dashboard(
-    journal_path: str = "trade_journal/signals.jsonl",
+    journal_path: str = DEFAULT_JOURNAL,
     plans_dir: str = "trade_plans",
     tickers: Optional[List[str]] = None,
     filter_date: Optional[str] = None,
@@ -671,7 +714,11 @@ def generate_dashboard(
     Parameters
     ----------
     journal_path :
-        Path to ``signals.jsonl``.
+        Path to the signal-journal JSONL. Defaults to the live-mode
+        journal (``trade_journal/signals_live.jsonl``); pass the
+        backtest path explicitly to render a backtest run. The legacy
+        ``signals.jsonl`` is auto-detected as a fallback when the
+        default doesn't exist (see ``_resolve_journal_path``).
     plans_dir :
         Directory containing ``trade_plan_*.json`` files.
     tickers :
@@ -781,9 +828,13 @@ def _parse_args(argv=None):
     )
     parser.add_argument(
         "--journal",
-        default="trade_journal/signals.jsonl",
+        default=DEFAULT_JOURNAL,
         metavar="PATH",
-        help="Path to signals.jsonl  (default: trade_journal/signals.jsonl)",
+        help=(
+            "Path to the signal-journal JSONL "
+            f"(default: {DEFAULT_JOURNAL}; "
+            "falls back to legacy signals.jsonl if the default is missing)"
+        ),
     )
     parser.add_argument(
         "--plans-dir",

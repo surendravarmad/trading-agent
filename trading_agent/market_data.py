@@ -46,6 +46,30 @@ INTRADAY_RETURN_TTL = 60        # 1 minute — 5-min bar return; long enough to
                                 # dedupe SPY/QQQ benchmark calls within one
                                 # cycle (~1-3 min), short enough to roll over
                                 # to the next bar between cycles
+INTRADAY_BARS_TTL = 60          # 1 minute — intraday OHLCV bars for the
+                                # Watchlist tab. Same rationale as the
+                                # 5-min return cache: long enough to dedupe
+                                # repeated reads from a Streamlit refresh,
+                                # short enough to roll over each bar.
+
+# yfinance interval limits (Yahoo's documented constraints):
+#   1m              → 7 days max
+#   2m/5m/15m/30m   → 60 days max
+#   60m / 90m       → 730 days max
+#   1d              → unlimited (use fetch_historical_prices for daily)
+# We expose the watchlist-tab-relevant subset and synthesize 4h from 60m
+# bars because Yahoo doesn't carry a native 4h interval.
+SUPPORTED_INTRADAY_INTERVALS: Tuple[str, ...] = (
+    "5m", "15m", "30m", "60m", "1h", "4h",
+)
+_INTRADAY_DEFAULT_LOOKBACK_DAYS: Dict[str, int] = {
+    "5m":  30,
+    "15m": 30,
+    "30m": 30,
+    "60m": 60,
+    "1h":  60,
+    "4h":  60,
+}
 
 # Max workers for parallel historical fetches
 _MAX_PREFETCH_WORKERS = 5
@@ -130,6 +154,14 @@ class MarketDataProvider:
         # ^VIX is sourced via yfinance because Alpaca doesn't carry it as a
         # tradable symbol on the IEX/SIP feeds.  Cached for INTRADAY_RETURN_TTL.
         self._vix_zscore_cache: Optional[Tuple[float, float, float]] = None  # (raw_change, zscore, epoch)
+
+        # Intraday OHLCV cache for the Watchlist tab.
+        # Keyed on (ticker, interval) so callers can request the same ticker
+        # at multiple timeframes without thrashing the network.  TTL is
+        # INTRADAY_BARS_TTL (60s by default) — short enough that the live
+        # Alpaca-overlay path stays accurate, long enough that repeated
+        # Streamlit reruns within a refresh window hit the cache.
+        self._intraday_bars_cache: Dict[Tuple[str, str], Tuple[pd.DataFrame, float]] = {}
 
     # ------------------------------------------------------------------
     # Yahoo Finance — historical OHLCV
@@ -218,6 +250,155 @@ class MarketDataProvider:
                 except Exception as exc:
                     logger.warning("[%s] Historical pre-fetch failed: %s",
                                    ticker, exc)
+
+    def fetch_intraday_bars(self,
+                            ticker: str,
+                            interval: str,
+                            lookback_days: Optional[int] = None,
+                            include_live_overlay: bool = True
+                            ) -> pd.DataFrame:
+        """
+        Fetch intraday OHLCV bars for the Watchlist tab.
+
+        Parameters
+        ----------
+        ticker
+            Equity / ETF symbol.
+        interval
+            One of ``SUPPORTED_INTRADAY_INTERVALS``: 5m, 15m, 30m, 60m, 1h, 4h.
+            ``1h`` is an alias for ``60m``. ``4h`` is synthesized by
+            resampling 60m bars (Yahoo doesn't expose a native 4h interval).
+        lookback_days
+            Calendar-day lookback. Defaults from
+            ``_INTRADAY_DEFAULT_LOOKBACK_DAYS`` if omitted. Capped at
+            Yahoo's per-interval limits to avoid silent empty responses.
+        include_live_overlay
+            When True (default), the most recent bar's *Close* is replaced
+            with Alpaca's real-time snapshot price (and *High*/*Low*
+            extended if the live tick exceeds them). This is the "Hybrid"
+            data-source mode chosen at planning time: yfinance for chart
+            depth, Alpaca for the right-most live tick, matching the
+            existing pattern used by ``get_current_price``.
+
+        Returns
+        -------
+        pd.DataFrame
+            Index: timezone-naive ``DatetimeIndex`` (US/Eastern wall-clock
+            stripped to naïve, so Plotly renders cleanly without DST jumps).
+            Columns: ``Open``, ``High``, ``Low``, ``Close``, ``Volume``.
+
+        Raises
+        ------
+        ValueError
+            On unsupported ``interval``.
+        InsufficientDataError
+            When yfinance returns an empty frame (delisted, halted, weekend
+            with too-short lookback, etc.).
+        ImportError
+            When ``yfinance`` is not installed.
+
+        Notes
+        -----
+        - **Cache**: ``(ticker, interval)`` key, ``INTRADAY_BARS_TTL`` second
+          TTL. Live-overlay mutation is applied AFTER cache read so a 60s
+          cache hit still gets a fresh Alpaca tick.
+        - **Logging**: per-fetch and per-cache-hit lines are DEBUG. The
+          watchlist UI logs an aggregate "refreshed N tickers" headline at
+          INFO so operator-visible chatter is bounded.
+        - **Read-only**: This method has no callers in the agent loop /
+          decision engine / executor — it exists exclusively for the
+          Watchlist analyst view, so it cannot affect the live ↔ backtest
+          parity invariants.
+        """
+        if interval not in SUPPORTED_INTRADAY_INTERVALS:
+            raise ValueError(
+                f"Unsupported intraday interval {interval!r}. "
+                f"Supported: {SUPPORTED_INTRADAY_INTERVALS}"
+            )
+        if yf is None:
+            raise ImportError("yfinance is required for intraday bars. "
+                              "Install with: pip install yfinance")
+
+        # 1h is an alias — normalize to 60m for cache + yfinance call.
+        yf_interval = "60m" if interval in ("1h", "4h") else interval
+        cache_key = (ticker, interval)
+        now = time.monotonic()
+
+        cached = self._intraday_bars_cache.get(cache_key)
+        if cached is not None and (now - cached[1]) < INTRADAY_BARS_TTL:
+            logger.debug("[%s] Intraday cache HIT %s (age=%.0fs)",
+                         ticker, interval, now - cached[1])
+            df = cached[0].copy()
+        else:
+            lookback = lookback_days or _INTRADAY_DEFAULT_LOOKBACK_DAYS[interval]
+            # Yahoo caps sub-hourly intervals at 60 days; clamp defensively.
+            if yf_interval in ("5m", "15m", "30m") and lookback > 60:
+                lookback = 60
+
+            end = datetime.now()
+            start = end - timedelta(days=lookback)
+
+            logger.debug("Fetching %s intraday bars for %s (lookback=%dd)",
+                         interval, ticker, lookback)
+            tk = yf.Ticker(ticker)
+            raw = tk.history(
+                start=start.strftime("%Y-%m-%d"),
+                end=end.strftime("%Y-%m-%d"),
+                interval=yf_interval,
+                auto_adjust=False,
+                prepost=False,
+            )
+            if raw is None or raw.empty:
+                raise InsufficientDataError(
+                    f"No intraday data for {ticker} @ {interval} "
+                    f"(lookback={lookback}d). Symbol may be delisted, halted, "
+                    f"or the lookback window may exclude all RTH bars."
+                )
+
+            # Strip TZ for clean Plotly rendering — keep wall-clock semantics.
+            if raw.index.tz is not None:
+                raw.index = raw.index.tz_localize(None)
+            raw = raw[["Open", "High", "Low", "Close", "Volume"]].copy()
+
+            if interval == "4h":
+                # No native 4h on Yahoo — resample 60m → 4h on the raw clock.
+                # Some buckets straddle pre/post-market gaps (which is why
+                # we set prepost=False above), so dropna() removes empties.
+                raw = (
+                    raw.resample("4h")
+                       .agg({"Open":   "first",
+                             "High":   "max",
+                             "Low":    "min",
+                             "Close":  "last",
+                             "Volume": "sum"})
+                       .dropna(subset=["Open", "Close"])
+                )
+
+            self._intraday_bars_cache[cache_key] = (raw.copy(), now)
+            df = raw
+            logger.debug("[%s] %d %s bars cached", ticker, len(df), interval)
+
+        # Hybrid live overlay — replace the right-most close with the
+        # current Alpaca snapshot so the chart shows the live tick. Failures
+        # here are non-fatal: charts always render with the cached bar data
+        # if Alpaca is unreachable.
+        if include_live_overlay and not df.empty:
+            try:
+                live_price = self._fetch_alpaca_snapshot_price(ticker)
+            except Exception as exc:  # pragma: no cover — defensive
+                logger.debug("[%s] Live-overlay snapshot failed: %s",
+                             ticker, exc)
+                live_price = None
+
+            if live_price is not None:
+                last = df.index[-1]
+                df.loc[last, "Close"] = live_price
+                if live_price > df.loc[last, "High"]:
+                    df.loc[last, "High"] = live_price
+                if live_price < df.loc[last, "Low"]:
+                    df.loc[last, "Low"] = live_price
+
+        return df
 
     def get_current_price(self, ticker: str) -> float:
         """

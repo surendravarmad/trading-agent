@@ -7,6 +7,7 @@ llm_extension never import plotly directly.
 
 from typing import Dict, List
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -75,7 +76,9 @@ def drawdown_chart(df: pd.DataFrame) -> go.Figure:
     """
     equity = df["account_balance"]
     running_max = equity.cummax()
-    drawdown_pct = (equity - running_max) / running_max.replace(0, pd.NA) * 100
+    # Use np.nan (not pd.NA) to keep dtype float64 — pd.NA coerces to
+    # object, which breaks downstream numeric ops like .ewm().mean().
+    drawdown_pct = (equity - running_max) / running_max.replace(0, np.nan) * 100
 
     fig = go.Figure()
     fig.add_trace(

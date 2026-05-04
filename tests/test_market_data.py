@@ -659,3 +659,181 @@ class TestVIXZScore:
         )
         result = provider.get_vix_zscore()
         assert result == (0.4, 1.8)
+
+
+# ----------------------------------------------------------------------
+# Watchlist tab — fetch_intraday_bars
+# ----------------------------------------------------------------------
+class TestFetchIntradayBars:
+    """
+    Read-only analyst data path for the Watchlist tab.
+
+    These tests guard the contract callers (multi_tf_regime, watchlist_ui)
+    will rely on:
+      * shape: 5 OHLCV columns, tz-naive DatetimeIndex
+      * cache: HIT inside TTL must not touch yfinance
+      * resample: 4h synthesizes from 60m correctly
+      * overlay: live Alpaca tick replaces the right-most close
+      * errors: bad interval → ValueError, empty fetch → InsufficientDataError
+    """
+
+    @staticmethod
+    def _make_60m_frame(periods: int = 12) -> pd.DataFrame:
+        idx = pd.date_range("2026-04-15 09:30", periods=periods, freq="60min")
+        # Simple monotonic ramp so resample assertions are easy to verify.
+        closes = np.linspace(100, 100 + periods - 1, periods)
+        return pd.DataFrame({
+            "Open":   closes - 0.25,
+            "High":   closes + 0.50,
+            "Low":    closes - 0.50,
+            "Close":  closes,
+            "Volume": np.full(periods, 1_000_000, dtype="int64"),
+        }, index=idx)
+
+    @staticmethod
+    def _patch_yf(monkeypatch, df: pd.DataFrame):
+        from unittest.mock import MagicMock
+        fake = MagicMock()
+        fake.history = MagicMock(return_value=df)
+        monkeypatch.setattr("yfinance.Ticker", lambda *a, **kw: fake)
+        return fake
+
+    @staticmethod
+    def _block_overlay(monkeypatch):
+        """Force include_live_overlay=False semantics by stubbing the snapshot."""
+        monkeypatch.setattr(
+            MarketDataProvider, "_fetch_alpaca_snapshot_price",
+            lambda self, ticker: None,
+        )
+
+    def test_returns_ohlcv_columns_and_tz_naive_index(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        self._patch_yf(monkeypatch, self._make_60m_frame(20))
+        self._block_overlay(monkeypatch)
+
+        df = provider.fetch_intraday_bars("SPY", "60m")
+
+        assert list(df.columns) == ["Open", "High", "Low", "Close", "Volume"]
+        assert df.index.tz is None
+        assert len(df) == 20
+
+    def test_1h_alias_routes_to_60m(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        fake = self._patch_yf(monkeypatch, self._make_60m_frame(10))
+        self._block_overlay(monkeypatch)
+
+        provider.fetch_intraday_bars("SPY", "1h")
+
+        # The alias should pass interval="60m" down to yfinance.
+        call_kwargs = fake.history.call_args.kwargs
+        assert call_kwargs["interval"] == "60m"
+
+    def test_4h_synthesizes_from_60m(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        # 12 hourly bars at 09:30 → resample("4h") yields ~4 buckets.
+        self._patch_yf(monkeypatch, self._make_60m_frame(12))
+        self._block_overlay(monkeypatch)
+
+        df = provider.fetch_intraday_bars("SPY", "4h")
+
+        # Each 4h bucket aggregates ≤4 hourly bars; min 2, max 5 across DST/edges.
+        assert 2 <= len(df) <= 5
+        # Aggregation correctness: high of each bucket ≥ close of that bucket.
+        assert (df["High"] >= df["Close"]).all()
+        assert (df["Low"] <= df["Close"]).all()
+        # Volume sums (each hourly bar = 1M) → bucket volume divisible by 1M.
+        assert (df["Volume"] % 1_000_000 == 0).all()
+
+    def test_cache_hit_within_ttl_skips_yfinance(self, monkeypatch):
+        import time as _t
+        provider = MarketDataProvider("k", "s")
+        seed = self._make_60m_frame(8)
+        provider._intraday_bars_cache[("SPY", "60m")] = (seed, _t.monotonic() - 5)
+        self._block_overlay(monkeypatch)
+
+        # yfinance must NOT be called when cache is fresh.
+        monkeypatch.setattr(
+            "yfinance.Ticker",
+            lambda *a, **kw: (_ for _ in ()).throw(
+                AssertionError("yfinance must not be called on cache hit")),
+        )
+
+        df = provider.fetch_intraday_bars("SPY", "60m")
+        assert len(df) == 8
+
+    def test_cache_miss_after_ttl_refetches(self, monkeypatch):
+        import time as _t
+        from trading_agent.market_data import INTRADAY_BARS_TTL
+        provider = MarketDataProvider("k", "s")
+
+        stale = self._make_60m_frame(4)
+        provider._intraday_bars_cache[("SPY", "60m")] = (
+            stale, _t.monotonic() - (INTRADAY_BARS_TTL + 5)
+        )
+        fresh = self._make_60m_frame(20)
+        fake = self._patch_yf(monkeypatch, fresh)
+        self._block_overlay(monkeypatch)
+
+        df = provider.fetch_intraday_bars("SPY", "60m")
+        assert len(df) == 20
+        assert fake.history.called
+
+    def test_unsupported_interval_raises(self):
+        provider = MarketDataProvider("k", "s")
+        with pytest.raises(ValueError, match="Unsupported intraday interval"):
+            provider.fetch_intraday_bars("SPY", "1m")
+
+    def test_empty_response_raises_insufficient_data(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        self._patch_yf(monkeypatch, pd.DataFrame())
+        with pytest.raises(InsufficientDataError):
+            provider.fetch_intraday_bars("SPY", "60m")
+
+    def test_live_overlay_replaces_last_close(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        self._patch_yf(monkeypatch, self._make_60m_frame(10))
+        # Snapshot returns a price clearly distinct from any cached close.
+        monkeypatch.setattr(
+            MarketDataProvider, "_fetch_alpaca_snapshot_price",
+            lambda self, ticker: 999.99,
+        )
+
+        df = provider.fetch_intraday_bars("SPY", "60m",
+                                          include_live_overlay=True)
+
+        last = df.index[-1]
+        assert df.loc[last, "Close"] == pytest.approx(999.99)
+        # High is widened upward to accommodate the live tick.
+        assert df.loc[last, "High"] >= 999.99
+
+    def test_live_overlay_disabled_keeps_yfinance_close(self, monkeypatch):
+        provider = MarketDataProvider("k", "s")
+        seed = self._make_60m_frame(10)
+        original_close = float(seed["Close"].iloc[-1])
+        self._patch_yf(monkeypatch, seed)
+        # The snapshot should NEVER be called when overlay is disabled —
+        # raise loudly if it is.
+        monkeypatch.setattr(
+            MarketDataProvider, "_fetch_alpaca_snapshot_price",
+            lambda self, ticker: (_ for _ in ()).throw(
+                AssertionError("snapshot must not run when overlay=False")),
+        )
+
+        df = provider.fetch_intraday_bars("SPY", "60m",
+                                          include_live_overlay=False)
+        assert df["Close"].iloc[-1] == pytest.approx(original_close)
+
+    def test_overlay_failure_is_non_fatal(self, monkeypatch):
+        """If Alpaca is unreachable, the chart still renders with cached bars."""
+        provider = MarketDataProvider("k", "s")
+        seed = self._make_60m_frame(10)
+        original_close = float(seed["Close"].iloc[-1])
+        self._patch_yf(monkeypatch, seed)
+        monkeypatch.setattr(
+            MarketDataProvider, "_fetch_alpaca_snapshot_price",
+            lambda self, ticker: None,  # treated as "no live tick available"
+        )
+
+        df = provider.fetch_intraday_bars("SPY", "60m",
+                                          include_live_overlay=True)
+        assert df["Close"].iloc[-1] == pytest.approx(original_close)

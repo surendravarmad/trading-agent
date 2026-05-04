@@ -6,7 +6,9 @@ based on SMA positioning and slope analysis.
 
 import logging
 from dataclasses import dataclass
+from datetime import datetime
 from enum import Enum
+from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -32,6 +34,7 @@ logger = logging.getLogger(__name__)
 # callers receive ``None`` from the data layer when ticker == anchor,
 # which the classifier treats as "no leadership signal".
 LEADERSHIP_ANCHORS: dict = {
+    # ---- ETFs ----
     "SPY": "QQQ",     # broad market vs growth proxy
     "QQQ": "SPY",     # growth vs broad market
     "IWM": "SPY",     # small-cap vs broad market
@@ -47,7 +50,64 @@ LEADERSHIP_ANCHORS: dict = {
     "XLB": "SPY",     # materials sector vs broad market
     "XLC": "SPY",     # comms sector vs broad market
     "XLRE": "SPY",    # real-estate sector vs broad market
+    # ---- Large-cap single names → matching sector ETF ----
+    # Anchoring a stock to its sector ETF gives a "vs peers" leadership
+    # signal: e.g. JPM running ahead of XLF means JPM is leading financials,
+    # not just riding the sector tide.  Without these entries, the watchlist
+    # silently fell through to a 0.0 z-score for any non-ETF ticker.
+    "JPM":   "XLF",   # financials
+    "BAC":   "XLF",
+    "WFC":   "XLF",
+    "C":     "XLF",
+    "GS":    "XLF",
+    "MS":    "XLF",
+    "AAPL":  "XLK",   # tech
+    "MSFT":  "XLK",
+    "NVDA":  "XLK",
+    "AMD":   "XLK",
+    "INTC":  "XLK",
+    "GOOGL": "XLC",   # comms
+    "META":  "XLC",
+    "NFLX":  "XLC",
+    "TSLA":  "XLY",   # consumer discretionary
+    "AMZN":  "XLY",
+    "HD":    "XLY",
+    "MCD":   "XLY",
+    "NKE":   "XLY",
+    "XOM":   "XLE",   # energy
+    "CVX":   "XLE",
+    "COP":   "XLE",
+    "JNJ":   "XLV",   # healthcare
+    "UNH":   "XLV",
+    "PFE":   "XLV",
+    "LLY":   "XLV",
+    "PG":    "XLP",   # consumer staples
+    "KO":    "XLP",
+    "PEP":   "XLP",
+    "WMT":   "XLP",
 }
+
+
+def leadership_anchor_for(ticker: str) -> str:
+    """Resolve a ticker's leadership anchor with a SPY fallback.
+
+    Why a helper rather than just dict lookup
+    -----------------------------------------
+    Old code: ``LEADERSHIP_ANCHORS.get(ticker, "")`` — non-ETF, non-listed
+    tickers returned the empty string and the classifier silently dropped
+    the leadership signal to 0.0.  The watchlist UI then rendered ``+0.00``
+    indistinguishable from a real near-zero reading.
+
+    New behaviour: any ticker not in the explicit map falls back to ``SPY``
+    so "vs broad market" is computable for everything.  ``ticker == "SPY"``
+    is excluded (would self-anchor); SPY's anchor stays QQQ via the dict.
+    Returns ``""`` only for the special "SPY → SPY would self-anchor" case,
+    which can't happen given the dict has SPY → QQQ — defensive only.
+    """
+    explicit = LEADERSHIP_ANCHORS.get(ticker)
+    if explicit:
+        return explicit
+    return "SPY" if ticker != "SPY" else ""
 
 # Inter-market gate threshold: when VIX 5-min change z-score exceeds
 # this floor, suppress new bullish-premium openings (Bull Put, Iron
@@ -93,6 +153,16 @@ class RegimeAnalysis:
     leadership_anchor: str = ""
     leadership_zscore: float = 0.0       # Z-score of (ticker - anchor) 5-min return diff
     leadership_raw_diff: float = 0.0     # last raw differential (informational)
+    # True only when ``get_leadership_zscore`` actually returned a real
+    # reading.  Distinguishes "0.0 because we couldn't compute it" (RPC
+    # failed, IEX feed had <2 bars after open-skip, ticker == anchor,
+    # degenerate stdev) from "0.0 because the ticker is genuinely tracking
+    # its anchor".  Strategy code reads ``leadership_zscore`` directly and
+    # is unaffected; the watchlist UI uses this flag to render "—" vs
+    # "+0.000".  Keeping ``leadership_zscore`` as float (rather than
+    # Optional[float]) preserves all existing comparison semantics in
+    # strategy.py:268-271 / thesis_builder.py:38.
+    leadership_signal_available: bool = False
     # Item 3: VIX inter-market gate.  ``vix_zscore`` is the 5-min change
     # in ^VIX z-scored against its own intraday distribution; positive
     # values indicate inter-market fear.  ``inter_market_inhibit_bullish``
@@ -104,6 +174,27 @@ class RegimeAnalysis:
     # Capital retainment guards
     iv_rank: float = 0.0               # realized-vol percentile rank 0-100
     high_iv_warning: bool = False      # True when iv_rank > 95 (extreme instability)
+    # ------------------------------------------------------------------
+    # Display-only diagnostics (added 2026-05-02). All optional with
+    # safe defaults — strategy.py / thesis_builder.py / decision_engine
+    # don't read these, so adding them can't change a trade decision and
+    # keeps AST invariants 1/2/3 untouched.
+    # ------------------------------------------------------------------
+    # Slope of the long SMA (50-day on daily, 50-bar on intraday) over the
+    # last 5 bars.  Combined with sma_50_slope, lets the UI flag a
+    # "trend conflict" when the long trend still rises but the medium
+    # trend has rolled over (classic topping pattern).
+    sma_200_slope: float = 0.0
+    # True when sma_200_slope > 0 AND sma_50_slope < 0 (or symmetric for
+    # bearish).  UI surfaces this as ⚠ next to a Bullish/Bearish label.
+    # Does NOT change the regime label itself — that would alter strategy
+    # routing and break invariant tests.
+    trend_conflict: bool = False
+    # Wall-clock timestamp of the most recent bar fed into this analysis.
+    # The watchlist tab uses this + market-hours to render a "Stale" chip
+    # when the data is hours old (e.g. weekend / pre-market).  None means
+    # the caller couldn't determine it (back-compat for synthetic tests).
+    last_bar_ts: Optional[datetime] = None
 
 
 class RegimeClassifier:
@@ -136,6 +227,11 @@ class RegimeClassifier:
         rsi = self.data.compute_rsi(close, 14)
         upper, middle, lower = self.data.compute_bollinger_bands(close, 20, 2.0)
         sma_50_slope = self.data.sma_slope(sma_50, lookback=5)
+        # Long-SMA slope is needed for the trend-conflict diagnostic.
+        # Computed here (not in _determine_regime) so the rule function's
+        # signature stays untouched — multi_tf_regime.py calls it directly
+        # and we don't want to fork that contract.
+        sma_200_slope = self.data.sma_slope(sma_200, lookback=5)
 
         # 3-standard-deviation Bollinger Bands for mean-reversion detection
         upper_3std, _, lower_3std = self.data.compute_bollinger_bands(close, 20, 3.0)
@@ -171,13 +267,19 @@ class RegimeClassifier:
         # Z-scores the differential against its own intraday distribution
         # — a 1.5σ leadership move is meaningful regardless of the
         # ticker's idiosyncratic volatility.
-        leadership_anchor = LEADERSHIP_ANCHORS.get(ticker, "")
+        # leadership_anchor_for() falls back to SPY for tickers absent
+        # from LEADERSHIP_ANCHORS (e.g. JPM/TSLA before this PR added
+        # explicit entries).  Older callers that did .get(ticker, "")
+        # still see the same dict; the helper is the new entry point.
+        leadership_anchor = leadership_anchor_for(ticker)
         leadership_zscore = 0.0
         leadership_raw_diff = 0.0
+        leadership_signal_available = False
         if leadership_anchor and hasattr(self.data, "get_leadership_zscore"):
             result = self.data.get_leadership_zscore(ticker, leadership_anchor)
             if result is not None:
                 leadership_raw_diff, leadership_zscore = result
+                leadership_signal_available = True
 
         # ------------------------------------------------------------------
         # Item 3: VIX inter-market gate.
@@ -207,6 +309,27 @@ class RegimeClassifier:
             mean_reversion_direction, u3, l3,
         )
 
+        # Trend conflict — the long trend still points one way while the
+        # medium trend has rolled over.  This is informational only:
+        # _determine_regime's label still wins; the UI just adds a ⚠.
+        # Live agent strategy / scoring don't read this field, so flipping
+        # it can't reroute a trade.
+        trend_conflict = (
+            (sma_50_slope < 0 and sma_200_slope > 0) or
+            (sma_50_slope > 0 and sma_200_slope < 0)
+        )
+
+        # Last bar timestamp — for the watchlist "Stale data" chip.
+        # close.index[-1] is whatever the data layer returned (yfinance
+        # daily index for the daily path; tz-aware datetimes typical).
+        last_bar_ts = None
+        try:
+            if len(close) > 0:
+                ts = close.index[-1]
+                last_bar_ts = pd.Timestamp(ts).to_pydatetime()
+        except Exception:  # noqa: BLE001 — never let staleness probe crash classify()
+            last_bar_ts = None
+
         analysis = RegimeAnalysis(
             regime=regime,
             current_price=current_price,
@@ -221,10 +344,14 @@ class RegimeClassifier:
             leadership_anchor=leadership_anchor,
             leadership_zscore=leadership_zscore,
             leadership_raw_diff=leadership_raw_diff,
+            leadership_signal_available=leadership_signal_available,
             vix_zscore=vix_zscore,
             inter_market_inhibit_bullish=inter_market_inhibit_bullish,
             iv_rank=iv_rank,
             high_iv_warning=high_iv_warning,
+            sma_200_slope=sma_200_slope,
+            trend_conflict=trend_conflict,
+            last_bar_ts=last_bar_ts,
         )
         logger.info(
             "[%s] Regime → %s | Price=%.2f SMA50=%.2f SMA200=%.2f "

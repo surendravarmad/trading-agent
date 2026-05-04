@@ -152,6 +152,87 @@ class TestLeadershipAnchorMap:
         for ticker, anchor in LEADERSHIP_ANCHORS.items():
             assert ticker != anchor
 
+    def test_jpm_anchored_to_xlf(self):
+        """Bug-fix 2026-05-02: non-ETF tickers were silently anchored to
+        the empty string, producing Lead-z = +0.00 in the watchlist.
+        JPM should anchor to its sector ETF (XLF)."""
+        from trading_agent.regime import LEADERSHIP_ANCHORS
+        assert LEADERSHIP_ANCHORS["JPM"] == "XLF"
+
+    def test_tsla_anchored_to_xly(self):
+        from trading_agent.regime import LEADERSHIP_ANCHORS
+        assert LEADERSHIP_ANCHORS["TSLA"] == "XLY"
+
+    def test_anchor_for_unknown_ticker_falls_back_to_spy(self):
+        """Tickers not in the explicit map should fall back to SPY so the
+        leadership signal is computable even for unconfigured names."""
+        from trading_agent.regime import leadership_anchor_for
+        assert leadership_anchor_for("ZZZZ") == "SPY"
+
+    def test_anchor_for_spy_uses_dict_entry_not_fallback(self):
+        """SPY must NOT self-anchor — the dict entry SPY → QQQ wins
+        over the fallback."""
+        from trading_agent.regime import leadership_anchor_for
+        assert leadership_anchor_for("SPY") == "QQQ"
+
+
+class TestTrendConflictAndLastBarTs:
+    """2026-05-02 patch: surface SMA50/SMA200 slope disagreement and
+    propagate the last-bar timestamp for the watchlist Stale chip."""
+
+    def _make_classifier(self, prices):
+        provider = MagicMock(spec=MarketDataProvider)
+        provider.fetch_historical_prices.return_value = prices
+        provider.get_current_price.return_value = float(prices["Close"].iloc[-1])
+        provider.compute_sma = MarketDataProvider.compute_sma
+        provider.compute_rsi = MarketDataProvider.compute_rsi
+        provider.compute_bollinger_bands = MarketDataProvider.compute_bollinger_bands
+        provider.sma_slope = MarketDataProvider.sma_slope
+        provider.get_leadership_zscore = MagicMock(return_value=None)
+        provider.get_vix_zscore = MagicMock(return_value=None)
+        return RegimeClassifier(provider)
+
+    def test_trend_conflict_field_is_bool(self, bullish_prices):
+        classifier = self._make_classifier(bullish_prices)
+        result = classifier.classify("SPY")
+        assert isinstance(result.trend_conflict, bool)
+
+    def test_sma_200_slope_populated(self, bullish_prices):
+        classifier = self._make_classifier(bullish_prices)
+        result = classifier.classify("SPY")
+        assert isinstance(result.sma_200_slope, float)
+
+    def test_uniform_uptrend_has_no_conflict(self, bullish_prices):
+        """Both SMA slopes positive on a clean uptrend → no conflict."""
+        classifier = self._make_classifier(bullish_prices)
+        result = classifier.classify("SPY")
+        if result.sma_50_slope > 0 and result.sma_200_slope > 0:
+            assert result.trend_conflict is False
+
+    def test_last_bar_ts_populated(self, bullish_prices):
+        from datetime import datetime
+        classifier = self._make_classifier(bullish_prices)
+        result = classifier.classify("SPY")
+        assert isinstance(result.last_bar_ts, datetime)
+
+    def test_default_regime_analysis_has_safe_field_defaults(self):
+        """Brand-new fields must default safely so any code constructing
+        RegimeAnalysis with the previous signature still works."""
+        from trading_agent.regime import RegimeAnalysis, Regime
+        ra = RegimeAnalysis(
+            regime=Regime.BULLISH, current_price=100, sma_50=100,
+            sma_200=100, sma_50_slope=0.0, rsi_14=50,
+            bollinger_width=0.05, reasoning="",
+        )
+        assert ra.sma_200_slope == 0.0
+        assert ra.trend_conflict is False
+        assert ra.last_bar_ts is None
+        assert ra.leadership_anchor == ""
+        # 2026-05-02 follow-up: signal_available must default False so
+        # that an unpopulated RegimeAnalysis renders "—" in the UI
+        # rather than a misleading "+0.000".
+        assert ra.leadership_signal_available is False
+
 
 class TestZScoreLeadershipIntegration:
     """Item 2: classify() reads leadership_zscore via the data provider."""
@@ -180,6 +261,10 @@ class TestZScoreLeadershipIntegration:
         assert result.leadership_anchor == "QQQ"
         assert result.leadership_zscore == 1.9
         assert result.leadership_raw_diff == 0.0008
+        # 2026-05-02 follow-up: a real reading must flip the
+        # signal_available flag to True so the watchlist UI knows to
+        # render the numeric value rather than "—".
+        assert result.leadership_signal_available is True
 
     def test_none_result_keeps_defaults(self, bullish_prices):
         classifier, _ = self._make_classifier(
@@ -187,6 +272,10 @@ class TestZScoreLeadershipIntegration:
         result = classifier.classify("SPY")
         assert result.leadership_zscore == 0.0
         assert result.leadership_raw_diff == 0.0
+        # The exact bug being fixed: RPC returning None must NOT look
+        # the same as a real 0σ reading.  Flag stays False → UI prints
+        # "—" instead of "+0.000".
+        assert result.leadership_signal_available is False
 
 
 class TestVIXInterMarketGate:

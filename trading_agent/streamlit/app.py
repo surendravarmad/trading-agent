@@ -49,8 +49,8 @@ st.set_page_config(
 st.title("📈 Trading Agent Dashboard")
 st.caption("Credit-spread options agent · Paper trading · Alpaca Markets")
 
-tab_live, tab_backtest, tab_llm = st.tabs(
-    ["📡 Live Monitoring", "📊 Backtesting", "🤖 LLM Extension"]
+tab_live, tab_backtest, tab_llm, tab_watchlist = st.tabs(
+    ["📡 Live Monitoring", "📊 Backtesting", "🤖 LLM Extension", "📊 Watchlist"]
 )
 
 with tab_live:
@@ -64,3 +64,10 @@ with tab_backtest:
 with tab_llm:
     from trading_agent.streamlit.llm_extension import render_llm_extension
     render_llm_extension()
+
+with tab_watchlist:
+    # Read-only analyst tab — does not import decision_engine,
+    # chain_scanner, executor, or risk_manager. See watchlist_ui.py
+    # docstring for the architectural-safety rationale.
+    from trading_agent.streamlit.watchlist_ui import render_watchlist
+    render_watchlist()

@@ -182,13 +182,14 @@ scored credit and targeted-fill limit price stay in sync. Worst-case
 
 ## 4. Streamlit dashboard
 
-Three tabs, all under `trading_agent/streamlit/`:
+Four tabs, all under `trading_agent/streamlit/`:
 
 | Tab | File | Purpose |
 |---|---|---|
 | 📡 Live Monitoring | `live_monitor.py` | Start/Stop agent, equity, P&L, regime, positions, journal |
 | 📊 Backtesting | `backtest_ui.py` | Date range, multi-ticker, **Unified Decision Engine** toggle, P&L charts |
 | 🤖 LLM Extension | `llm_extension.py` | Chat with local Ollama model (RAG over `signals_live.jsonl`) |
+| 📊 Watchlist | `watchlist_ui.py` + `watchlist_chart.py` | Persistent ticker watchlist, multi-tf regime table (1d/4h/1h/15m/5m), 4-row Plotly chart. **Read-only — must not import `decision_engine`, `chain_scanner`, `executor`, `risk_manager`** (architectural invariant; the watchlist is a display surface only) |
 
 ### 4.1 Refresh model (watchdog)
 
@@ -221,7 +222,23 @@ inspection. This was added because pre-fix the position monitor logged
 "Fetched N positions / Grouped into N spread(s)" every ~3 seconds even
 when the agent wasn't running.
 
-### 4.3 Strategy presets
+### 4.3 Watchlist tab (May 2026)
+
+`watchlist_ui.py` registers as the 4th tab and lazy-imports `watchlist_chart.py` only when a user opens it (keeps cold-start light).
+
+**Multi-timeframe regime parity invariant.** `multi_tf_regime.classify_multi_tf` reuses `RegimeClassifier._determine_regime` — the same pure rule the live agent uses on daily bars — fed intraday bars. There is **no fork** of regime logic. The "1d" timeframe is delegated directly to the existing `RegimeClassifier` (single source of truth). A regression test (`tests/test_multi_tf_regime.py::TestNoShadowScorer`) AST-walks the module and rejects any new `_determine_regime`-shaped function.
+
+**Hybrid intraday data path.** `MarketDataProvider.fetch_intraday_bars(ticker, interval, lookback_days=None, include_live_overlay=True)` pulls history from yfinance (5m/15m/30m capped at 60 days; 4h synthesised via `df.resample("4h")` from 60m) and overlays the right-most live tick from the Alpaca snapshot. Cached for `INTRADAY_BARS_TTL=60s` by `(ticker, interval)`.
+
+**Indicator stack — pure pandas.** `watchlist_chart.py` implements MACD, Stoch RSI, ATR bands, Ichimoku, plus the existing SMA/RSI/Bollinger/ADX in ~80 lines of pandas/numpy. **Do not re-introduce `pandas-ta`** — its `numba` transitive dep has no Python 3.13+ wheels yet (source build needs LLVM, fails on most user machines). `TA-Lib` and `VectorBT` were also rejected: TA-Lib needs a system C library install (worse portability), VectorBT has the same numba problem and is aimed at backtesting not chart rendering. The pure-pandas approach is performance-adequate (chart render dominated by Plotly serialisation, not indicator math) and dependency-clean. The ADX line on the chart and the strength badge in the table both use the same `_adx_series` math so they cannot drift.
+
+**Persistence.** `watchlist_store.py` writes `knowledge_base/watchlist.json` atomically (`tmp + os.replace`). Uses `threading.RLock` (not `Lock`) because `add_ticker → save_watchlist` would otherwise self-deadlock on the nested acquire.
+
+**Refresh model.** `@st.cache_data(ttl=WATCHLIST_REFRESH_SECS)` (default 60s) keyed on `(ticker, intervals_tuple, refresh_token)`. Manual `↻ Refresh` button bumps the token for immediate invalidation.
+
+**Architectural firewall.** `watchlist_ui.py` and `watchlist_chart.py` import only `market_data`, `multi_tf_regime`, `regime`, `watchlist_store`, plus `streamlit`/`plotly`. They explicitly do **not** import `decision_engine`, `chain_scanner`, `executor`, or `risk_manager`. If a future PR needs to break this, it requires explicit sign-off — the read-only invariant is what makes the tab safe to hand to a less-trusted analyst.
+
+### 4.4 Strategy presets
 
 The Live tab has a **Strategy Profile** expander writing to
 `STRATEGY_PRESET.json` (atomic temp+rename). Three built-in profiles
@@ -266,8 +283,9 @@ trading-agent/
 │   ├── logger_setup.py               # idempotent setup (sentinel-tagged handlers)
 │   │
 │   │   # — Core phases —
-│   ├── market_data.py                # Phase I — yfinance + Alpaca with TTL cache, parallel, split timeouts
+│   ├── market_data.py                # Phase I — yfinance + Alpaca with TTL cache, parallel, split timeouts, fetch_intraday_bars
 │   ├── regime.py                     # Phase II — SMA / RSI / Bollinger / VIX-z classifier
+│   ├── multi_tf_regime.py            # Multi-tf wrapper — reuses _determine_regime, no shadow scorer
 │   ├── strategy.py                   # Phase III — strike selection, nearest-Friday DTE
 │   ├── chain_scanner.py              # Phase III — adaptive (Δ × DTE × width) sweep [SCORING SOURCE]
 │   ├── decision_engine.py            # Pure scoring entrypoint (live + backtest delegate here)
@@ -276,6 +294,7 @@ trading-agent/
 │   ├── risk_manager.py               # Phase IV — 8-guardrail validator
 │   ├── executor.py                   # Phase VI — mleg execution + HTML report + live-quote refresh
 │   ├── trade_plan_report.py          # Per-ticker HTML
+│   ├── watchlist_store.py            # Persistent JSON watchlist (atomic writes, RLock for nested CRUD)
 │   │
 │   │   # — Position management —
 │   ├── position_monitor.py           # Stage 1 — fetch + group spreads (DEBUG-level on hot path)
@@ -298,10 +317,12 @@ trading-agent/
 │   ├── sentiment_verifier.py         # Tier-2 — reasoning verifier (VerifiedSentimentReport)
 │   │
 │   └── streamlit/
-│       ├── app.py                    # 3-tab entrypoint
+│       ├── app.py                    # 4-tab entrypoint
 │       ├── live_monitor.py           # Live tab (broker-gated, watchdog-driven)
 │       ├── backtest_ui.py            # Backtest tab (Backtester + unified-engine toggle)
 │       ├── llm_extension.py          # LLM tab (RAG over signals_live.jsonl)
+│       ├── watchlist_ui.py           # Watchlist tab — multi-tf regime table + macro strip
+│       ├── watchlist_chart.py        # Watchlist tab — 4-row Plotly chart, pure-pandas indicators
 │       ├── file_watcher.py           # Per-process Observer + version counters
 │       └── components.py
 │
@@ -448,6 +469,39 @@ change per day**, not a percentage. Logs and the LLM prompt annotate
 with `$/day` so a reader can't mistake the magnitude. Downstream
 consumers only read the sign.
 
+### 7.6 Trading-library choice (locked)
+
+The Watchlist tab's indicator stack is **pure pandas/numpy**. Three
+candidates were evaluated and rejected:
+
+- **`pandas-ta`** — `numba` transitive dep has no Python 3.13+ wheels;
+  source build needs LLVM. User hit this on Python 3.14 install. Fatal
+  for portability.
+- **`TA-Lib`** — fastest option (10–50× over pandas), but needs a
+  system-level C library install (`brew install ta-lib`, etc). Worse
+  portability than what we just escaped from. The watchlist isn't
+  performance-bound anyway — Plotly serialisation dominates render time
+  by an order of magnitude over indicator math.
+- **`VectorBT`** — same `numba` problem; also wrong tool for the job
+  (built for backtesting sweeps, not chart panels).
+
+If a future PR ever has a real performance need: **finta** (pure
+Python, no compiled deps) is the safe swap; **TA-Lib** if the deploy
+environment is controlled and the C-lib install is tolerable. Don't
+re-introduce `pandas-ta` until/unless `numba` ships Python 3.13+
+wheels and our minimum Python floor is raised.
+
+### 7.7 `pd.NA` vs `np.nan` on float Series
+
+`Series.replace(0, pd.NA)` on a `float64` Series **coerces dtype to
+`object`** (because `pd.NA` is the masked-array NA scalar built for
+nullable dtypes). After that, `.ewm().mean()` raises
+`pandas.errors.DataError: No numeric types to aggregate`. **Always
+use `np.nan`** when replacing into a float Series. Two fixed sites:
+`multi_tf_regime.adx_strength` and `streamlit/components.py::drawdown_chart`.
+Inline comments left at both call-sites so this trap doesn't get
+re-introduced.
+
 ---
 
 ## 8. Commands
@@ -515,6 +569,7 @@ python visualize_logs.py --journal trade_journal/signals_backtest.jsonl
 |---|---|---|
 | `LIVE_MONITOR_REFRESH_SECS` | `3` | Was 30 pre-watchdog |
 | `BROKER_STATE_TTL_SECS` | `30` | Cache TTL on Alpaca account/positions |
+| `WATCHLIST_REFRESH_SECS` | `60` | TTL on Watchlist tab's per-ticker multi-tf classification cache |
 | `WATCHDOG_DISABLE` | `0` | `1` to disable Observer |
 | `WATCHDOG_FORCE_POLLING` | `0` | `1` for NFS / network mounts |
 
@@ -623,6 +678,50 @@ verify the invariants in §2 still hold afterwards.
     - Module docstring rewritten with new examples.
     - New `TestResolveJournalPath` class in `tests/test_visualize_logs.py`
       pins all four resolver branches.
+
+13. **Watchlist tab (4 PRs).** New 4th Streamlit tab for multi-timeframe
+    regime monitoring, shipped as a sequence:
+    - **PR #1** `MarketDataProvider.fetch_intraday_bars(ticker, interval,
+      lookback_days=None, include_live_overlay=True)` — yfinance for
+      depth, Alpaca snapshot for the right-most live tick. 4h synthesised
+      via `df.resample("4h")` from 60m bars. `INTRADAY_BARS_TTL=60s`,
+      cached by `(ticker, interval)`. Tests: `TestFetchIntradayBars`.
+    - **PR #2** `trading_agent/multi_tf_regime.py` — `classify_multi_tf`
+      reuses `RegimeClassifier._determine_regime` (no shadow scorer,
+      enforced by `TestNoShadowScorer`). Per-tf SMA windows scale
+      `(50, 200)` for daily vs `(20, 50)` for intraday. `adx_strength`
+      and `adx_strength_label` helpers (Wilder smoothing, pure pandas).
+      `MultiTFRegime.agreement_score` collapses regimes to a 3-way
+      trend bucket for cross-tf alignment.
+    - **PR #3** `watchlist_store.py` (atomic JSON, `threading.RLock` for
+      nested `add_ticker → save_watchlist` calls — `Lock` deadlocks) +
+      `streamlit/watchlist_ui.py` (controls / macro strip / regime
+      table). 17-case persistence test suite.
+    - **PR #4** `streamlit/watchlist_chart.py` — 4-row Plotly stack
+      (Price · Volume · Oscillators · Trend) with collapsible rows; six
+      timeframe options (5m → 1d); indicator toggles for SMA/BB/ATR/
+      Ichimoku/RSI/StochRSI/MACD/ADX. ADX line on chart and badge in
+      table both delegate to the same `_adx_series` math.
+
+14. **`pandas-ta` rejected — pure-pandas indicator stack.** Discovered
+    `numba` (transitive dep of `pandas-ta`) has no Python 3.13+ wheels;
+    source build needs LLVM, fails on most user machines. Rolled MACD,
+    Stoch RSI, ATR, Ichimoku in pure pandas/numpy directly in
+    `watchlist_chart.py` (~80 lines, matches existing in-house pattern
+    for SMA/RSI/Bollinger/ADX). `TA-Lib` (system C dep) and `VectorBT`
+    (same numba problem, wrong tool for live charting) also rejected;
+    rationale captured in §7.6 below.
+
+15. **ADX dtype bug fix.** `multi_tf_regime.adx_strength` raised
+    `pandas.errors.DataError: No numeric types to aggregate` on flat or
+    near-flat OHLC tapes. Root cause: `.replace(0, pd.NA)` on a float
+    Series coerces dtype to `object`, after which `.ewm().mean()` can't
+    aggregate. Fix: `pd.NA` → `np.nan` (keeps `float64`); added
+    `pd.to_numeric(dx, errors="coerce")` belt-and-suspenders + early
+    return when `dx.dropna().empty`. Same bug fixed pre-emptively in
+    `streamlit/components.py::drawdown_chart`. Regression in
+    `verify_adx_dtype_fix.py` (4 cases incl. flat tape, trending,
+    short-input, NaN-laden).
 
 ---
 

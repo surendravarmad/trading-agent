@@ -15,6 +15,13 @@ plotly>=6.0.0
 # fall back to mtime+size-based polling.
 watchdog>=3.0,<5
 
+# Watchlist-tab indicators (MACD, Stochastic RSI, ATR bands, Ichimoku)
+# are implemented in pure pandas/numpy inside watchlist_chart.py. We
+# previously considered pandas-ta but its transitive dependency on numba
+# breaks installs on Python 3.13+ (no wheels yet → source build needs
+# LLVM). Rolling our own keeps the requirement set narrow and matches
+# the existing in-house pattern for SMA/RSI/Bollinger/ADX.
+
 # --- Optional: FinGPT multi-source pipeline ---
 # Install the sources you want; each degrades gracefully if absent.
 # Reddit (r/wsb, r/stocks, r/options):   pip install praw>=7.7.0

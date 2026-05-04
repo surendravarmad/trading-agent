@@ -300,6 +300,7 @@ streamlit run trading_agent/streamlit/app.py
 | **📡 Live Monitoring** | Agent Start / Stop / Dry-Run · cycle PID · equity · P&L · regime badge · open positions · equity curve · 8-guardrail status · agent log · Strategy Profile applier · journal expander |
 | **📊 Backtesting** | Date range · multi-ticker · timeframe (1Day / 5Min) · Live Quote Refresh · **Unified Decision Engine** toggle (preset selector) · simulated P&L · per-regime bars · equity + drawdown · trade log · CSV / JSON / Journal export |
 | **🤖 LLM Extension** | Chat with local Ollama model (RAG over `signals_live.jsonl`) · Optimize Strategy → one-click `.env` update |
+| **📊 Watchlist** | Persistent ticker watchlist (`knowledge_base/watchlist.json`) · multi-timeframe regime table (1d / 4h / 1h / 15m / 5m) · ADX strength badge · VIX-z macro strip · 4-row Plotly chart (Price + overlays / Volume / Oscillators / Trend) with 6 timeframes (5m → 1d) and indicator toggles. **Read-only — never imports `decision_engine`, `chain_scanner`, `executor`, or `risk_manager`.** |
 
 **Refresh model.** Refresh is event-driven via `watchdog`. A single per-process `Observer` (wrapped in `@st.cache_resource`) watches `trade_journal/` and `trade_plans/`; loaders cache by `(version, mtime, size)` so unrelated reruns hit the cache and only real journal writes invalidate. Default tick is `LIVE_MONITOR_REFRESH_SECS=3` (was 30). Kill switches: `WATCHDOG_DISABLE=1` (fall back to mtime polling) and `WATCHDOG_FORCE_POLLING=1` (NFS / network mounts where inotify is unavailable).
 
@@ -330,6 +331,22 @@ The backtester mirrors the live `executor._refresh_limit_price()` pattern: immed
 2. **Gated by `_SNAPSHOT_FRESH_DAYS=3`.** In snapshot mode, an entry older than 3 days is skipped because today's quote is structurally meaningless as a proxy.
 
 Regression: `tests/test_streamlit/test_backtest_ui.py::TestRefreshGating`.
+
+### Watchlist Tab
+
+A read-only analyst surface for multi-timeframe regime monitoring. Add tickers via the input row, persist them across restarts (`knowledge_base/watchlist.json`, atomic temp+rename writes), and view each ticker's regime / ADX / IV-rank across five timeframes simultaneously.
+
+**Multi-timeframe regime parity.** `multi_tf_regime.classify_multi_tf` reuses `RegimeClassifier._determine_regime` — the same pure rule the live agent uses on daily bars — fed intraday bars at `1d / 4h / 1h / 15m / 5m`. There is no fork of regime logic. SMA windows scale per timeframe (`(50, 200)` for 1d, `(20, 50)` for intraday). The "TF agree" column is the share of timeframes whose trend matches each ticker's longest interval — 100% means fully aligned across the stack.
+
+**Hybrid intraday data path.** `MarketDataProvider.fetch_intraday_bars(ticker, interval)` pulls history from yfinance (chart depth: 5m/15m/30m capped at 60 days; 4h synthesised via `df.resample("4h")` from 60m) and overlays the right-most live tick from the Alpaca snapshot when available. Cached for 60s by `(ticker, interval)` so a Streamlit rerun within the refresh window is free.
+
+**Chart panel.** A 4-row Plotly subplot stack (Price · Volume · Oscillators · Trend) with collapsible rows. Indicators include SMA-50/200, Bollinger Bands, ATR bands, full Ichimoku Kinkō Hyō (Tenkan / Kijun / Cloud), RSI(14), Stoch RSI, MACD(12,26,9), and ADX(14). All indicators are pure pandas/numpy in `watchlist_chart.py` — no `pandas-ta`, no `TA-Lib`, no `numba` (the latter has no Python 3.13+ wheels yet, which broke an earlier prototype). The ADX line on the chart and the strength badge in the table use the same `_adx_series` math so they cannot drift.
+
+**Architectural safety.** `watchlist_ui.py` and `watchlist_chart.py` import only `market_data`, `multi_tf_regime`, `regime`, `watchlist_store`, plus `streamlit` / `plotly`. They explicitly **do not import** `decision_engine`, `chain_scanner`, `executor`, or `risk_manager` — the watchlist is a display surface and cannot influence trade decisions even by accident.
+
+**Refresh model.** `@st.cache_data(ttl=WATCHLIST_REFRESH_SECS)` (default 60s) keyed on `(ticker, intervals_tuple, refresh_token)`. The `↻ Refresh` button bumps the token for immediate invalidation; otherwise the cache self-expires every minute so yfinance doesn't get rate-limited.
+
+Regression: `tests/test_market_data.py::TestFetchIntradayBars`, `tests/test_multi_tf_regime.py`, `tests/test_watchlist_store.py`, `tests/test_watchlist_chart.py`.
 
 ---
 
@@ -379,6 +396,7 @@ A minimal `.env` is shown in [Quickstart](#quickstart). The full reference follo
 |---|---|---|
 | `LIVE_MONITOR_REFRESH_SECS` | `3` | Live Monitor fragment auto-refresh tick (was 30 pre-watchdog) |
 | `BROKER_STATE_TTL_SECS` | `30` | TTL on cached Alpaca account/positions/clock fetches |
+| `WATCHLIST_REFRESH_SECS` | `60` | TTL on per-ticker multi-timeframe classification cache (Watchlist tab) |
 | `WATCHDOG_DISABLE` | `0` | Set to `1` to disable the journal `Observer` (cache keys go to mtime+size only) |
 | `WATCHDOG_FORCE_POLLING` | `0` | Set to `1` for `PollingObserver` on NFS / network mounts where inotify is unavailable |
 
@@ -479,8 +497,9 @@ trading-agent/
 │   ├── logger_setup.py
 │   │
 │   │   # ── Core Phases ──
-│   ├── market_data.py                # Phase I — yfinance + Alpaca (TTL cache, parallel, split timeouts)
+│   ├── market_data.py                # Phase I — yfinance + Alpaca (TTL cache, parallel, split timeouts, fetch_intraday_bars)
 │   ├── regime.py                     # Phase II — SMA / RSI / Bollinger / VIX-z
+│   ├── multi_tf_regime.py            # Multi-timeframe regime wrapper (reuses _determine_regime, no shadow scorer)
 │   ├── strategy.py                   # Phase III — strike selection, nearest-Friday DTE
 │   ├── chain_scanner.py              # Phase III — adaptive (Δ × DTE × width) sweep
 │   ├── decision_engine.py            # Pure scoring entrypoint shared by live + backtest
@@ -489,6 +508,7 @@ trading-agent/
 │   ├── risk_manager.py               # Phase IV — 8-guardrail validator
 │   ├── executor.py                   # Phase VI — mleg execution + HTML report
 │   ├── trade_plan_report.py
+│   ├── watchlist_store.py            # Persistent JSON watchlist (atomic writes, RLock for nested CRUD)
 │   │
 │   │   # ── Position Management ──
 │   ├── position_monitor.py
@@ -511,10 +531,12 @@ trading-agent/
 │   ├── sentiment_verifier.py         # Tier-2 — Reasoning verifier
 │   │
 │   └── streamlit/
-│       ├── app.py                    # 3-tab dashboard entrypoint
+│       ├── app.py                    # 4-tab dashboard entrypoint
 │       ├── live_monitor.py           # Live tab — broker-gated, watchdog-driven refresh
 │       ├── backtest_ui.py            # Backtest tab — Backtester + unified-engine toggle
 │       ├── llm_extension.py          # LLM tab — RAG over signals_live.jsonl
+│       ├── watchlist_ui.py           # Watchlist tab — multi-tf regime table + macro strip
+│       ├── watchlist_chart.py        # Watchlist tab — 4-row Plotly chart, pure-pandas indicators
 │       ├── file_watcher.py           # Per-process Observer + version counters
 │       └── components.py
 │
@@ -527,7 +549,7 @@ trading-agent/
 │   └── signals_*.md                  # Human-readable mirrors
 │
 ├── trade_plans/                      # Per-ticker persistent trade-plan files
-├── knowledge_base/                   # RAG vector store (LLM layer only)
+├── knowledge_base/                   # RAG vector store (LLM layer) + watchlist.json (Watchlist tab)
 └── logs/
 ```
 
